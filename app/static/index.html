@@ -58,6 +58,13 @@
   #modalOverlay { position:fixed; inset:0; background:rgba(0,0,0,.6); display:flex; align-items:center; justify-content:center; z-index:100; }
   #modal { background:var(--panel); border:1px solid #343743; border-radius:12px; padding:18px; width:520px; max-width:92vw; }
   .scacc { display:flex; gap:8px; align-items:center; padding:4px 0; font-size:13px; }
+  #searchbar { display:flex; gap:8px; padding:10px 16px; background:var(--panel); border-bottom:1px solid #2c2f3a; }
+  #searchbar input { flex:1; background:var(--panel2); border:1px solid #343743; color:var(--text); padding:7px 12px; border-radius:6px; }
+  .search-sec { padding:10px 16px 4px; font-weight:600; color:var(--accent); }
+  .srow { display:flex; align-items:center; gap:8px; padding:5px 16px; border-bottom:1px solid #262933; }
+  .srow .tt { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .srow button { padding:3px 10px; font-size:12px; }
+  .srow .meta { color:var(--dim); font-size:12px; white-space:nowrap; }
 </style>
 </head>
 <body>
@@ -81,6 +88,7 @@
     <div id="tabs">
       <button id="tab-deezer" class="active" onclick="switchTab('deezer')">Deezer</button>
       <button id="tab-sc" onclick="switchTab('sc')">SoundCloud</button>
+      <button id="tab-search" onclick="switchTab('search')">Поиск</button>
       <button id="tab-errors" onclick="switchTab('errors')">Ошибки</button>
     </div>
     <div id="sc-add">
@@ -104,6 +112,16 @@
       <button onclick="downloadSelected()">Скачать выбранные</button>
       <button onclick="syncPlaylistOrder()" title="Перенумеровать файлы по порядку в стриминге и докачать недостающие">Синк: по порядку</button>
       <button onclick="syncAppend()" title="Не трогать текущие номера, новые треки — вниз списка">Синк: новые вниз</button>
+    </div>
+    <div id="searchbar" style="display:none">
+      <input id="searchInput" placeholder="Трек, альбом или исполнитель…" onkeydown="if(event.key==='Enter')runSearch()">
+      <select id="searchService">
+        <option value="both">Deezer + SC</option>
+        <option value="deezer">Deezer</option>
+        <option value="sc">SoundCloud</option>
+      </select>
+      <button onclick="runSearch()">Найти</button>
+      <button class="ghost" onclick="createDzPlaylist()" title="Создать плейлист в Deezer">+ Плейлист</button>
     </div>
     <div id="tracks"><div id="empty">Выберите плейлист слева</div></div>
   </div>
@@ -264,6 +282,7 @@ async function saveRoot() {
 async function loadPlaylists() {
   if (tab === 'sc') return loadScSources();
   if (tab === 'errors') return loadErrors();
+  if (tab === 'search') return loadSearchTargets();
   const pls = await api('/api/playlists');
   $('#playlists').innerHTML = pls.map(p => `
     <div class="pl ${current && current.id===p.id?'active':''}" onclick="selectPlaylist('${p.id}', '${esc(p.title).replace(/'/g,"\\'")}')">
@@ -309,14 +328,132 @@ function switchTab(t) {
   tab = t;
   $('#tab-deezer').classList.toggle('active', t==='deezer');
   $('#tab-sc').classList.toggle('active', t==='sc');
+  $('#tab-search').classList.toggle('active', t==='search');
   $('#tab-errors').classList.toggle('active', t==='errors');
   $('#sc-add').style.display = t==='sc' ? 'flex' : 'none';
+  $('#searchbar').style.display = t==='search' ? 'flex' : 'none';
   current = null;
   $('#toolbar').style.display = 'none';
+  if (t === 'search') {
+    $('#tracks').innerHTML = '<div id="empty">Слева выберите плейлист-назначение, затем ищите треки.<br>⬇ — скачать в выбранный плейлист, ＋ — добавить в плейлист Deezer без скачивания.</div>';
+    loadSearchTargets();
+    return;
+  }
   $('#tracks').innerHTML = t==='errors'
     ? '<div id="empty">Треки с ошибками загрузки/верификации — слева. Кнопка ↻ перезапускает сломавшийся этап.</div>'
     : '<div id="empty">Выберите ' + (t==='sc'?'источник':'плейлист') + ' слева</div>';
   loadPlaylists();
+}
+
+// ---------- поиск ----------
+let searchTarget = null;   // {key,title,provider}
+
+async function loadSearchTargets() {
+  const [dz, sc] = await Promise.all([api('/api/playlists'), api('/api/sc/sources')]);
+  const rows = [
+    ...dz.map(p => ({key:p.id, title:p.title, provider:'deezer', count:p.count})),
+    ...sc.map(s => ({key:'sc:'+s.id, title:s.title, provider:'sc', count:s.count})),
+  ];
+  if (!searchTarget && rows.length) searchTarget = rows[0];
+  $('#playlists').innerHTML = rows.map((r,i) => `
+    <div class="pl ${searchTarget && searchTarget.key===r.key?'active':''}" onclick="setSearchTarget(${i})">
+      <img alt="">
+      <div style="min-width:0">
+        <div class="t">${esc(r.title)}</div>
+        <div class="c">${r.provider==='deezer'?'Deezer':'SoundCloud'} · ${r.count ?? '?'}</div>
+      </div>
+    </div>`).join('');
+  window._targets = rows;
+}
+
+function setSearchTarget(i) {
+  searchTarget = window._targets[i];
+  loadSearchTargets();
+}
+
+async function runSearch() {
+  const q = $('#searchInput').value.trim();
+  if (!q) return;
+  $('#tracks').innerHTML = '<div id="empty">Ищу…</div>';
+  try {
+    const d = await api(`/api/search?q=${encodeURIComponent(q)}&service=${$('#searchService').value}`);
+    window._search = d;
+    renderSearch();
+  } catch (e) {
+    $('#tracks').innerHTML = `<div id="empty">⚠ ${esc(e.message)}</div>`;
+  }
+}
+
+function renderSearch() {
+  const d = window._search || {};
+  let html = '';
+  for (const [svc, label] of [['deezer','Deezer'],['sc','SoundCloud']]) {
+    const s = d[svc];
+    if (!s) continue;
+    html += `<div class="search-sec">${label}</div>`;
+    s.tracks.forEach((t,i) => {
+      html += `<div class="srow">
+        <div class="tt">${esc(t.title)} <span class="meta">${esc(t.artist)} · ${fmtDur(t.duration)}</span></div>
+        ${svc==='deezer' ? `<button class="ghost" title="Добавить в плейлист Deezer без скачивания" onclick="addDzTrack(${i})">＋</button>` : ''}
+        <button title="Скачать в выбранный плейлист" onclick="dlSearchTrack('${svc}',${i})">⬇</button>
+      </div>`;
+    });
+    s.albums.forEach((a,i) => {
+      html += `<div class="srow">
+        <div class="tt">💿 ${esc(a.title)} <span class="meta">${esc(a.artist)}${a.count?` · ${a.count} тр.`:''}</span></div>
+        <button title="Скачать альбом целиком" onclick="dlSearchAlbum('${svc}',${i})">⬇ альбом</button>
+      </div>`;
+    });
+    s.artists.forEach(a => {
+      html += `<div class="srow"><div class="tt">👤 ${esc(a.name)}</div></div>`;
+    });
+  }
+  $('#tracks').innerHTML = html || '<div id="empty">Ничего не найдено</div>';
+}
+
+function _dlPayload(tracks) {
+  if (!searchTarget) { alert('Слева выберите плейлист-назначение'); return null; }
+  return {target_key: searchTarget.key, target_title: searchTarget.title, tracks};
+}
+
+async function dlSearchTrack(svc, i) {
+  const t = window._search[svc].tracks[i];
+  const body = _dlPayload([{id:t.id, title:t.title, artist:t.artist, duration:t.duration, url:t.url, provider:svc}]);
+  if (!body) return;
+  const r = await api('/api/search/download', {body});
+  if (r.added_to_deezer) console.log(`+${r.added_to_deezer} в плейлист Deezer`);
+  startPolling();
+}
+
+async function dlSearchAlbum(svc, i) {
+  const a = window._search[svc].albums[i];
+  const body = _dlPayload([]);
+  if (!body) return;
+  $('#tracks').innerHTML = '<div id="empty">Загружаю треки альбома…</div>';
+  const tracks = svc === 'deezer'
+    ? await api(`/api/deezer/album/${a.id}`)
+    : await api(`/api/sc/resolve-tracks?url=${encodeURIComponent(a.url)}`);
+  body.tracks = tracks.map(t => ({id:t.id, title:t.title, artist:t.artist, duration:t.duration, url:t.url, provider:svc}));
+  const r = await api('/api/search/download', {body});
+  alert(`Альбом «${a.title}» поставлен в очередь (${tracks.length} треков)`);
+  startPolling();
+}
+
+async function addDzTrack(i) {
+  if (!searchTarget || searchTarget.provider !== 'deezer') {
+    return alert('Выберите слева плейлист Deezer как назначение');
+  }
+  const t = window._search.deezer.tracks[i];
+  const r = await api('/api/deezer/playlist/add', {body:{playlist_id: searchTarget.key, track_ids:[t.id]}});
+  alert(`«${t.title}» добавлен в «${searchTarget.title}»`);
+}
+
+async function createDzPlaylist() {
+  const title = prompt('Название нового плейлиста в Deezer:');
+  if (!title) return;
+  const r = await api('/api/deezer/playlist/create', {body:{title, track_ids:[]}});
+  alert(`Плейлист «${r.title}» создан`);
+  loadSearchTargets();
 }
 
 async function loadScSources() {

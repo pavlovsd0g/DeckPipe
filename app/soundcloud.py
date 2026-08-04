@@ -154,6 +154,34 @@ def _api_get(path: str, token: str | None, **params) -> dict:
     raise RuntimeError(last or "ошибка API")
 
 
+def search(q: str) -> dict:
+    """Поиск SoundCloud: треки/сеты/юзеры через api-v2."""
+    token = sc_oauth_token()
+    out = {"tracks": [], "albums": [], "artists": []}
+    try:
+        d = _api_get("/search/tracks", token, q=q, limit=10)
+        out["tracks"] = [_track_from_api(t) for t in d.get("collection", [])]
+    except Exception:
+        pass
+    try:
+        d = _api_get("/search/albums", token, q=q, limit=5)
+        out["albums"] = [{"id": str(p.get("id")), "title": p.get("title") or "?",
+                          "artist": (p.get("user") or {}).get("username", ""),
+                          "url": p.get("permalink_url") or "",
+                          "count": p.get("track_count", 0)}
+                         for p in d.get("collection", [])]
+    except Exception:
+        pass
+    try:
+        d = _api_get("/search/users", token, q=q, limit=5)
+        out["artists"] = [{"id": str(u.get("id")), "name": u.get("username") or "?",
+                           "url": u.get("permalink_url") or ""}
+                          for u in d.get("collection", [])]
+    except Exception:
+        pass
+    return out
+
+
 def resolve(url: str, use_cache: bool = True) -> dict:
     """URL (сет / страница юзера / tracks / лайки) -> {id, title, tracks[]}.
     Сеты и юзеры — через api-v2 (1-2 запроса), лайки — через yt-dlp."""

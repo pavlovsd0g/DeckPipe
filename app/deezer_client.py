@@ -32,7 +32,11 @@ CONFIG_PATH = ROOT / "config.local.json"
 
 def load_config() -> dict:
     if CONFIG_PATH.exists():
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        try:
+            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except UnicodeDecodeError:
+            # старый конфиг мог быть прочитан/переписан в cp1251 — чиним
+            return json.loads(CONFIG_PATH.read_text(encoding="cp1251"))
     return {}
 
 

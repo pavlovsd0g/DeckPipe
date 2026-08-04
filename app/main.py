@@ -340,7 +340,7 @@ def api_sc_download(source_id: str, body: DownloadIn, mode: str = "append"):
     src = next((s for s in _sc_sources() if s["id"] == source_id), None)
     if not src:
         raise HTTPException(404, "источник не найден")
-    tracks = [{**t, "provider": "sc"} for t in body.tracks]
+    tracks = [{**t, "provider": t.get("provider") or "sc"} for t in body.tracks]
     job_id = jobs.enqueue(_sc_key(source_id), src["title"], tracks, mode=mode)
     return {"job_id": job_id}
 
@@ -432,8 +432,14 @@ def api_sc_sync_account(force: bool = False):
     # вычищаем устаревший источник лайков (you/likes)
     sources = [s for s in sources if not s["url"].endswith("/you/likes")]
     added = 0
+    by_url = {s["url"]: s for s in sources}
     for it in items:
-        if not it.get("url") or any(s["url"] == it["url"] for s in sources):
+        if not it.get("url"):
+            continue
+        existing = by_url.get(it["url"])
+        if existing:  # обновляем название/счётчик (чинит старые битые данные)
+            existing["title"] = it.get("title", existing["title"])
+            existing["count"] = it.get("count", existing.get("count", 0))
             continue
         sources.append({"id": str(it["id"]), "url": it["url"],
                         "title": it.get("title", "?"), "count": it.get("count", 0)})
@@ -442,6 +448,145 @@ def api_sc_sync_account(force: bool = False):
     cfg["sc_last_sync"] = time.time()
     save_config(cfg)  # одна запись: и sources, и last_sync
     return {"added": added, "total": len(sources)}
+
+
+# ---------- Поиск (Deezer + SoundCloud) ----------
+def _search_deezer(q: str) -> dict:
+    out = {"tracks": [], "albums": [], "artists": []}
+    try:
+        d = requests.get("https://api.deezer.com/search", params={"q": q, "limit": 10}, timeout=20).json()
+        out["tracks"] = [{"id": str(t["id"]), "title": t.get("title") or "?",
+                          "artist": (t.get("artist") or {}).get("name", ""),
+                          "album": (t.get("album") or {}).get("title", ""),
+                          "duration": t.get("duration") or 0,
+                          "url": t.get("link") or "", "provider": "deezer"}
+                         for t in d.get("data", [])]
+    except Exception:
+        pass
+    try:
+        d = requests.get("https://api.deezer.com/search/album", params={"q": q, "limit": 5}, timeout=20).json()
+        out["albums"] = [{"id": str(a["id"]), "title": a.get("title") or "?",
+                          "artist": (a.get("artist") or {}).get("name", ""),
+                          "url": a.get("link") or ""} for a in d.get("data", [])]
+    except Exception:
+        pass
+    try:
+        d = requests.get("https://api.deezer.com/search/artist", params={"q": q, "limit": 5}, timeout=20).json()
+        out["artists"] = [{"id": str(a["id"]), "name": a.get("name") or "?",
+                           "url": a.get("link") or ""} for a in d.get("data", [])]
+    except Exception:
+        pass
+    return out
+
+
+@app.get("/api/search")
+def api_search(q: str, service: str = "both"):
+    out = {}
+    if service in ("both", "deezer"):
+        out["deezer"] = _search_deezer(q)
+    if service in ("both", "sc"):
+        sc_res = soundcloud.search(q)
+        for t in sc_res["tracks"]:
+            t["provider"] = "sc"
+        out["sc"] = sc_res
+    return out
+
+
+class SearchDownloadIn(BaseModel):
+    target_key: str       # deezer playlist id или sc:<id>
+    target_title: str
+    tracks: list          # [{id,title,artist,duration,url?,provider}]
+
+
+@app.post("/api/search/download")
+async def api_search_download(body: SearchDownloadIn):
+    """Скачать найденные треки в выбранный локальный плейлист.
+    Если цель — плейлист Deezer, треки также добавляются в него на сервисе."""
+    if not body.tracks:
+        raise HTTPException(400, "пустой список треков")
+    is_deezer_target = not body.target_key.startswith("sc:")
+    job_id = jobs.enqueue(body.target_key, body.target_title, body.tracks, mode="append")
+    added_remote = 0
+    if is_deezer_target:
+        dz_ids = [str(t["id"]) for t in body.tracks if t.get("provider", "deezer") == "deezer"]
+        if dz_ids:
+            try:
+                from deezer_python_gql import DeezerGQLClient
+                client = DeezerGQLClient(arl=load_config().get("arl"))
+                await client.add_tracks_to_playlist(playlist_id=body.target_key, track_ids=dz_ids)
+                added_remote = len(dz_ids)
+                _cache["tracks"].pop(body.target_key, None)
+            except Exception:
+                pass  # не критично: локальная загрузка идёт независимо
+    return {"job_id": job_id, "added_to_deezer": added_remote}
+
+
+class DzAddIn(BaseModel):
+    playlist_id: str
+    track_ids: list
+
+
+class DzCreateIn(BaseModel):
+    title: str
+    track_ids: list = []
+
+
+@app.post("/api/deezer/playlist/add")
+async def api_dz_add(body: DzAddIn):
+    """Добавить треки в плейлист Deezer без скачивания."""
+    try:
+        from deezer_python_gql import DeezerGQLClient
+        client = DeezerGQLClient(arl=load_config().get("arl"))
+        await client.add_tracks_to_playlist(playlist_id=body.playlist_id,
+                                            track_ids=[str(i) for i in body.track_ids])
+        _cache["playlists"] = (0, None)
+        _cache["tracks"].pop(body.playlist_id, None)
+        return {"ok": True, "added": len(body.track_ids)}
+    except Exception as e:
+        raise HTTPException(502, f"deezer: {e}")
+
+
+@app.post("/api/deezer/playlist/create")
+async def api_dz_create(body: DzCreateIn):
+    """Создать плейлист в Deezer (+ опционально сразу добавить треки)."""
+    try:
+        from deezer_python_gql import DeezerGQLClient
+        client = DeezerGQLClient(arl=load_config().get("arl"))
+        pl = await client.create_playlist(title=body.title, is_private=False, is_collaborative=False)
+        inner = getattr(pl, "playlist", pl)
+        pid = str(getattr(inner, "id"))
+        if body.track_ids:
+            await client.add_tracks_to_playlist(playlist_id=pid,
+                                                track_ids=[str(i) for i in body.track_ids])
+        _cache["playlists"] = (0, None)
+        return {"ok": True, "id": pid, "title": body.title}
+    except Exception as e:
+        raise HTTPException(502, f"deezer: {e}")
+
+
+@app.get("/api/deezer/album/{album_id}")
+def api_dz_album(album_id: str):
+    """Треки альбома Deezer для скачивания из поиска."""
+    d = requests.get(f"https://api.deezer.com/album/{album_id}", timeout=20).json()
+    if "tracks" not in d:
+        raise HTTPException(502, f"deezer: {d.get('error', 'album not found')}")
+    return [{"id": str(t["id"]), "title": t.get("title") or "?",
+             "artist": (t.get("artist") or {}).get("name", ""),
+             "album": d.get("title", ""),
+             "duration": t.get("duration") or 0, "provider": "deezer"}
+            for t in d["tracks"].get("data", [])]
+
+
+@app.get("/api/sc/resolve-tracks")
+def api_sc_resolve_tracks(url: str):
+    """Треки сета/страницы SC для скачивания из поиска."""
+    try:
+        data = soundcloud.resolve(url)
+    except Exception as e:
+        raise HTTPException(502, f"SoundCloud: {e}")
+    return [{**t, "provider": "sc"} for t in data["tracks"]]
+
+
 @app.get("/api/errors")
 async def api_errors():
     """Все треки со статусом verify_failed_* по всем плейлистам и источникам."""
