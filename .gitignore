@@ -7,3 +7,4 @@ downloads/
 
 # секреты и локальные настройки — НЕ коммитить
 config.local.json
+.sc_cookies.txt

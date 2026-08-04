@@ -55,12 +55,16 @@
   .bar i { display:block; height:100%; background:var(--accent); transition:width .3s; }
   .dim { color:var(--dim); }
   #empty { padding:40px; text-align:center; color:var(--dim); }
+  #modalOverlay { position:fixed; inset:0; background:rgba(0,0,0,.6); display:flex; align-items:center; justify-content:center; z-index:100; }
+  #modal { background:var(--panel); border:1px solid #343743; border-radius:12px; padding:18px; width:520px; max-width:92vw; }
+  .scacc { display:flex; gap:8px; align-items:center; padding:4px 0; font-size:13px; }
 </style>
 </head>
 <body>
 <header>
   <h1>Deck<span>Pipe</span></h1>
-  <div id="user">…</div>
+  <button class="ghost" id="btnLoginDeezer" onclick="openLogin('deezer')">Deezer: вход</button>
+  <button class="ghost" id="btnLoginSc" onclick="openLogin('sc')">SC: вход</button>
   <div id="settings">
     <select id="wavMode" onchange="saveWavMode()" title="Режим хранения скачанных файлов">
       <option value="source">Исходный формат</option>
@@ -106,6 +110,26 @@
 </main>
 <div id="jobs"></div>
 
+<div id="modalOverlay" style="display:none" onclick="if(event.target===this)closeLogin()">
+  <div id="modal">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h2 id="loginTitle" style="font-size:16px"></h2>
+      <button class="ghost" onclick="closeLogin()">×</button>
+    </div>
+    <div id="loginSteps" style="color:var(--dim);font-size:13px;margin:10px 0"></div>
+    <input id="loginToken" style="width:100%;background:var(--panel2);border:1px solid #343743;color:var(--text);padding:8px 10px;border-radius:6px" placeholder="">
+    <div style="display:flex;gap:8px;margin-top:12px;align-items:center">
+      <button onclick="doLogin()">Войти</button>
+      <span id="loginResult" style="font-size:13px"></span>
+    </div>
+    <div id="scImport" style="display:none;margin-top:14px;border-top:1px solid #2c2f3a;padding-top:10px">
+      <div style="font-size:13px;margin-bottom:8px">Импортировать в источники:</div>
+      <div id="scAccountList" style="max-height:200px;overflow-y:auto"></div>
+      <button style="margin-top:8px" onclick="importScAccount()">Импортировать выбранные</button>
+    </div>
+  </div>
+</div>
+
 <script>
 let current = null;   // {kind:'deezer'|'sc', id, title}
 let tab = 'deezer';
@@ -127,8 +151,82 @@ async function loadConfig() {
   $('#musicRoot').value = c.music_root;
   $('#wavMode').value = c.wav_mode || 'source';
   $('#numbering').checked = !!c.numbering;
-  $('#user').textContent = c.user && c.user.email
-    ? `Deezer: ${c.user.email}` : `ARL: ${c.user && c.user.error ? 'ошибка — '+c.user.error : 'не задан'}`;
+  $('#btnLoginDeezer').textContent = c.user && c.user.email ? `Deezer: ${c.user.email}` : 'Deezer: вход';
+  $('#btnLoginDeezer').style.color = c.user && c.user.email ? 'var(--ok)' : '';
+  $('#btnLoginSc').textContent = c.sc_user ? `SC: ${c.sc_user}` : 'SC: вход';
+  $('#btnLoginSc').style.color = c.sc_user ? 'var(--ok)' : '';
+}
+
+// ---------- логин ----------
+let loginService = 'deezer';
+
+function openLogin(service) {
+  loginService = service;
+  $('#loginResult').textContent = '';
+  $('#loginResult').style.color = '';
+  $('#loginToken').value = '';
+  $('#scImport').style.display = 'none';
+  if (service === 'deezer') {
+    $('#loginTitle').textContent = 'Вход в Deezer';
+    $('#loginSteps').innerHTML = `1. Откройте <a href="https://www.deezer.com" target="_blank" style="color:var(--accent)">deezer.com</a> и войдите в аккаунт<br>
+      2. F12 → Application → Cookies → <b>arl</b> — скопируйте значение<br>
+      3. Вставьте ниже (в Tauri-версии это будет автоматически)`;
+    $('#loginToken').placeholder = 'ARL cookie (192 символа)';
+  } else {
+    $('#loginTitle').textContent = 'Вход в SoundCloud';
+    $('#loginSteps').innerHTML = `1. Откройте <a href="https://soundcloud.com" target="_blank" style="color:var(--accent)">soundcloud.com</a> и войдите<br>
+      2. F12 → Application → Cookies → <b>oauth_token</b> — скопируйте значение<br>
+      3. Вставьте ниже — подтянутся ваши плейлисты и лайки`;
+    $('#loginToken').placeholder = 'oauth_token cookie';
+  }
+  $('#modalOverlay').style.display = 'flex';
+  $('#loginToken').focus();
+}
+
+function closeLogin() { $('#modalOverlay').style.display = 'none'; }
+
+async function doLogin() {
+  const token = $('#loginToken').value.trim();
+  if (!token) return;
+  const url = loginService === 'deezer' ? '/api/login/deezer' : '/api/login/soundcloud';
+  const body = loginService === 'deezer' ? {arl: token} : {oauth_token: token};
+  try {
+    const r = await api(url, {body});
+    $('#loginResult').style.color = 'var(--ok)';
+    $('#loginResult').textContent = loginService === 'deezer'
+      ? `✔ ${r.email}` : `✔ ${r.username}`;
+    loadConfig();
+    if (loginService === 'sc') loadScAccount();
+    else { closeLogin(); loadPlaylists(); }
+  } catch (e) {
+    $('#loginResult').style.color = 'var(--err)';
+    $('#loginResult').textContent = '✖ ' + e.message;
+  }
+}
+
+async function loadScAccount() {
+  try {
+    const d = await api('/api/sc/account');
+    const items = [d.likes, ...d.playlists];
+    $('#scAccountList').innerHTML = items.map(p => `
+      <label class="scacc"><input type="checkbox" class="scacc-cb"
+        data-id="${p.id}" data-title="${esc(p.title)}" data-url="${esc(p.url)}" data-count="${p.count||0}">
+        ${esc(p.title)} <span class="dim">(${p.count ?? '?'})</span></label>`).join('');
+    $('#scImport').style.display = 'block';
+  } catch (e) {
+    $('#loginResult').style.color = 'var(--err)';
+    $('#loginResult').textContent = 'аккаунт не загрузился: ' + e.message;
+  }
+}
+
+async function importScAccount() {
+  const items = [...document.querySelectorAll('.scacc-cb:checked')].map(c => ({
+    id: c.dataset.id, title: c.dataset.title, url: c.dataset.url, count: +c.dataset.count}));
+  if (!items.length) return;
+  const r = await api('/api/sc/account/import', {body:{items}});
+  alert(`Импортировано: ${r.added}`);
+  closeLogin();
+  switchTab('sc');
 }
 
 async function saveWavMode() {
@@ -258,14 +356,19 @@ function selectPlaylist(id, title) {
 async function loadTracks(pl) {
   $('#toolbar').style.display = 'flex';
   $('#pltitle').textContent = pl.title;
-  $('#tracks').innerHTML = '<div id="empty">Загрузка…</div>';
-  const url = pl.kind === 'sc'
-    ? `/api/sc/sources/${pl.id}/tracks`
-    : `/api/playlists/${pl.id}/tracks?title=${encodeURIComponent(pl.title)}`;
-  const d = await api(url);
-  tracks = d.tracks;
-  $('#plpath').textContent = d.path;
-  renderTracks();
+  $('#tracks').innerHTML = '<div id="empty">Загрузка… (большие плейлисты — до ~20 сек)</div>';
+  try {
+    const url = pl.kind === 'sc'
+      ? `/api/sc/sources/${pl.id}/tracks`
+      : `/api/playlists/${pl.id}/tracks?title=${encodeURIComponent(pl.title)}`;
+    const d = await api(url);
+    tracks = d.tracks;
+    $('#plpath').textContent = d.path;
+    renderTracks();
+  } catch (e) {
+    $('#tracks').innerHTML = `<div id="empty">⚠ Не удалось загрузить: ${esc(e.message)}<br><br>
+      <button class="ghost" onclick="rescan()">Повторить</button></div>`;
+  }
 }
 
 function renderTracks() {

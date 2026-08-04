@@ -56,11 +56,13 @@ def fetch_tracks(playlist_id: str):
         if "data" not in d:
             raise HTTPException(502, f"deezer api: {d.get('error', d)}")
         for t in d["data"]:
+            if not isinstance(t, dict) or "id" not in t:
+                continue
             tracks.append({
-                "id": str(t["id"]), "title": t["title"],
-                "artist": t["artist"]["name"],
-                "album": t.get("album", {}).get("title", ""),
-                "duration": t.get("duration", 0),
+                "id": str(t["id"]), "title": t.get("title") or "?",
+                "artist": (t.get("artist") or {}).get("name", ""),
+                "album": (t.get("album") or {}).get("title", ""),
+                "duration": t.get("duration") or 0,
             })
         if "next" not in d or not d["data"]:
             break
@@ -96,6 +98,7 @@ def api_config():
     return {"music_root": str(library.music_root()), "arl_set": bool(cfg.get("arl")),
             "wav_mode": cfg.get("wav_mode", "source"),
             "numbering": cfg.get("numbering", True),
+            "sc_user": cfg.get("sc_username") or None,
             "user": user}
 
 
@@ -299,7 +302,69 @@ def api_sc_download(source_id: str, body: DownloadIn, mode: str = "append"):
     return {"job_id": job_id}
 
 
-# ---------- Лист ошибок ----------
+# ---------- Логин ----------
+class LoginDeezerIn(BaseModel):
+    arl: str
+
+
+class LoginScIn(BaseModel):
+    oauth_token: str
+
+
+@app.post("/api/login/deezer")
+def api_login_deezer(body: LoginDeezerIn):
+    from .deezer_client import DeezerSession, save_config, _session_cache
+    try:
+        ds = DeezerSession(body.arl.strip())
+    except Exception as e:
+        raise HTTPException(401, f"ARL не принят: {e}")
+    cfg = load_config()
+    cfg["arl"] = body.arl.strip()
+    save_config(cfg)
+    _session_cache["session"] = None  # сброс кеша сессии
+    return {"id": ds.user["USER_ID"], "email": ds.user.get("EMAIL")}
+
+
+@app.post("/api/login/soundcloud")
+def api_login_sc(body: LoginScIn):
+    token = body.oauth_token.strip()
+    try:
+        user = soundcloud.sc_validate(token)
+    except Exception as e:
+        raise HTTPException(401, f"oauth_token не принят: {e}")
+    cfg = load_config()
+    cfg["sc_oauth"] = token
+    cfg["sc_username"] = user.get("username", "")
+    save_config(cfg)
+    return {"id": user.get("id"), "username": user.get("username")}
+
+
+@app.get("/api/sc/account")
+def api_sc_account():
+    token = soundcloud.sc_oauth_token()
+    if not token:
+        raise HTTPException(401, "SoundCloud: не выполнен вход")
+    playlists = soundcloud.sc_account_playlists(token)
+    return {"playlists": playlists,
+            "likes": {"id": "likes", "title": "❤ Лайки", "url": "https://soundcloud.com/you/likes"}}
+
+
+class ScImportIn(BaseModel):
+    items: list  # [{id,title,url}]
+
+
+@app.post("/api/sc/account/import")
+def api_sc_import(body: ScImportIn):
+    sources = _sc_sources()
+    added = 0
+    for it in body.items:
+        if not it.get("url") or any(s["url"] == it["url"] for s in sources):
+            continue
+        sources.append({"id": str(it["id"]), "url": it["url"],
+                        "title": it.get("title", "?"), "count": it.get("count", 0)})
+        added += 1
+    _sc_save_sources(sources)
+    return {"added": added}
 @app.get("/api/errors")
 async def api_errors():
     """Все треки со статусом verify_failed_* по всем плейлистам и источникам."""

@@ -14,7 +14,7 @@ log = logging.getLogger(__name__)
 UA = {"User-Agent": "Mozilla/5.0"}
 
 
-def deezer_cover_url(picture_id: str, size: int = 1000) -> str:
+def deezer_cover_url(picture_id: str, size: int = 500) -> str:
     return f"https://e-cdns-images.dzcdn.net/images/cover/{picture_id}/{size}x{size}-000000-80-0-0.jpg"
 
 
