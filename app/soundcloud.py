@@ -23,24 +23,88 @@ def sc_oauth_token() -> str | None:
     return load_config().get("sc_oauth")
 
 
+_CID_FALLBACK = "sUn5toeW5d8MC2jOLpE2yAibTG7RRYsA"
+_cid_cache = {"id": None, "ts": 0}
+
+
+def sc_client_id() -> str:
+    """client_id веб-приложения SC (из JS-ассетов, кеш 6 ч, fallback — константа)."""
+    import re
+    if _cid_cache["id"] and time.time() - _cid_cache["ts"] < 6 * 3600:
+        return _cid_cache["id"]
+    try:
+        UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        html = requests.get("https://soundcloud.com", headers=UA, timeout=20).text
+        scripts = re.findall(r'<script[^>]+src="([^"]+\.js)"', html)
+        for s in scripts:
+            if s.startswith("/"):
+                s = "https://soundcloud.com" + s
+            try:
+                js = requests.get(s, headers=UA, timeout=20).text
+            except Exception:
+                continue
+            m = re.search(r'client_id\s*:\s*"([0-9a-zA-Z]{32})"', js)
+            if m:
+                _cid_cache.update(id=m.group(1), ts=time.time())
+                return _cid_cache["id"]
+    except Exception:
+        pass
+    return _CID_FALLBACK
+
+
+def _headers(token: str) -> dict:
+    return {"Authorization": f"OAuth {token}"}
+
+
+def _params(**kw) -> dict:
+    return {"client_id": sc_client_id(), **kw}
+
+
 def sc_validate(token: str) -> dict:
     """Проверяет oauth_token на /me. Возвращает данные юзера."""
-    r = requests.get(f"{SC_API}/me", headers={"Authorization": f"OAuth {token}"}, timeout=20)
+    r = requests.get(f"{SC_API}/me", headers=_headers(token),
+                     params=_params(), timeout=20)
     if r.status_code != 200:
         raise RuntimeError(f"токен не принят (HTTP {r.status_code})")
     return r.json()
 
 
 def sc_account_playlists(token: str) -> list:
-    """Плейлисты аккаунта: [{id,title,url,count}]."""
-    out, url = [], f"{SC_API}/me/playlists?limit=50&linked_partitioning=1"
+    """Свои + лайкнутые плейлисты: [{id,title,url,count}]."""
+    me = sc_validate(token)
+    uid = me["id"]
+    out = []
+    # свои плейлисты
+    url = f"{SC_API}/users/{uid}/playlists"
     while url:
-        r = requests.get(url, headers={"Authorization": f"OAuth {token}"}, timeout=20)
+        r = requests.get(url, headers=_headers(token),
+                         params=_params(limit=50, linked_partitioning=1) if SC_API in url else None,
+                         timeout=20)
         r.raise_for_status()
         d = r.json()
         for p in d.get("collection", []):
             out.append({"id": str(p["id"]), "title": p.get("title") or "?",
                         "url": p.get("permalink_url"), "count": p.get("track_count", 0)})
+        url = d.get("next_href")
+    # лайкнутые плейлисты (библиотека)
+    url = f"{SC_API}/me/library/all"
+    seen = {p["id"] for p in out}
+    while url:
+        r = requests.get(url, headers=_headers(token),
+                         params=_params(limit=50, linked_partitioning=1) if SC_API in url else None,
+                         timeout=20)
+        if r.status_code != 200:
+            break
+        d = r.json()
+        for it in d.get("collection", []):
+            if it.get("type") not in ("playlist-like", "playlist"):
+                continue
+            p = it.get("playlist") or it
+            pid = str(p.get("id", ""))
+            if pid and pid not in seen and p.get("permalink_url"):
+                seen.add(pid)
+                out.append({"id": pid, "title": "♥ " + (p.get("title") or "?"),
+                            "url": p["permalink_url"], "count": p.get("track_count", 0)})
         url = d.get("next_href")
     return out
 
