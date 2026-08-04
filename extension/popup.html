@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<style>
+  body { width: 280px; font: 13px/1.5 system-ui, sans-serif; background:#1d1f26; color:#e8e9ed; padding: 14px; margin: 0; }
+  h1 { font-size: 15px; margin: 0 0 8px; }
+  h1 span { color: #7c6cff; }
+  button { background: #7c6cff; color: #fff; border: 0; padding: 8px 12px; border-radius: 6px; cursor: pointer; width: 100%; margin-top: 6px; }
+  button.sec { background: #23252e; border: 1px solid #3a3e4c; }
+  #status { margin-top: 10px; font-size: 12px; white-space: pre-line; }
+  .ok { color: #3fce7c; } .err { color: #ff5c6c; }
+</style>
+</head>
+<body>
+  <h1>Deck<span>Pipe</span> Helper</h1>
+  <div>Если вы вошли в Deezer/SoundCloud в этом браузере — нажмите кнопку, приложение подхватит вход само.</div>
+  <button id="send">Подхватить вход в DeckPipe</button>
+  <div id="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

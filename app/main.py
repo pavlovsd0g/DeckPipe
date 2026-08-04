@@ -15,6 +15,8 @@ from . import jobs, library
 from .deezer_client import load_config, get_session
 
 app = FastAPI(title="DeckPipe")
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 STATIC = Path(__file__).parent / "static"
 APP_VERSION = "0.5.0"
 
@@ -406,6 +408,41 @@ class LoginDeezerIn(BaseModel):
 
 class LoginScIn(BaseModel):
     oauth_token: str
+
+
+class LoginFromBrowserIn(BaseModel):
+    arl: str | None = None
+    oauth_token: str | None = None
+
+
+@app.post("/api/login/from-browser")
+def api_login_from_browser(body: LoginFromBrowserIn):
+    """Токены из браузерного расширения DeckPipe Helper."""
+    out = {}
+    if body.arl:
+        from .deezer_client import DeezerSession, _session_cache
+        try:
+            ds = DeezerSession(body.arl.strip())
+            cfg = load_config()
+            cfg["arl"] = body.arl.strip()
+            save_config(cfg)
+            _session_cache["session"] = None
+            out["deezer"] = ds.user.get("EMAIL")
+        except Exception as e:
+            out["deezer_error"] = str(e)
+    if body.oauth_token:
+        try:
+            user = soundcloud.sc_validate(body.oauth_token.strip())
+            cfg = load_config()
+            cfg["sc_oauth"] = body.oauth_token.strip()
+            cfg["sc_username"] = user.get("username", "")
+            save_config(cfg)
+            out["sc"] = user.get("username")
+        except Exception as e:
+            out["sc_error"] = str(e)
+    if not out:
+        raise HTTPException(400, "пустые токены")
+    return out
 
 
 @app.post("/api/login/deezer")

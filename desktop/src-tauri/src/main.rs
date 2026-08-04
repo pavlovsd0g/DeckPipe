@@ -50,7 +50,7 @@ fn main() {
             let (mut rx, _child) = shell
                 .sidecar("deckpipe-backend")
                 .map_err(|e| e.to_string())?
-                .args(["--port", "0"])
+                .args(["--port", "24680"])
                 .spawn()
                 .map_err(|e| e.to_string())?;
 

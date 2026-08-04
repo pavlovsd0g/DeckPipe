@@ -18,9 +18,14 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     args = ap.parse_args()
     port = args.port or free_port()
-    # порт печатаем — Tauri читает его из stdout sidecar
-    print(f"DECKPIPE_PORT={port}", flush=True)
-    uvicorn.run("app.main:app", host=args.host, port=port, log_level="warning")
+    for attempt in (port, free_port()):
+        try:
+            # порт печатаем — Tauri читает его из stdout sidecar
+            print(f"DECKPIPE_PORT={attempt}", flush=True)
+            uvicorn.run("app.main:app", host=args.host, port=attempt, log_level="warning")
+            break
+        except OSError:
+            continue
 
 
 if __name__ == "__main__":

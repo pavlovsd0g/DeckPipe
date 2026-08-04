@@ -218,15 +218,15 @@ function openLogin(service) {
   $('#scImport').style.display = 'none';
   if (service === 'deezer') {
     $('#loginTitle').textContent = 'Вход в Deezer';
-    $('#loginSteps').innerHTML = `1. Откройте <a href="https://www.deezer.com" target="_blank" style="color:var(--accent)">deezer.com</a> и войдите в аккаунт<br>
-      2. F12 → Application → Cookies → <b>arl</b> — скопируйте значение<br>
-      3. Вставьте ниже (в Tauri-версии это будет автоматически)`;
+    $('#loginSteps').innerHTML = `<b>Способ 1 — расширение DeckPipe Helper</b> (папка extension/):<br>
+      opera://extensions → Режим разработчика → Загрузить распакованное → клик по иконке DeckPipe — вход подхватится из браузера сам.<br>
+      <b>Способ 2 — вручную:</b> F12 → Application → Cookies → <b>arl</b> на deezer.com → вставить ниже`;
     $('#loginToken').placeholder = 'ARL cookie (192 символа)';
   } else {
     $('#loginTitle').textContent = 'Вход в SoundCloud';
-    $('#loginSteps').innerHTML = `1. Откройте <a href="https://soundcloud.com" target="_blank" style="color:var(--accent)">soundcloud.com</a> и войдите<br>
-      2. F12 → Application → Cookies → <b>oauth_token</b> — скопируйте значение<br>
-      3. Вставьте ниже — подтянутся ваши плейлисты и лайки`;
+    $('#loginSteps').innerHTML = `<b>Способ 1 — расширение DeckPipe Helper</b> (папка extension/):<br>
+      opera://extensions → Режим разработчика → Загрузить распакованное → клик по иконке DeckPipe — вход подхватится из браузера сам.<br>
+      <b>Способ 2 — вручную:</b> F12 → Application → Cookies → <b>oauth_token</b> на soundcloud.com → вставить ниже`;
     $('#loginToken').placeholder = 'oauth_token cookie';
   }
   $('#modalOverlay').style.display = 'flex';
