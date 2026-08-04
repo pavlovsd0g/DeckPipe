@@ -15,3 +15,4 @@ desktop/src-tauri/target/
 # секреты и локальные настройки — НЕ коммитить
 config.local.json
 .sc_cookies.txt
+desktop/src-tauri/binaries/
