@@ -73,6 +73,7 @@ def fetch_tracks(playlist_id: str):
 class ConfigIn(BaseModel):
     music_root: str | None = None
     wav_mode: str | None = None  # source|wav|wav_delete
+    numbering: bool | None = None
 
 
 class DownloadIn(BaseModel):
@@ -94,6 +95,7 @@ def api_config():
         user = {"error": str(e)}
     return {"music_root": str(library.music_root()), "arl_set": bool(cfg.get("arl")),
             "wav_mode": cfg.get("wav_mode", "source"),
+            "numbering": cfg.get("numbering", True),
             "user": user}
 
 
@@ -106,6 +108,10 @@ def api_set_config(c: ConfigIn):
     if c.wav_mode in ("source", "wav", "wav_delete"):
         cfg = load_config()
         cfg["wav_mode"] = c.wav_mode
+        save_config(cfg)
+    if c.numbering is not None:
+        cfg = load_config()
+        cfg["numbering"] = bool(c.numbering)
         save_config(cfg)
     return api_config()
 
@@ -134,11 +140,24 @@ def api_tracks(playlist_id: str, title: str = ""):
 
 
 @app.post("/api/playlists/{playlist_id}/download")
-def api_download(playlist_id: str, body: DownloadIn, title: str = ""):
+def api_download(playlist_id: str, body: DownloadIn, title: str = "", mode: str = "append"):
     if not body.tracks:
         raise HTTPException(400, "пустой список треков")
-    job_id = jobs.enqueue(playlist_id, title or playlist_id, body.tracks)
+    job_id = jobs.enqueue(playlist_id, title or playlist_id, body.tracks, mode=mode)
     return {"job_id": job_id}
+
+
+class RenumberIn(BaseModel):
+    order: list  # [track_id, ...] в нужном порядке
+    total: int = 0
+
+
+@app.post("/api/playlists/{key}/renumber")
+def api_renumber(key: str, body: RenumberIn, title: str = ""):
+    pl_dir = library.playlist_dir(key, title or key)
+    digits = library.digits_for(body.total or len(body.order))
+    renamed = library.renumber_playlist(pl_dir, [str(i) for i in body.order], digits)
+    return {"renamed": renamed}
 
 
 @app.post("/api/playlists/{playlist_id}/bind")
@@ -271,12 +290,12 @@ def api_sc_tracks(source_id: str):
 
 
 @app.post("/api/sc/sources/{source_id}/download")
-def api_sc_download(source_id: str, body: DownloadIn):
+def api_sc_download(source_id: str, body: DownloadIn, mode: str = "append"):
     src = next((s for s in _sc_sources() if s["id"] == source_id), None)
     if not src:
         raise HTTPException(404, "источник не найден")
     tracks = [{**t, "provider": "sc"} for t in body.tracks]
-    job_id = jobs.enqueue(_sc_key(source_id), src["title"], tracks)
+    job_id = jobs.enqueue(_sc_key(source_id), src["title"], tracks, mode=mode)
     return {"job_id": job_id}
 
 
@@ -304,7 +323,8 @@ async def api_errors():
                     "track": {"id": tid, "title": e.get("title", "?"),
                               "artist": e.get("artist", ""),
                               "duration": e.get("duration_expected", 0),
-                              "url": e.get("url", "")},
+                              "url": e.get("url", ""),
+                              "position": e.get("position")},
                 })
     return out
 
@@ -338,7 +358,9 @@ def api_report(body: ReportIn):
 def api_retry(body: RetryIn):
     provider = "sc" if body.playlist_key.startswith("sc:") else "deezer"
     track = {**body.track, "provider": provider}
-    job_id = jobs.enqueue(body.playlist_key, body.playlist_title, [track])
+    # если у трека была позиция — восстанавливаем её, а не кидаем вниз
+    mode = "playlist_order" if track.get("position") else "append"
+    job_id = jobs.enqueue(body.playlist_key, body.playlist_title, [track], mode=mode)
     return {"job_id": job_id}
 
 

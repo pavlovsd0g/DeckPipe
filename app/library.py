@@ -65,6 +65,55 @@ def update_track_status(pl_dir: Path, deezer_id: str, entry: dict):
     save_sidecar(pl_dir, sc)
 
 
+# ---------- нумерация треков ----------
+
+def digits_for(total: int) -> int:
+    return 3 if total >= 100 else 2
+
+
+def strip_number_prefix(filename: str) -> str:
+    """убрать 'NN - ' / 'NN. ' из начала имени файла."""
+    stem, ext = filename.rsplit(".", 1) if "." in filename else (filename, "")
+    stem = re.sub(r"^\s*\d{1,3}\s*[-._)]\s*", "", stem)
+    return f"{stem}.{ext}" if ext else stem
+
+
+def max_position(sidecar_tracks: dict) -> int:
+    return max((int(e.get("position", 0) or 0) for e in sidecar_tracks.values()), default=0)
+
+
+def numbered_name(num: int, digits: int, artist: str, title: str, ext: str) -> str:
+    base = sanitize_filename(f"{artist} - {title}") if artist else sanitize_filename(title)
+    return f"{num:0{digits}d} - {base}.{ext}"
+
+
+def renumber_playlist(pl_dir: Path, ordered_ids: list, digits: int) -> int:
+    """Перенумеровывает файлы по порядку ordered_ids. Возвращает число переименований."""
+    sc = load_sidecar(pl_dir)
+    tracks = sc.get("tracks", {})
+    renamed = 0
+    for i, tid in enumerate(ordered_ids, start=1):
+        e = tracks.get(str(tid))
+        if not e or not e.get("file"):
+            continue
+        old = pl_dir / e["file"]
+        if not old.exists():
+            continue
+        new_name = f"{i:0{digits}d} - {strip_number_prefix(e['file'])}"
+        if e["file"] == new_name and e.get("position") == i:
+            continue
+        new = pl_dir / new_name
+        if new.exists() and new != old:
+            continue  # не перетираем чужой файл
+        old.rename(new)
+        e["file"] = new_name
+        e["position"] = i
+        renamed += 1
+    if renamed:
+        save_sidecar(pl_dir, sc)
+    return renamed
+
+
 # ---------- нормализация и нечёткое сопоставление файлов ----------
 
 def _normalize(s: str) -> str:

@@ -93,10 +93,13 @@
       </div>
       <div class="spacer"></div>
       <span id="plstats" class="dim"></span>
+      <label class="dim" style="font-size:12px" title="Файлы с номерами: 01 - Artist - Title">
+        <input type="checkbox" id="numbering" onchange="saveNumbering()"> NN</label>
       <button class="ghost" onclick="rescan()">Пересканировать</button>
       <button class="ghost" onclick="bindPath()">Папка плейлиста…</button>
       <button onclick="downloadSelected()">Скачать выбранные</button>
-      <button onclick="syncAll()">Синхронизировать всё</button>
+      <button onclick="syncPlaylistOrder()" title="Перенумеровать файлы по порядку в стриминге и докачать недостающие">Синк: по порядку</button>
+      <button onclick="syncAppend()" title="Не трогать текущие номера, новые треки — вниз списка">Синк: новые вниз</button>
     </div>
     <div id="tracks"><div id="empty">Выберите плейлист слева</div></div>
   </div>
@@ -123,12 +126,17 @@ async function loadConfig() {
   const c = await api('/api/config');
   $('#musicRoot').value = c.music_root;
   $('#wavMode').value = c.wav_mode || 'source';
+  $('#numbering').checked = !!c.numbering;
   $('#user').textContent = c.user && c.user.email
     ? `Deezer: ${c.user.email}` : `ARL: ${c.user && c.user.error ? 'ошибка — '+c.user.error : 'не задан'}`;
 }
 
 async function saveWavMode() {
   await api('/api/config', {body:{wav_mode: $('#wavMode').value}});
+}
+
+async function saveNumbering() {
+  await api('/api/config', {body:{numbering: $('#numbering').checked}});
 }
 
 async function sendReport() {
@@ -289,28 +297,48 @@ function selectedTracks(onlyMissing = false) {
   const idxs = [...document.querySelectorAll('.trk:checked')].map(c => +c.dataset.i);
   let sel = idxs.map(i => tracks[i]);
   if (onlyMissing) sel = sel.filter(t => t.status !== 'ok');
-  return sel.map(t => ({id:t.id, title:t.title, artist:t.artist, duration:t.duration, url:t.url}));
+  return sel.map(t => ({id:t.id, title:t.title, artist:t.artist, duration:t.duration, url:t.url, total:tracks.length}));
 }
 
-function downloadUrl() {
-  return current.kind === 'sc'
+function downloadUrl(mode) {
+  const base = current.kind === 'sc'
     ? `/api/sc/sources/${current.id}/download`
     : `/api/playlists/${current.id}/download?title=${encodeURIComponent(current.title)}`;
+  return base + (base.includes('?') ? '&' : '?') + 'mode=' + mode;
 }
 
 async function downloadSelected() {
   const sel = selectedTracks(true);
   if (!sel.length) return alert('Ничего не выбрано (уже скачанные пропускаются)');
-  await api(downloadUrl(), {body:{tracks:sel}});
+  await api(downloadUrl('append'), {body:{tracks:sel}});
   startPolling();
 }
 
-async function syncAll() {
+async function syncPlaylistOrder() {
+  // 1) перенумеровать существующие файлы по порядку стриминга
+  const order = tracks.map(t => t.id);
+  const key = current.kind === 'sc' ? 'sc:' + current.id : current.id;
+  const rn = await api(`/api/playlists/${key}/renumber?title=${encodeURIComponent(current.title)}`,
+                       {body:{order, total: tracks.length}});
+  // 2) докачать недостающие с позициями из плейлиста
   const missing = tracks.filter(t => t.status !== 'ok')
-    .map(t => ({id:t.id, title:t.title, artist:t.artist, duration:t.duration, url:t.url}));
+    .map((t) => ({id:t.id, title:t.title, artist:t.artist, duration:t.duration, url:t.url,
+                  position: tracks.indexOf(t)+1, total: tracks.length}));
+  if (!missing.length) {
+    alert(`Порядок применён (переименовано: ${rn.renamed}). Всё уже скачано.`);
+    rescan(); return;
+  }
+  if (!confirm(`Перенумеровано: ${rn.renamed}. Скачать ${missing.length} треков?`)) { rescan(); return; }
+  await api(downloadUrl('playlist_order'), {body:{tracks:missing}});
+  startPolling();
+}
+
+async function syncAppend() {
+  const missing = tracks.filter(t => t.status !== 'ok')
+    .map(t => ({id:t.id, title:t.title, artist:t.artist, duration:t.duration, url:t.url, total:tracks.length}));
   if (!missing.length) return alert('Всё уже скачано');
-  if (!confirm(`Скачать ${missing.length} треков?`)) return;
-  await api(downloadUrl(), {body:{tracks:missing}});
+  if (!confirm(`Скачать ${missing.length} треков (новые — вниз списка)?`)) return;
+  await api(downloadUrl('append'), {body:{tracks:missing}});
   startPolling();
 }
 

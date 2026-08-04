@@ -19,15 +19,16 @@ def _now():
     return int(time.time())
 
 
-def enqueue(playlist_id: str, playlist_title: str, tracks: list) -> str:
-    """tracks: [{id, title, artist, duration}] -> job_id"""
+def enqueue(playlist_id: str, playlist_title: str, tracks: list, mode: str = "append") -> str:
+    """tracks: [{id, title, artist, duration, position?}] -> job_id
+    mode: 'append' (новые вниз) | 'playlist_order' (номер = позиция в плейлисте)"""
     global _worker_started
     job_id = uuid.uuid4().hex[:8]
     job = {
         "id": job_id, "playlist_id": playlist_id, "title": playlist_title,
         "total": len(tracks), "done": 0, "failed": 0, "current": None,
-        "state": "queued",  # queued|running|done
-        "results": [],      # {id, title, ok, error, quality}
+        "state": "queued", "mode": mode,
+        "results": [],
         "created_at": _now(),
     }
     with _lock:
@@ -59,6 +60,31 @@ def _wav_mode() -> str:
     return load_config().get("wav_mode", "source")  # source|wav|wav_delete
 
 
+def _numbering_on() -> bool:
+    return bool(load_config().get("numbering", True))
+
+
+def _apply_numbering(pl_dir, t, fpath, job, counter):
+    """Переименовывает файл в 'NN - Artist - Title.ext' по режиму синка.
+    Возвращает (fpath, num|None)."""
+    if not _numbering_on():
+        return fpath, None
+    from .library import numbered_name
+    ext = fpath.suffix.lstrip(".")
+    if job.get("mode") == "playlist_order" and t.get("position"):
+        num = int(t["position"])
+    else:  # append: продолжаем с максимального существующего номера
+        counter["n"] += 1
+        num = counter["base"] + counter["n"]
+    new_name = numbered_name(num, counter["digits"], t.get("artist", ""), t["title"], ext)
+    if fpath.name != new_name:
+        new = fpath.with_name(new_name)
+        if not new.exists():
+            fpath.rename(new)
+            fpath = new
+    return fpath, num
+
+
 def _wav_step(fpath: Path, reference_duration: float):
     """Конвертация в WAV + верификация (сверка с длительностью исходника).
     Возвращает (wav_path, error)."""
@@ -73,8 +99,8 @@ def _wav_step(fpath: Path, reference_duration: float):
     return wav, ""
 
 
-def _process_track(job, pl_dir, t, ds_holder):
-    """Полный пайплайн одного трека: (пере)скачивание -> теги -> WAV-режим."""
+def _process_track(job, pl_dir, t, ds_holder, counter):
+    """Полный пайплайн одного трека: (пере)скачивание -> теги -> нумерация -> WAV-режим."""
     from .tagger import write_tags, _meta_from_deezer, _meta_from_sc
     tid = str(t["id"])
     provider = t.get("provider", "deezer")
@@ -131,6 +157,9 @@ def _process_track(job, pl_dir, t, ds_holder):
                    downloaded_at=_now(), provider=provider, url=t.get("url", ""))
         return False, err, quality
 
+    # --- нумерация по выбранному режиму ---
+    fpath, num = _apply_numbering(pl_dir, t, fpath, job, counter)
+
     # --- WAV-режим ---
     src_format = fpath.suffix.lstrip(".").lower()
     source_file_name = fpath.name
@@ -140,6 +169,8 @@ def _process_track(job, pl_dir, t, ds_holder):
                       provider=provider, url=t.get("url", ""),
                       source_format=src_format,
                       mp3_source=src_format in ("mp3", "m4a", "aac"))
+    if num:
+        base_entry["position"] = num
     if _wav_mode() != "source" and src_format != "wav":
         wav, werr = _wav_step(fpath, actual)
         if wav is None:
@@ -172,11 +203,15 @@ def _worker():
         pl_dir = playlist_dir(job["playlist_id"], job["title"])
         pl_dir.mkdir(parents=True, exist_ok=True)
         ds_holder = {"ds": None}  # deezer-сессия — лениво
+        from .library import max_position as _max_pos, digits_for as _digits
+        pl_total = int(tracks[0].get("total") or len(tracks)) if tracks else len(tracks)
+        counter = {"base": _max_pos(load_sidecar(pl_dir).get("tracks", {})),
+                   "n": 0, "digits": _digits(pl_total)}
 
         for t in tracks:
             job["current"] = t["title"]
             try:
-                ok, err, quality = _process_track(job, pl_dir, t, ds_holder)
+                ok, err, quality = _process_track(job, pl_dir, t, ds_holder, counter)
             except Exception as e:
                 ok, err, quality = False, f"внутренняя ошибка: {e}", ""
             if not ok:
