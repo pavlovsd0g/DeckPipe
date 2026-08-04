@@ -39,13 +39,11 @@ def _meta_from_deezer(infos: dict) -> dict:
         "isrc": infos.get("ISRC", ""),
         "date": (infos.get("DIGITAL_RELEASE_DATE") or "")[:4],
         "track_number": infos.get("TRACK_NUMBER", ""),
-        "cover": _fetch_cover(deezer_cover_url(infos["ALB_PICTURE"])
-                              if infos.get("ALB_PICTURE") else ""),
+        "cover": None,  # обложки не встраиваем: в WAV не переносятся, раздувают файл
     }
 
 
 def _meta_from_sc(info: dict, cover_bytes: bytes | None) -> dict:
-    thumb = info.get("thumbnail") or ""
     return {
         "title": info.get("title", ""),
         "artist": info.get("uploader") or info.get("artist") or "",
@@ -54,7 +52,7 @@ def _meta_from_sc(info: dict, cover_bytes: bytes | None) -> dict:
         "isrc": "",
         "date": (info.get("upload_date") or "")[:4],
         "track_number": "",
-        "cover": cover_bytes if cover_bytes is not None else _fetch_cover(thumb),
+        "cover": None,
     }
 
 

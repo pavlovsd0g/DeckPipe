@@ -280,8 +280,8 @@ async function loadErrors() {
         <div class="badge-err">${esc(e.error)}</div>
       </div>
       <button class="ghost" style="padding:4px 8px" onclick='retryOne(${JSON.stringify(i)})'>↻</button>
-    </div>`).join(''))
-    : '<div id="empty">Ошибок нет 🎉</div>';
+    </div>`).join('')
+    : '<div id="empty">Ошибок нет 🎉</div>');
   window._errors = errs;
 }
 
