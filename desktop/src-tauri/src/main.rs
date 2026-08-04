@@ -12,9 +12,10 @@ async fn service_login(app: tauri::AppHandle, service: String) -> Result<String,
         "sc" => ("https://soundcloud.com/sign-in", "oauth_token", "SoundCloud"),
         _ => return Err("неизвестный сервис".into()),
     };
+    let label = format!("login-{service}");
     let win = WebviewWindowBuilder::new(
         &app,
-        format!("login-{service}"),
+        label.clone(),
         WebviewUrl::External(url.parse().map_err(|e| format!("{e}"))?),
     )
     .title(format!("DeckPipe — вход {title}"))
@@ -23,14 +24,17 @@ async fn service_login(app: tauri::AppHandle, service: String) -> Result<String,
     .map_err(|e| e.to_string())?;
 
     for _ in 0..300 {
-        if win.is_closed() {
-            return Err("окно входа закрыто".into());
-        }
-        let cookies = win.cookies().map_err(|e| e.to_string())?;
-        if let Some(c) = cookies.iter().find(|c| c.name() == cookie_name && !c.value().is_empty()) {
-            let value = c.value().to_string();
-            let _ = win.close();
-            return Ok(value);
+        match app.get_webview_window(&label) {
+            None => return Err("окно входа закрыто".into()),
+            Some(w) => {
+                if let Ok(cookies) = w.cookies() {
+                    if let Some(c) = cookies.iter().find(|c| c.name() == cookie_name && !c.value().is_empty()) {
+                        let value = c.value().to_string();
+                        let _ = w.close();
+                        return Ok(value);
+                    }
+                }
+            }
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }

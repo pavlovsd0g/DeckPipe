@@ -162,7 +162,10 @@ def api_set_config(c: ConfigIn):
 
 @app.get("/api/playlists")
 async def api_playlists():
-    pls = await fetch_playlists()
+    try:
+        pls = await fetch_playlists()
+    except Exception as e:
+        return []  # нет логина/сети — пустой список, вход через кнопку в шапке
     for p in pls:
         pl_dir = library.playlist_dir(p["id"], p["title"])
         sc = library.load_sidecar(pl_dir)
