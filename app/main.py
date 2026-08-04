@@ -72,6 +72,7 @@ def fetch_tracks(playlist_id: str):
 # ---------- API ----------
 class ConfigIn(BaseModel):
     music_root: str | None = None
+    wav_mode: str | None = None  # source|wav|wav_delete
 
 
 class DownloadIn(BaseModel):
@@ -92,6 +93,7 @@ def api_config():
     except Exception as e:
         user = {"error": str(e)}
     return {"music_root": str(library.music_root()), "arl_set": bool(cfg.get("arl")),
+            "wav_mode": cfg.get("wav_mode", "source"),
             "user": user}
 
 
@@ -101,6 +103,10 @@ def api_set_config(c: ConfigIn):
         p = Path(c.music_root)
         p.mkdir(parents=True, exist_ok=True)
         library.set_music_root(str(p))
+    if c.wav_mode in ("source", "wav", "wav_delete"):
+        cfg = load_config()
+        cfg["wav_mode"] = c.wav_mode
+        save_config(cfg)
     return api_config()
 
 
@@ -307,6 +313,25 @@ class RetryIn(BaseModel):
     playlist_key: str
     playlist_title: str
     track: dict
+
+
+class ReportIn(BaseModel):
+    text: str
+    current: str | None = None
+
+
+@app.post("/api/report")
+def api_report(body: ReportIn):
+    from .bugreport import send_report
+    errs = []
+    for j in jobs.list_jobs()[:3]:
+        for r in j.get("results", []):
+            if not r.get("ok"):
+                errs.append(f"{r.get('title')}: {str(r.get('error'))[:100]}")
+    res = send_report(body.text, context={"jobs_errors": errs, "current": body.current})
+    if not res["ok"]:
+        raise HTTPException(502, res["error"])
+    return res
 
 
 @app.post("/api/errors/retry")

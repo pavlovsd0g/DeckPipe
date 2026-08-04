@@ -5,7 +5,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .deezer_client import get_session, verify_file
+from .deezer_client import get_session, verify_file, load_config
 from .library import playlist_dir, load_sidecar, save_sidecar
 
 AUTO_RETRIES = 2
@@ -55,6 +55,110 @@ def _set_track(pl_dir, tid, **kw):
     save_sidecar(pl_dir, sc)
 
 
+def _wav_mode() -> str:
+    return load_config().get("wav_mode", "source")  # source|wav|wav_delete
+
+
+def _wav_step(fpath: Path, reference_duration: float):
+    """Конвертация в WAV + верификация (сверка с длительностью исходника).
+    Возвращает (wav_path, error)."""
+    from .converter import convert_to_wav
+    try:
+        wav = convert_to_wav(fpath)
+    except Exception as e:
+        return None, f"конвертация: {e}"
+    v_ok, v_err, _ = verify_file(wav, reference_duration, tolerance=0.5)
+    if not v_ok:
+        return None, f"wav после конвертации: {v_err}"
+    return wav, ""
+
+
+def _process_track(job, pl_dir, t, ds_holder):
+    """Полный пайплайн одного трека: (пере)скачивание -> теги -> WAV-режим."""
+    from .tagger import write_tags, _meta_from_deezer, _meta_from_sc
+    tid = str(t["id"])
+    provider = t.get("provider", "deezer")
+    expected = int(t.get("duration") or 0)
+
+    # ретрай ошибки КОНВЕРТАЦИИ: исходник на диске — только переконвертируем
+    prev = load_sidecar(pl_dir).get("tracks", {}).get(tid, {})
+    if prev.get("status") == "verify_failed_convert":
+        src = pl_dir / prev.get("source_file", "")
+        if src.exists() and src.suffix.lower() != ".wav":
+            src_actual = prev.get("duration_actual") or expected
+            wav, werr = _wav_step(src, src_actual)
+            if wav:
+                if _wav_mode() == "wav_delete":
+                    src.unlink(missing_ok=True)
+                _set_track(pl_dir, tid, file=wav.name, format="wav",
+                           status="ok", error="", converted_at=_now(),
+                           source_deleted=_wav_mode() == "wav_delete")
+                return True, "", "wav"
+            _set_track(pl_dir, tid, status="verify_failed_convert", error=werr)
+            return False, werr, "wav"
+
+    ok, err, quality, fpath = False, "", "", None
+    meta = None
+    for attempt in range(1 + AUTO_RETRIES):
+        try:
+            if provider == "sc":
+                from .soundcloud import download_track as sc_download
+                fpath, quality, sc_dur, sc_info = sc_download(t, pl_dir)
+                infos_duration = int(sc_dur or expected)
+                meta = _meta_from_sc(sc_info, None)
+            else:
+                if ds_holder["ds"] is None:
+                    ds_holder["ds"] = get_session()
+                fpath, quality, infos = ds_holder["ds"].download_track(tid, pl_dir, prefer="FLAC")
+                infos_duration = int(infos["DURATION"])
+                meta = _meta_from_deezer(infos)
+            # HLS-AAC со SoundCloud может плавать по длительности на неск. секунд
+            tol = 12.0 if (provider == "sc" and fpath.suffix.lower() == ".m4a") else 2.0
+            v_ok, v_err, actual = verify_file(fpath, expected or infos_duration, tolerance=tol)
+            if v_ok:
+                if meta:
+                    write_tags(fpath, meta)
+                ok, err = True, ""
+                break
+            err = v_err
+        except Exception as e:
+            err = str(e)
+
+    if not ok:
+        _set_track(pl_dir, tid, title=t["title"], artist=t["artist"],
+                   file=fpath.name if fpath else "", format=quality.lower(),
+                   status="verify_failed_download", error=err,
+                   downloaded_at=_now(), provider=provider, url=t.get("url", ""))
+        return False, err, quality
+
+    # --- WAV-режим ---
+    src_format = fpath.suffix.lstrip(".").lower()
+    source_file_name = fpath.name
+    base_entry = dict(title=t["title"], artist=t["artist"],
+                      downloaded_at=_now(), duration_expected=expected,
+                      duration_actual=round(actual, 1),
+                      provider=provider, url=t.get("url", ""),
+                      source_format=src_format,
+                      mp3_source=src_format in ("mp3", "m4a", "aac"))
+    if _wav_mode() != "source" and src_format != "wav":
+        wav, werr = _wav_step(fpath, actual)
+        if wav is None:
+            _set_track(pl_dir, tid, **base_entry, file=fpath.name, format=src_format,
+                       source_file=source_file_name, status="verify_failed_convert", error=werr)
+            return False, werr, quality
+        if _wav_mode() == "wav_delete":
+            fpath.unlink(missing_ok=True)
+        _set_track(pl_dir, tid, **base_entry, file=wav.name, format="wav",
+                   source_file=source_file_name,
+                   source_deleted=_wav_mode() == "wav_delete",
+                   status="ok", error="", converted_at=_now())
+        return True, "", "wav"
+
+    _set_track(pl_dir, tid, **base_entry, file=fpath.name, format=src_format,
+               status="ok", error="")
+    return True, "", quality
+
+
 def _worker():
     while True:
         with _lock:
@@ -67,54 +171,17 @@ def _worker():
         job["state"] = "running"
         pl_dir = playlist_dir(job["playlist_id"], job["title"])
         pl_dir.mkdir(parents=True, exist_ok=True)
-        ds = None  # deezer-сессия — лениво, только если есть deezer-треки
+        ds_holder = {"ds": None}  # deezer-сессия — лениво
 
         for t in tracks:
             job["current"] = t["title"]
-            tid = str(t["id"])
-            provider = t.get("provider", "deezer")
-            expected = int(t.get("duration") or 0)
-            ok, err, quality, fpath = False, "", "", None
-            meta = None
-            for attempt in range(1 + AUTO_RETRIES):
-                try:
-                    if provider == "sc":
-                        from .soundcloud import download_track as sc_download
-                        from .tagger import _meta_from_sc
-                        fpath, quality, sc_dur, sc_info = sc_download(t, pl_dir)
-                        infos_duration = int(sc_dur or expected)
-                        meta = _meta_from_sc(sc_info, None)
-                    else:
-                        from .tagger import _meta_from_deezer
-                        if ds is None:
-                            ds = get_session()
-                        fpath, quality, infos = ds.download_track(tid, pl_dir, prefer="FLAC")
-                        infos_duration = int(infos["DURATION"])
-                        meta = _meta_from_deezer(infos)
-                    # HLS-AAC со SoundCloud может плавать по длительности на неск. секунд
-                    tol = 12.0 if (provider == "sc" and fpath.suffix.lower() == ".m4a") else 2.0
-                    v_ok, v_err, actual = verify_file(fpath, expected or infos_duration, tolerance=tol)
-                    if v_ok:
-                        from .tagger import write_tags
-                        if meta:
-                            write_tags(fpath, meta)
-                        ok, err = True, ""
-                        _set_track(pl_dir, tid, title=t["title"], artist=t["artist"],
-                                   file=fpath.name, format=quality.lower(),
-                                   status="ok", downloaded_at=_now(),
-                                   duration_expected=expected, duration_actual=round(actual, 1),
-                                   provider=provider, url=t.get("url", ""))
-                        break
-                    err = v_err
-                except Exception as e:
-                    err = str(e)
+            try:
+                ok, err, quality = _process_track(job, pl_dir, t, ds_holder)
+            except Exception as e:
+                ok, err, quality = False, f"внутренняя ошибка: {e}", ""
             if not ok:
-                _set_track(pl_dir, tid, title=t["title"], artist=t["artist"],
-                           file=fpath.name if fpath else "", format=quality.lower(),
-                           status="verify_failed_download", error=err,
-                           downloaded_at=_now(), provider=provider, url=t.get("url", ""))
                 job["failed"] += 1
-            job["results"].append({"id": tid, "title": t["title"], "ok": ok,
+            job["results"].append({"id": str(t["id"]), "title": t["title"], "ok": ok,
                                    "error": err, "quality": quality})
             job["done"] += 1
         job["current"] = None

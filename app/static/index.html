@@ -16,6 +16,7 @@
   #settings { margin-left:auto; display:flex; gap:8px; align-items:center; }
   #settings input { width:340px; background:var(--panel2); border:1px solid #343743; color:var(--text); padding:6px 10px; border-radius:6px; }
   button { background:var(--accent); color:#fff; border:0; padding:7px 14px; border-radius:6px; cursor:pointer; font-size:13px; }
+  select { background:var(--panel2); border:1px solid #343743; color:var(--text); padding:6px 8px; border-radius:6px; font-size:13px; }
   button.ghost { background:var(--panel2); border:1px solid #3a3e4c; }
   button:disabled { opacity:.5; cursor:default; }
   main { flex:1; display:flex; min-height:0; }
@@ -61,8 +62,14 @@
   <h1>Deck<span>Pipe</span></h1>
   <div id="user">…</div>
   <div id="settings">
+    <select id="wavMode" onchange="saveWavMode()" title="Режим хранения скачанных файлов">
+      <option value="source">Исходный формат</option>
+      <option value="wav">WAV (+ исходник)</option>
+      <option value="wav_delete">WAV (удалять исходник)</option>
+    </select>
     <input id="musicRoot" placeholder="Корень библиотеки (общая папка, напр. E:\Music)">
     <button class="ghost" onclick="saveRoot()">Сохранить</button>
+    <button class="ghost" onclick="sendReport()">🐞 Багрепорт</button>
   </div>
 </header>
 <main>
@@ -115,8 +122,24 @@ async function api(path, opts) {
 async function loadConfig() {
   const c = await api('/api/config');
   $('#musicRoot').value = c.music_root;
+  $('#wavMode').value = c.wav_mode || 'source';
   $('#user').textContent = c.user && c.user.email
     ? `Deezer: ${c.user.email}` : `ARL: ${c.user && c.user.error ? 'ошибка — '+c.user.error : 'не задан'}`;
+}
+
+async function saveWavMode() {
+  await api('/api/config', {body:{wav_mode: $('#wavMode').value}});
+}
+
+async function sendReport() {
+  const text = prompt('Опишите проблему (что делали, что ожидали, что произошло):');
+  if (!text) return;
+  try {
+    await api('/api/report', {body:{text, current: current ? current.title : tab}});
+    alert('Репорт отправлен, спасибо!');
+  } catch (e) {
+    alert('Не отправилось: ' + e.message);
+  }
 }
 
 async function saveRoot() {
