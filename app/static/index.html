@@ -321,6 +321,8 @@ function switchTab(t) {
 }
 
 async function loadScSources() {
+  // автосинк аккаунта: свои + лайкнутые плейлисты + лайки (если выполнен вход)
+  try { await api('/api/sc/sync-account', {body:{}}); } catch (e) { /* не вошли — ок */ }
   const srcs = await api('/api/sc/sources');
   $('#playlists').innerHTML = (srcs.map(s => `
     <div class="pl ${current && current.id===s.id?'active':''}" onclick="selectScSource('${s.id}', '${esc(s.title).replace(/'/g,"\\'")}')">
@@ -329,7 +331,7 @@ async function loadScSources() {
         <div class="c">${s.ok||0}/${s.count ?? '?'} ${s.errors?`<span class="badge-err">⚠ ${s.errors}</span>`:''}</div>
       </div>
       <button class="ghost" style="padding:2px 8px" onclick="event.stopPropagation(); delScSource('${s.id}')">×</button>
-    </div>`).join('')) || '<div id="empty">Добавьте URL плейлиста или страницы SoundCloud выше</div>';
+    </div>`).join('')) || '<div id="empty">Войдите через «SC: вход» — плейлисты аккаунта появятся сами.<br>Или добавьте URL выше.</div>';
 }
 
 async function addScSource() {

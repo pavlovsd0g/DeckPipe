@@ -70,42 +70,49 @@ def sc_validate(token: str) -> dict:
 
 
 def sc_account_playlists(token: str) -> list:
-    """Свои + лайкнутые плейлисты: [{id,title,url,count}]."""
+    """Свои + лайкнутые плейлисты: [{id,title,url,count}].
+    Толерантно к 403/рейт-лимиту: возвращает то, что удалось получить."""
     me = sc_validate(token)
     uid = me["id"]
     out = []
     # свои плейлисты
-    url = f"{SC_API}/users/{uid}/playlists"
-    while url:
-        r = requests.get(url, headers=_headers(token),
-                         params=_params(limit=50, linked_partitioning=1) if SC_API in url else None,
-                         timeout=20)
-        r.raise_for_status()
-        d = r.json()
-        for p in d.get("collection", []):
-            out.append({"id": str(p["id"]), "title": p.get("title") or "?",
-                        "url": p.get("permalink_url"), "count": p.get("track_count", 0)})
-        url = d.get("next_href")
+    try:
+        url = f"{SC_API}/users/{uid}/playlists"
+        while url:
+            r = requests.get(url, headers=_headers(token),
+                             params=_params(limit=50, linked_partitioning=1) if SC_API in url else None,
+                             timeout=20)
+            r.raise_for_status()
+            d = r.json()
+            for p in d.get("collection", []):
+                out.append({"id": str(p["id"]), "title": p.get("title") or "?",
+                            "url": p.get("permalink_url"), "count": p.get("track_count", 0)})
+            url = d.get("next_href")
+    except Exception:
+        pass
     # лайкнутые плейлисты (библиотека)
-    url = f"{SC_API}/me/library/all"
-    seen = {p["id"] for p in out}
-    while url:
-        r = requests.get(url, headers=_headers(token),
-                         params=_params(limit=50, linked_partitioning=1) if SC_API in url else None,
-                         timeout=20)
-        if r.status_code != 200:
-            break
-        d = r.json()
-        for it in d.get("collection", []):
-            if it.get("type") not in ("playlist-like", "playlist"):
-                continue
-            p = it.get("playlist") or it
-            pid = str(p.get("id", ""))
-            if pid and pid not in seen and p.get("permalink_url"):
-                seen.add(pid)
-                out.append({"id": pid, "title": "♥ " + (p.get("title") or "?"),
-                            "url": p["permalink_url"], "count": p.get("track_count", 0)})
-        url = d.get("next_href")
+    try:
+        url = f"{SC_API}/me/library/all"
+        seen = {p["id"] for p in out}
+        while url:
+            r = requests.get(url, headers=_headers(token),
+                             params=_params(limit=50, linked_partitioning=1) if SC_API in url else None,
+                             timeout=20)
+            if r.status_code != 200:
+                break
+            d = r.json()
+            for it in d.get("collection", []):
+                if it.get("type") not in ("playlist-like", "playlist"):
+                    continue
+                p = it.get("playlist") or it
+                pid = str(p.get("id", ""))
+                if pid and pid not in seen and p.get("permalink_url"):
+                    seen.add(pid)
+                    out.append({"id": pid, "title": "♥ " + (p.get("title") or "?"),
+                                "url": p["permalink_url"], "count": p.get("track_count", 0)})
+            url = d.get("next_href")
+    except Exception:
+        pass
     return out
 
 

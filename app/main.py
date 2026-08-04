@@ -405,6 +405,37 @@ def api_sc_import(body: ScImportIn):
         added += 1
     _sc_save_sources(sources)
     return {"added": added}
+
+
+@app.post("/api/sc/sync-account")
+def api_sc_sync_account(force: bool = False):
+    """Автосинк: подтягивает свои + лайкнутые плейлисты и лайки в источники.
+    Не чаще раза в 5 минут (рейт-лимит SC), force — принудительно."""
+    token = soundcloud.sc_oauth_token()
+    if not token:
+        raise HTTPException(401, "SoundCloud: не выполнен вход")
+    cfg = load_config()
+    if not force and time.time() - cfg.get("sc_last_sync", 0) < 300:
+        return {"added": 0, "total": len(_sc_sources()), "skipped": True}
+    try:
+        account = soundcloud.sc_account_playlists(token)
+    except Exception as e:
+        raise HTTPException(503, f"SoundCloud недоступен: {e}")
+    items = [{"id": "likes", "title": "❤ Лайки",
+              "url": "https://soundcloud.com/you/likes", "count": 0}]
+    items += account
+    sources = _sc_sources()
+    added = 0
+    for it in items:
+        if not it.get("url") or any(s["url"] == it["url"] for s in sources):
+            continue
+        sources.append({"id": str(it["id"]), "url": it["url"],
+                        "title": it.get("title", "?"), "count": it.get("count", 0)})
+        added += 1
+    _sc_save_sources(sources)
+    cfg["sc_last_sync"] = time.time()
+    save_config(cfg)
+    return {"added": added, "total": len(sources)}
 @app.get("/api/errors")
 async def api_errors():
     """Все треки со статусом verify_failed_* по всем плейлистам и источникам."""
