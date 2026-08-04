@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """Спайк 0: чтение master.db Rekordbox 7.2.14 через pyrekordbox (только чтение)."""
 import sys
+import os
 from pathlib import Path
 import pyrekordbox.config as _cfg
 from pyrekordbox import Rekordbox6Database
 
-# Обход бага автоопределения: на этой машине master.db лежит в Pioneer\rekordbox
-# (не rekordbox6), из-за чего падает assert в _get_rb7_config.
-DB_PATH = Path(r"C:\Users\Никита\AppData\Roaming\Pioneer\rekordbox\master.db")
+# Обход бага автоопределения: передаём путь явно (из %APPDATA%).
+DB_PATH = Path(os.environ["APPDATA"]) / "Pioneer" / "rekordbox" / "master.db"
 _cfg.__config__["rekordbox7"] = {"db_path": DB_PATH}
 
 def main():

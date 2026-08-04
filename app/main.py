@@ -2,6 +2,7 @@
 """DeckPipe MVP — FastAPI бэкенд."""
 import asyncio
 import time
+import uuid
 from pathlib import Path
 
 import requests
@@ -345,6 +346,56 @@ def api_sc_download(source_id: str, body: DownloadIn, mode: str = "append"):
     return {"job_id": job_id}
 
 
+# ---------- Локальные плейлисты (для SoundCloud-целей из поиска) ----------
+# SoundCloud API не позволяет сторонним приложениям создавать плейлисты
+# (регистрация приложений закрыта, write-endpoints недоступны) — поэтому
+# цель для SC-треков создаётся локально; URL можно привязать позже.
+
+def _local_sources() -> list:
+    return load_config().get("local_sources", [])
+
+
+def _local_save(sources: list):
+    cfg = load_config()
+    cfg["local_sources"] = sources
+    save_config(cfg)
+
+
+class LocalPlaylistIn(BaseModel):
+    title: str
+    url: str | None = None  # опционально: связать со страницей SC позже
+
+
+@app.get("/api/local/playlists")
+def api_local_playlists():
+    out = []
+    for s in _local_sources():
+        key = f"local:{s['id']}"
+        pl_dir = library.playlist_dir(key, s["title"])
+        sc = library.load_sidecar(pl_dir)
+        ok = err = 0
+        for e in sc.get("tracks", {}).values():
+            if e.get("status", "").startswith("verify_failed"):
+                err += 1
+            elif e.get("status") == "ok" and (pl_dir / e.get("file", "")).exists():
+                ok += 1
+        out.append({**s, "key": key, "ok": ok, "errors": err, "path": str(pl_dir)})
+    return out
+
+
+@app.post("/api/local/playlists")
+def api_local_create(body: LocalPlaylistIn):
+    title = body.title.strip()
+    if not title:
+        raise HTTPException(400, "пустое название")
+    src = {"id": uuid.uuid4().hex[:8], "title": title,
+           "url": (body.url or "").strip(), "count": 0, "local": True}
+    sources = _local_sources()
+    sources.append(src)
+    _local_save(sources)
+    return {"ok": True, "key": f"local:{src['id']}", **src}
+
+
 # ---------- Логин ----------
 class LoginDeezerIn(BaseModel):
     arl: str
@@ -493,21 +544,36 @@ def api_search(q: str, service: str = "both"):
 
 
 class SearchDownloadIn(BaseModel):
-    target_key: str       # deezer playlist id или sc:<id>
+    target_key: str       # deezer playlist id | sc:<id> | local:<id> | dir:<key>
     target_title: str
     tracks: list          # [{id,title,artist,duration,url?,provider}]
+    target_dir: str | None = None  # произвольная папка скачивания
+
+
+def _is_deezer_playlist_key(key: str) -> bool:
+    """Плейлист Deezer — числовой id без префиксов sc:/local:/dir:."""
+    return not key.startswith(("sc:", "local:", "dir:"))
 
 
 @app.post("/api/search/download")
 async def api_search_download(body: SearchDownloadIn):
-    """Скачать найденные треки в выбранный локальный плейлист.
+    """Скачать найденные треки в выбранный плейлист/папку.
     Если цель — плейлист Deezer, треки также добавляются в него на сервисе."""
     if not body.tracks:
         raise HTTPException(400, "пустой список треков")
-    is_deezer_target = not body.target_key.startswith("sc:")
-    job_id = jobs.enqueue(body.target_key, body.target_title, body.tracks, mode="append")
+    target_key, target_title = body.target_key, body.target_title
+    if body.target_dir:
+        # произвольная папка: разовый биндинг dir:<hash> -> путь, sidecar живёт в ней
+        p = Path(body.target_dir)
+        if not p.is_absolute():
+            raise HTTPException(400, "target_dir должен быть абсолютным путём")
+        p.mkdir(parents=True, exist_ok=True)
+        target_key = "dir:" + uuid.uuid4().hex[:8]
+        library.bind_playlist(target_key, str(p))
+        target_title = target_title or p.name
+    job_id = jobs.enqueue(target_key, target_title, body.tracks, mode="append")
     added_remote = 0
-    if is_deezer_target:
+    if not body.target_dir and _is_deezer_playlist_key(body.target_key):
         dz_ids = [str(t["id"]) for t in body.tracks if t.get("provider", "deezer") == "deezer"]
         if dz_ids:
             try:
@@ -585,6 +651,43 @@ def api_sc_resolve_tracks(url: str):
     except Exception as e:
         raise HTTPException(502, f"SoundCloud: {e}")
     return [{**t, "provider": "sc"} for t in data["tracks"]]
+
+
+# ---------- Rekordbox ----------
+from . import rekordbox as rb
+
+
+@app.get("/api/rb/status")
+def api_rb_status():
+    out = {"db_exists": rb.db_exists(), "running": rb.rb_running(), "playlists": []}
+    if out["db_exists"] and not out["running"]:
+        try:
+            out["playlists"] = rb.get_rb_playlists()
+        except Exception as e:
+            out["error"] = str(e)
+    return out
+
+
+class RbSyncIn(BaseModel):
+    playlist_key: str
+    playlist_title: str
+
+
+@app.post("/api/rb/sync")
+def api_rb_sync(body: RbSyncIn):
+    """Синк локального плейлиста (ок-треки по порядку) в Rekordbox."""
+    pl_dir = library.playlist_dir(body.playlist_key, body.playlist_title)
+    sc = library.load_sidecar(pl_dir)
+    entries = [e for e in sc.get("tracks", {}).values()
+               if e.get("status") == "ok" and e.get("file") and (pl_dir / e["file"]).exists()]
+    entries.sort(key=lambda e: (int(e.get("position") or 10 ** 6), e["file"].lower()))
+    if not entries:
+        raise HTTPException(400, "в плейлисте нет скачанных треков (✔)")
+    files = [pl_dir / e["file"] for e in entries]
+    try:
+        return rb.sync_playlist(body.playlist_title, files)
+    except Exception as e:
+        raise HTTPException(409, str(e))
 
 
 @app.get("/api/errors")

@@ -60,11 +60,33 @@
   .scacc { display:flex; gap:8px; align-items:center; padding:4px 0; font-size:13px; }
   #searchbar { display:flex; gap:8px; padding:10px 16px; background:var(--panel); border-bottom:1px solid #2c2f3a; }
   #searchbar input { flex:1; background:var(--panel2); border:1px solid #343743; color:var(--text); padding:7px 12px; border-radius:6px; }
-  .search-sec { padding:10px 16px 4px; font-weight:600; color:var(--accent); }
+  #searchFilters { display:none; gap:6px; padding:8px 16px; background:var(--panel); border-bottom:1px solid #2c2f3a; flex-wrap:wrap; }
+  .chip { background:var(--panel2); border:1px solid #3a3e4c; color:var(--dim); padding:4px 12px; border-radius:20px; font-size:12px; cursor:pointer; }
+  .chip.active { background:#2b2447; border-color:var(--accent); color:var(--text); }
+  .search-sec { padding:12px 16px 4px; font-weight:600; color:var(--accent); }
   .srow { display:flex; align-items:center; gap:8px; padding:5px 16px; border-bottom:1px solid #262933; }
   .srow .tt { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .srow button { padding:3px 10px; font-size:12px; }
+  .srow button { padding:3px 10px; font-size:12px; flex-shrink:0; }
   .srow .meta { color:var(--dim); font-size:12px; white-space:nowrap; }
+  .srow .cb { flex-shrink:0; }
+  .srow.exp { cursor:pointer; }
+  .srow.exp:hover { background:var(--panel2); }
+  .prov { font-size:10px; padding:1px 6px; border-radius:4px; background:#313646; color:#c9d2ff; flex-shrink:0; }
+  .prov.sc { background:#463431; color:#ffc9c0; }
+  .stracks { background:#191b21; border-bottom:1px solid #262933; }
+  .stracks .srow { padding-left:34px; }
+  #basket { position:sticky; bottom:0; display:flex; gap:10px; align-items:center; padding:10px 16px;
+            background:#23263a; border-top:1px solid var(--accent); }
+  #targetBox { padding:8px; border-bottom:1px solid #2c2f3a; background:var(--panel2); }
+  #targetBox .cap { font-size:11px; color:var(--dim); margin-bottom:4px; }
+  #targetBox .cur { font-size:13px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-bottom:6px; }
+  #targetBox .acts { display:flex; gap:4px; flex-wrap:wrap; }
+  #targetBox .acts button { padding:3px 8px; font-size:11px; }
+  #tabs { flex-wrap:wrap; }
+  #tabs button { min-width:0; padding:7px 4px; font-size:12px; }
+  .pl { min-width:0; }
+  .pl > div { min-width:0; }
+  #toolbar { flex-wrap:wrap; }
 </style>
 </head>
 <body>
@@ -112,6 +134,7 @@
       <button onclick="downloadSelected()">Скачать выбранные</button>
       <button onclick="syncPlaylistOrder()" title="Перенумеровать файлы по порядку в стриминге и докачать недостающие">Синк: по порядку</button>
       <button onclick="syncAppend()" title="Не трогать текущие номера, новые треки — вниз списка">Синк: новые вниз</button>
+      <button class="ghost" onclick="rbSync()" title="Синхронизировать скачанные треки в Rekordbox (Rekordbox должен быть закрыт)">→ RB</button>
     </div>
     <div id="searchbar" style="display:none">
       <input id="searchInput" placeholder="Трек, альбом или исполнитель…" onkeydown="if(event.key==='Enter')runSearch()">
@@ -121,7 +144,13 @@
         <option value="sc">SoundCloud</option>
       </select>
       <button onclick="runSearch()">Найти</button>
-      <button class="ghost" onclick="createDzPlaylist()" title="Создать плейлист в Deezer">+ Плейлист</button>
+    </div>
+    <div id="searchFilters">
+      <span class="chip" data-f="all" onclick="setSearchFilter('all')">Все</span>
+      <span class="chip" data-f="tracks" onclick="setSearchFilter('tracks')">Треки</span>
+      <span class="chip" data-f="albums" onclick="setSearchFilter('albums')">Альбомы</span>
+      <span class="chip" data-f="playlists" onclick="setSearchFilter('playlists')">Плейлисты/Сеты</span>
+      <span class="chip" data-f="artists" onclick="setSearchFilter('artists')">Исполнители</span>
     </div>
     <div id="tracks"><div id="empty">Выберите плейлист слева</div></div>
   </div>
@@ -332,10 +361,12 @@ function switchTab(t) {
   $('#tab-errors').classList.toggle('active', t==='errors');
   $('#sc-add').style.display = t==='sc' ? 'flex' : 'none';
   $('#searchbar').style.display = t==='search' ? 'flex' : 'none';
+  $('#searchFilters').style.display = t==='search' ? 'flex' : 'none';
   current = null;
   $('#toolbar').style.display = 'none';
   if (t === 'search') {
-    $('#tracks').innerHTML = '<div id="empty">Слева выберите плейлист-назначение, затем ищите треки.<br>⬇ — скачать в выбранный плейлист, ＋ — добавить в плейлист Deezer без скачивания.</div>';
+    $('#tracks').innerHTML = '<div id="empty">Слева — цель (плейлист Deezer / источник SC / локальный плейлист / своя папка).<br>Ищите треки, отмечайте чекбоксами или качайте по одному. Альбомы и сеты раскрываются по клику — внутри треки качаются поштучно или все сразу.</div>';
+    setSearchFilter(searchFilter);
     loadSearchTargets();
     return;
   }
@@ -346,24 +377,43 @@ function switchTab(t) {
 }
 
 // ---------- поиск ----------
-let searchTarget = null;   // {key,title,provider}
+let searchTarget = null;   // {key,title,provider:'deezer'|'sc'|'local'|'dir',dir?}
+let searchFilter = 'all';
+let searchSel = {};        // "svc:tracks:i" -> track
+let searchExpanded = {};   // "svc:i" -> {loading?, tracks?}
+
+const provLabel = p => ({deezer:'Deezer', sc:'SoundCloud', local:'Локальный', dir:'Папка'})[p] || p;
 
 async function loadSearchTargets() {
-  const [dz, sc] = await Promise.all([api('/api/playlists'), api('/api/sc/sources')]);
+  const [dz, sc, loc] = await Promise.all([
+    api('/api/playlists'), api('/api/sc/sources'), api('/api/local/playlists')]);
   const rows = [
     ...dz.map(p => ({key:p.id, title:p.title, provider:'deezer', count:p.count})),
     ...sc.map(s => ({key:'sc:'+s.id, title:s.title, provider:'sc', count:s.count})),
+    ...loc.map(s => ({key:s.key, title:s.title, provider:'local', count:s.count})),
   ];
   if (!searchTarget && rows.length) searchTarget = rows[0];
-  $('#playlists').innerHTML = rows.map((r,i) => `
+  window._targets = rows;
+  const cur = searchTarget
+    ? `${provLabel(searchTarget.provider)} · ${esc(searchTarget.title)}`
+    : 'не выбрана';
+  $('#playlists').innerHTML = `
+    <div id="targetBox">
+      <div class="cap">Цель загрузки / добавления</div>
+      <div class="cur" title="${cur}">${cur}</div>
+      <div class="acts">
+        <button class="ghost" onclick="createTargetPlaylist('deezer')" title="Новый плейлист в Deezer">＋Deezer</button>
+        <button class="ghost" onclick="createTargetPlaylist('local')" title="Новый локальный плейлист (SoundCloud не даёт создавать плейлисты через API — создаётся локальная папка-плейлист, URL можно привязать позже)">＋Локальный (SC)</button>
+        <button class="ghost" onclick="chooseCustomDir()" title="Скачивать в произвольную папку">📁 Папка…</button>
+      </div>
+    </div>` + rows.map((r,i) => `
     <div class="pl ${searchTarget && searchTarget.key===r.key?'active':''}" onclick="setSearchTarget(${i})">
       <img alt="">
       <div style="min-width:0">
         <div class="t">${esc(r.title)}</div>
-        <div class="c">${r.provider==='deezer'?'Deezer':'SoundCloud'} · ${r.count ?? '?'}</div>
+        <div class="c">${provLabel(r.provider)} · ${r.count ?? '?'}</div>
       </div>
     </div>`).join('');
-  window._targets = rows;
 }
 
 function setSearchTarget(i) {
@@ -371,48 +421,153 @@ function setSearchTarget(i) {
   loadSearchTargets();
 }
 
+async function chooseCustomDir() {
+  const r = await api('/api/browse');
+  if (!r.path) return;
+  searchTarget = {key:'', title:r.path, provider:'dir', dir:r.path};
+  loadSearchTargets();
+}
+
+async function createTargetPlaylist(kind) {
+  if (kind === 'deezer') {
+    const title = prompt('Название нового плейлиста в Deezer:');
+    if (!title) return;
+    const r = await api('/api/deezer/playlist/create', {body:{title, track_ids:[]}});
+    searchTarget = {key:r.id, title:r.title, provider:'deezer'};
+  } else {
+    const title = prompt('Название локального плейлиста (папка в библиотеке; в SoundCloud плейлисты через API создавать нельзя):');
+    if (!title) return;
+    const r = await api('/api/local/playlists', {body:{title}});
+    searchTarget = {key:r.key, title:r.title, provider:'local'};
+  }
+  loadSearchTargets();
+}
+
+function setSearchFilter(f) {
+  searchFilter = f;
+  document.querySelectorAll('#searchFilters .chip').forEach(c =>
+    c.classList.toggle('active', c.dataset.f === f));
+  if (window._search) renderSearch();
+}
+
 async function runSearch() {
   const q = $('#searchInput').value.trim();
   if (!q) return;
+  searchSel = {}; searchExpanded = {};
   $('#tracks').innerHTML = '<div id="empty">Ищу…</div>';
   try {
     const d = await api(`/api/search?q=${encodeURIComponent(q)}&service=${$('#searchService').value}`);
     window._search = d;
-    renderSearch();
+    setSearchFilter(searchFilter);
   } catch (e) {
     $('#tracks').innerHTML = `<div id="empty">⚠ ${esc(e.message)}</div>`;
   }
 }
 
+function _selKey(svc, i) { return `${svc}:${i}`; }
+
+function _trackCb(svc, i, t) {
+  const k = _selKey(svc, i);
+  if (searchSel[k]) delete searchSel[k]; else searchSel[k] = t;
+  document.getElementById('cb-'+svc+'-'+i).checked = !!searchSel[k];
+  _renderBasket();
+}
+
+function _renderBasket() {
+  const n = Object.keys(searchSel).length;
+  let b = document.getElementById('basket');
+  if (!n) { if (b) b.remove(); return; }
+  if (!b) {
+    b = document.createElement('div');
+    b.id = 'basket';
+    $('#tracks').appendChild(b);
+  }
+  const tgt = searchTarget ? `${provLabel(searchTarget.provider)} · ${esc(searchTarget.title)}` : '—';
+  b.innerHTML = `<b>${n} тр.</b>
+    <button onclick="dlBasket()">⬇ в цель: ${tgt}</button>
+    <button class="ghost" onclick="searchSel={};_renderBasket();renderSearch()">✕ очистить</button>`;
+}
+
+function _trackRow(svc, i, t, indent) {
+  const checked = searchSel[_selKey(svc,i)] ? 'checked' : '';
+  return `<div class="srow">
+    <input type="checkbox" class="cb" id="cb-${svc}-${i}" ${checked} onclick="_trackCb('${svc}',${i},window._search['${svc}'].tracks[${i}])">
+    <div class="tt" title="${esc(t.title)} — ${esc(t.artist)}">${esc(t.title)} <span class="meta">${esc(t.artist)} · ${fmtDur(t.duration)}</span></div>
+    <span class="prov ${svc==='sc'?'sc':''}">${svc==='sc'?'SC':'DZ'}</span>
+    ${svc==='deezer' ? `<button class="ghost" title="Добавить в плейлист Deezer без скачивания" onclick="addDzTrack(${i})">＋</button>` : ''}
+    <button title="Скачать в цель" onclick="dlSearchTrack('${svc}',${i})">⬇</button>
+  </div>`;
+}
+
+function _albumRow(svc, i, a) {
+  const k = svc+':'+i;
+  const exp = searchExpanded[k];
+  const arrow = exp && exp.tracks ? '▾' : '▸';
+  let html = `<div class="srow exp" onclick="toggleAlbum('${svc}',${i})">
+    <div class="tt">${arrow} 💿 ${esc(a.title)} <span class="meta">${esc(a.artist)}${a.count?` · ${a.count} тр.`:''}</span></div>
+    <span class="prov ${svc==='sc'?'sc':''}">${svc==='sc'?'SC':'DZ'}</span>
+  </div>`;
+  if (exp) {
+    if (exp.loading) html += `<div class="stracks"><div class="srow dim">Загружаю треки…</div></div>`;
+    else if (exp.error) html += `<div class="stracks"><div class="srow errtext">⚠ ${esc(exp.error)}</div></div>`;
+    else if (exp.tracks) {
+      html += `<div class="stracks">` + exp.tracks.map((t,j) => `
+        <div class="srow">
+          <div class="tt" title="${esc(t.title)} — ${esc(t.artist)}">${esc(t.title)} <span class="meta">${esc(t.artist)} · ${fmtDur(t.duration)}</span></div>
+          <button title="Скачать в цель" onclick="dlAlbumTrack('${svc}',${i},${j})">⬇</button>
+        </div>`).join('') +
+        `<div class="srow"><div class="tt dim">${exp.tracks.length} тр.</div>
+          <button onclick="dlWholeAlbum('${svc}',${i})">⬇ все</button></div></div>`;
+    }
+  }
+  return html;
+}
+
+async function toggleAlbum(svc, i) {
+  const k = svc+':'+i;
+  if (searchExpanded[k] && !searchExpanded[k].loading) { delete searchExpanded[k]; renderSearch(); return; }
+  searchExpanded[k] = {loading:true};
+  renderSearch();
+  try {
+    const a = window._search[svc].albums[i];
+    searchExpanded[k] = {tracks: svc === 'deezer'
+      ? await api(`/api/deezer/album/${a.id}`)
+      : await api(`/api/sc/resolve-tracks?url=${encodeURIComponent(a.url)}`)};
+  } catch (e) {
+    searchExpanded[k] = {error: e.message};
+  }
+  renderSearch();
+}
+
 function renderSearch() {
   const d = window._search || {};
+  const f = searchFilter;
   let html = '';
+  const sections = [];
   for (const [svc, label] of [['deezer','Deezer'],['sc','SoundCloud']]) {
     const s = d[svc];
     if (!s) continue;
-    html += `<div class="search-sec">${label}</div>`;
-    s.tracks.forEach((t,i) => {
-      html += `<div class="srow">
-        <div class="tt">${esc(t.title)} <span class="meta">${esc(t.artist)} · ${fmtDur(t.duration)}</span></div>
-        ${svc==='deezer' ? `<button class="ghost" title="Добавить в плейлист Deezer без скачивания" onclick="addDzTrack(${i})">＋</button>` : ''}
-        <button title="Скачать в выбранный плейлист" onclick="dlSearchTrack('${svc}',${i})">⬇</button>
-      </div>`;
-    });
-    s.albums.forEach((a,i) => {
-      html += `<div class="srow">
-        <div class="tt">💿 ${esc(a.title)} <span class="meta">${esc(a.artist)}${a.count?` · ${a.count} тр.`:''}</span></div>
-        <button title="Скачать альбом целиком" onclick="dlSearchAlbum('${svc}',${i})">⬇ альбом</button>
-      </div>`;
-    });
-    s.artists.forEach(a => {
-      html += `<div class="srow"><div class="tt">👤 ${esc(a.name)}</div></div>`;
-    });
+    if ((f==='all'||f==='tracks') && s.tracks.length)
+      sections.push([`${label} — треки`, s.tracks.map((t,i) => _trackRow(svc,i,t)).join('')]);
+    const isPl = f==='playlists';
+    if ((f==='all'||f==='albums'||isPl) && s.albums.length) {
+      const kind = svc==='deezer' ? 'альбомы' : 'плейлисты и сеты';
+      if (!(isPl && svc==='deezer'))
+        sections.push([`${label} — ${kind}`, s.albums.map((a,i) => _albumRow(svc,i,a)).join('')]);
+    }
+    if ((f==='all'||f==='artists') && s.artists.length)
+      sections.push([`${label} — исполнители`,
+        s.artists.map(a => `<div class="srow"><div class="tt">👤 ${esc(a.name)}</div></div>`).join('')]);
   }
+  html = sections.map(([t,rows]) => `<div class="search-sec">${t}</div>${rows}`).join('');
   $('#tracks').innerHTML = html || '<div id="empty">Ничего не найдено</div>';
+  _renderBasket();
 }
 
 function _dlPayload(tracks) {
-  if (!searchTarget) { alert('Слева выберите плейлист-назначение'); return null; }
+  if (!searchTarget) { alert('Слева выберите цель (плейлист или папку)'); return null; }
+  if (searchTarget.provider === 'dir')
+    return {target_key:'dir', target_title: searchTarget.title, target_dir: searchTarget.dir, tracks};
   return {target_key: searchTarget.key, target_title: searchTarget.title, tracks};
 }
 
@@ -425,35 +580,43 @@ async function dlSearchTrack(svc, i) {
   startPolling();
 }
 
-async function dlSearchAlbum(svc, i) {
-  const a = window._search[svc].albums[i];
-  const body = _dlPayload([]);
+async function dlAlbumTrack(svc, i, j) {
+  const t = searchExpanded[svc+':'+i].tracks[j];
+  const body = _dlPayload([{id:t.id, title:t.title, artist:t.artist, duration:t.duration, url:t.url, provider:svc}]);
   if (!body) return;
-  $('#tracks').innerHTML = '<div id="empty">Загружаю треки альбома…</div>';
-  const tracks = svc === 'deezer'
-    ? await api(`/api/deezer/album/${a.id}`)
-    : await api(`/api/sc/resolve-tracks?url=${encodeURIComponent(a.url)}`);
-  body.tracks = tracks.map(t => ({id:t.id, title:t.title, artist:t.artist, duration:t.duration, url:t.url, provider:svc}));
-  const r = await api('/api/search/download', {body});
-  alert(`Альбом «${a.title}» поставлен в очередь (${tracks.length} треков)`);
+  await api('/api/search/download', {body});
+  startPolling();
+}
+
+async function dlWholeAlbum(svc, i) {
+  const a = window._search[svc].albums[i];
+  const tracks = searchExpanded[svc+':'+i].tracks;
+  const body = _dlPayload(tracks.map(t => ({id:t.id, title:t.title, artist:t.artist, duration:t.duration, url:t.url, provider:svc})));
+  if (!body) return;
+  await api('/api/search/download', {body});
+  alert(`«${a.title}» поставлен в очередь (${tracks.length} треков)`);
+  startPolling();
+}
+
+async function dlBasket() {
+  const tracks = Object.values(searchSel).map(t => ({id:t.id, title:t.title, artist:t.artist, duration:t.duration, url:t.url, provider:t.provider}));
+  const body = _dlPayload(tracks);
+  if (!body) return;
+  await api('/api/search/download', {body});
+  alert(`Поставлено в очередь: ${tracks.length} тр.`);
+  searchSel = {};
+  _renderBasket();
+  renderSearch();
   startPolling();
 }
 
 async function addDzTrack(i) {
   if (!searchTarget || searchTarget.provider !== 'deezer') {
-    return alert('Выберите слева плейлист Deezer как назначение');
+    return alert('Выберите слева плейлист Deezer как цель');
   }
   const t = window._search.deezer.tracks[i];
   const r = await api('/api/deezer/playlist/add', {body:{playlist_id: searchTarget.key, track_ids:[t.id]}});
   alert(`«${t.title}» добавлен в «${searchTarget.title}»`);
-}
-
-async function createDzPlaylist() {
-  const title = prompt('Название нового плейлиста в Deezer:');
-  if (!title) return;
-  const r = await api('/api/deezer/playlist/create', {body:{title, track_ids:[]}});
-  alert(`Плейлист «${r.title}» создан`);
-  loadSearchTargets();
 }
 
 async function loadScSources() {
@@ -589,6 +752,17 @@ async function syncAppend() {
   if (!confirm(`Скачать ${missing.length} треков (новые — вниз списка)?`)) return;
   await api(downloadUrl('append'), {body:{tracks:missing}});
   startPolling();
+}
+
+async function rbSync() {
+  const key = current.kind === 'sc' ? 'sc:' + current.id : current.id;
+  if (!confirm(`Синхронизировать «${current.title}» в Rekordbox?\nRekordbox должен быть ЗАКРЫТ. Бэкап master.db будет создан автоматически.`)) return;
+  try {
+    const r = await api('/api/rb/sync', {body:{playlist_key:key, playlist_title:current.title}});
+    alert(`Готово: плейлист «${r.playlist}»\nновых треков в коллекции: ${r.added_content}\nдобавлено в плейлист: ${r.added_to_playlist}\n\n${r.note}`);
+  } catch (e) {
+    alert('⚠ ' + e.message);
+  }
 }
 
 async function bindPath() {
