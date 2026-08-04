@@ -61,12 +61,11 @@ def _params(**kw) -> dict:
 
 
 def sc_validate(token: str) -> dict:
-    """Проверяет oauth_token на /me. Возвращает данные юзера."""
-    r = requests.get(f"{SC_API}/me", headers=_headers(token),
-                     params=_params(), timeout=20)
-    if r.status_code != 200:
-        raise RuntimeError(f"токен не принят (HTTP {r.status_code})")
-    return r.json()
+    """Проверяет oauth_token на /me (с ретраями при рейт-лимите)."""
+    try:
+        return _api_get("/me", token)
+    except Exception as e:
+        raise RuntimeError(f"токен не принят ({e})")
 
 
 def sc_account_playlists(token: str) -> list:
@@ -129,22 +128,85 @@ def _oauth_cookiefile() -> str | None:
     return str(p)
 
 
+def _track_from_api(t: dict) -> dict:
+    return {
+        "id": str(t.get("id")),
+        "title": t.get("title") or "?",
+        "artist": (t.get("user") or {}).get("username", ""),
+        "album": "",
+        "duration": int((t.get("duration") or 0) / 1000),
+        "url": t.get("permalink_url") or "",
+    }
+
+
+def _api_get(path: str, token: str | None, **params) -> dict:
+    h = _headers(token) if token else {}
+    last = None
+    for attempt in range(4):
+        r = requests.get(f"{SC_API}{path}", headers=h, params=_params(**params), timeout=30)
+        if r.status_code == 200:
+            return r.json()
+        last = f"HTTP {r.status_code}"
+        if r.status_code in (403, 429) and attempt < 3:
+            time.sleep(3 * (attempt + 1))  # рейт-лимит SC: 3с, 6с, 9с
+            continue
+        r.raise_for_status()
+    raise RuntimeError(last or "ошибка API")
+
+
 def resolve(url: str, use_cache: bool = True) -> dict:
-    """URL (сет / страница юзера / tracks / likes) -> {id, title, tracks[]}.
-    Полный резолв (не flat) — иначе у треков нет title/duration/uploader."""
+    """URL (сет / страница юзера / tracks / лайки) -> {id, title, tracks[]}.
+    Сеты и юзеры — через api-v2 (1-2 запроса), лайки — через yt-dlp."""
     if use_cache and url in _cache and time.time() - _cache[url][0] < TTL:
         return _cache[url][1]
-    opts = {"quiet": True, "ignoreerrors": True}
+    token = sc_oauth_token()
+
+    if "/likes" in url:
+        data = _resolve_likes(url)
+    else:
+        data = _resolve_api(url, token)
+    _cache[url] = (time.time(), data)
+    return data
+
+
+def _resolve_api(url: str, token: str | None) -> dict:
+    """api-v2 /resolve: сет (1 запрос, треки с метаданными) или юзер (+треки юзера)."""
+    obj = _api_get("/resolve", token, url=url)
+    kind = obj.get("kind")
+    if kind == "playlist":
+        return {"id": str(obj["id"]), "title": obj.get("title") or "playlist",
+                "tracks": [_track_from_api(t) for t in obj.get("tracks", []) if t.get("id")]}
+    if kind == "user":
+        tracks, next_url = [], f"/users/{obj['id']}/tracks"
+        params = _params(limit=200, linked_partitioning=1)
+        while next_url:
+            r = requests.get(next_url if next_url.startswith("http") else f"{SC_API}{next_url}",
+                             headers=_headers(token) if token else {},
+                             params=params if next_url.startswith("/") else None, timeout=30)
+            r.raise_for_status()
+            d = r.json()
+            tracks += [_track_from_api(t) for t in d.get("collection", [])]
+            next_url, params = d.get("next_href"), None
+        return {"id": str(obj["id"]), "title": obj.get("username") or "user", "tracks": tracks}
+    if kind == "track":
+        return {"id": str(obj["id"]), "title": obj.get("title") or "track",
+                "tracks": [_track_from_api(obj)]}
+    raise RuntimeError(f"неизвестный тип ресурса: {kind}")
+
+
+def _resolve_likes(url: str) -> dict:
+    """Лайки — только yt-dlp с oauth-cookie (публичный API их закрыл)."""
     cookies = _oauth_cookiefile()
-    if cookies:
-        opts["cookiefile"] = cookies
+    if not cookies:
+        raise RuntimeError("лайки доступны после входа (SC: вход)")
+    opts = {"quiet": True, "ignoreerrors": True, "extract_flat": True,
+            "cookiefile": cookies}
     with yt_dlp.YoutubeDL(opts) as y:
         info = y.extract_info(url, download=False)
+    if not info:
+        raise RuntimeError("yt-dlp не смог прочитать лайки")
     tracks = []
-    entries = info.get("entries")
-    if entries is None:  # одиночный трек
-        entries = [info]
-    for e in entries:
+    for e in (info.get("entries") or []):
         if not e:
             continue
         tracks.append({
@@ -153,15 +215,9 @@ def resolve(url: str, use_cache: bool = True) -> dict:
             "artist": e.get("uploader") or "",
             "album": "",
             "duration": int(e.get("duration") or 0),
-            "url": e.get("webpage_url") or e.get("url") or url,
+            "url": e.get("url") or e.get("webpage_url") or "",
         })
-    data = {
-        "id": str(info.get("id") or abs(hash(url))),
-        "title": info.get("title") or url,
-        "tracks": tracks,
-    }
-    _cache[url] = (time.time(), data)
-    return data
+    return {"id": "likes", "title": info.get("title") or "❤ Лайки", "tracks": tracks}
 
 
 def download_track(track: dict, out_dir: Path):

@@ -15,7 +15,7 @@ from .deezer_client import load_config, get_session
 
 app = FastAPI(title="DeckPipe")
 STATIC = Path(__file__).parent / "static"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 
 
 @app.get("/api/version")
@@ -327,7 +327,10 @@ def api_sc_tracks(source_id: str):
     src = next((s for s in _sc_sources() if s["id"] == source_id), None)
     if not src:
         raise HTTPException(404, "источник не найден")
-    data = soundcloud.resolve(src["url"])
+    try:
+        data = soundcloud.resolve(src["url"], use_cache=False)
+    except Exception as e:
+        raise HTTPException(502, f"SoundCloud: {str(e)[:300]}")
     pl_dir = library.playlist_dir(_sc_key(source_id), src["title"])
     return {"path": str(pl_dir), "tracks": library.scan_playlist(pl_dir, data["tracks"])}
 
@@ -418,13 +421,16 @@ def api_sc_sync_account(force: bool = False):
     if not force and time.time() - cfg.get("sc_last_sync", 0) < 300:
         return {"added": 0, "total": len(_sc_sources()), "skipped": True}
     try:
+        me = soundcloud.sc_validate(token)
         account = soundcloud.sc_account_playlists(token)
     except Exception as e:
         raise HTTPException(503, f"SoundCloud недоступен: {e}")
-    items = [{"id": "likes", "title": "❤ Лайки",
-              "url": "https://soundcloud.com/you/likes", "count": 0}]
+    likes_url = f"https://soundcloud.com/{me.get('permalink', 'you')}/likes"
+    items = [{"id": "likes", "title": "❤ Лайки", "url": likes_url, "count": me.get("likes_count", 0)}]
     items += account
     sources = _sc_sources()
+    # вычищаем устаревший источник лайков (you/likes)
+    sources = [s for s in sources if not s["url"].endswith("/you/likes")]
     added = 0
     for it in items:
         if not it.get("url") or any(s["url"] == it["url"] for s in sources):

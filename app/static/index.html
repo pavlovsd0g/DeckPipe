@@ -84,9 +84,8 @@
       <button id="tab-errors" onclick="switchTab('errors')">Ошибки</button>
     </div>
     <div id="sc-add">
-      <input id="scUrl" placeholder="URL плейлиста/страницы SoundCloud">
+      <input id="scUrl" placeholder="URL плейлиста/страницы SoundCloud (необязательно)">
       <button onclick="addScSource()">+</button>
-      <button class="ghost" onclick="openLogin('sc')" title="Импортировать плейлисты и лайки моего аккаунта">Мои</button>
     </div>
     <div id="playlists"></div>
   </div>
@@ -326,11 +325,11 @@ async function loadScSources() {
   const srcs = await api('/api/sc/sources');
   $('#playlists').innerHTML = (srcs.map(s => `
     <div class="pl ${current && current.id===s.id?'active':''}" onclick="selectScSource('${s.id}', '${esc(s.title).replace(/'/g,"\\'")}')">
-      <div style="min-width:0; flex:1">
+      <img alt="">
+      <div style="min-width:0">
         <div class="t">${esc(s.title)}</div>
         <div class="c">${s.ok||0}/${s.count ?? '?'} ${s.errors?`<span class="badge-err">⚠ ${s.errors}</span>`:''}</div>
       </div>
-      <button class="ghost" style="padding:2px 8px" onclick="event.stopPropagation(); delScSource('${s.id}')">×</button>
     </div>`).join('')) || '<div id="empty">Войдите через «SC: вход» — плейлисты аккаунта появятся сами.<br>Или добавьте URL выше.</div>';
 }
 

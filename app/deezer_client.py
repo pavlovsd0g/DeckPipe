@@ -37,7 +37,9 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict):
-    CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = CONFIG_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(CONFIG_PATH)
 
 
 def sanitize_filename(name: str) -> str:
