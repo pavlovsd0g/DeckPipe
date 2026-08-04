@@ -47,7 +47,17 @@ def fetch_tracks(playlist_id: str):
     ts, data = _cache["tracks"].get(playlist_id, (0, None))
     if data is not None and time.time() - ts < TRACKS_TTL:
         return data
-    # публичный API (плейлисты юзера публичные); приватные — TODO через GraphQL
+    # публичный API (быстро, но только для public-плейлистов)
+    try:
+        tracks = _fetch_tracks_public(playlist_id)
+    except Exception:
+        # приватный плейлист — через GraphQL с ARL
+        tracks = asyncio.run(_fetch_tracks_graphql(playlist_id))
+    _cache["tracks"][playlist_id] = (time.time(), tracks)
+    return tracks
+
+
+def _fetch_tracks_public(playlist_id: str) -> list:
     tracks, index = [], 0
     while True:
         r = requests.get(f"https://api.deezer.com/playlist/{playlist_id}/tracks",
@@ -67,7 +77,31 @@ def fetch_tracks(playlist_id: str):
         if "next" not in d or not d["data"]:
             break
         index += 100
-    _cache["tracks"][playlist_id] = (time.time(), tracks)
+    return tracks
+
+
+async def _fetch_tracks_graphql(playlist_id: str) -> list:
+    from deezer_python_gql import DeezerGQLClient
+    client = DeezerGQLClient(arl=load_config().get("arl"))
+    tracks, after = [], None
+    while True:
+        pl = await client.get_playlist(playlist_id=playlist_id,
+                                       tracks_first=100, tracks_after=after)
+        conn = pl.tracks
+        for e in conn.edges:
+            n = e.node
+            artists = [c.node.name for c in n.contributors.edges
+                       if c.node and "MAIN" in (c.roles or [])]
+            tracks.append({
+                "id": str(n.id), "title": n.title or "?",
+                "artist": ", ".join(artists) or "",
+                "album": (n.album.display_title if n.album else "") or "",
+                "duration": n.duration or 0,
+            })
+        page = getattr(conn, "page_info", None) or getattr(conn, "pageInfo", None)
+        if not page or not page.has_next_page:
+            break
+        after = page.end_cursor
     return tracks
 
 
