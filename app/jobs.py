@@ -151,6 +151,8 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
             err = str(e)
 
     if not ok:
+        if "DRM" in str(err):
+            err = "🔒 DRM-защита SoundCloud — трек не отдаётся для скачивания"
         _set_track(pl_dir, tid, title=t["title"], artist=t["artist"],
                    file=fpath.name if fpath else "", format=quality.lower(),
                    status="verify_failed_download", error=err,
@@ -214,6 +216,8 @@ def _worker():
                 ok, err, quality = _process_track(job, pl_dir, t, ds_holder, counter)
             except Exception as e:
                 ok, err, quality = False, f"внутренняя ошибка: {e}", ""
+            if not ok and "DRM" in str(err):
+                err = "🔒 DRM-защита SoundCloud — трек не отдаётся для скачивания"
             if not ok:
                 job["failed"] += 1
             job["results"].append({"id": str(t["id"]), "title": t["title"], "ok": ok,

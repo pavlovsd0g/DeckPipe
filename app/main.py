@@ -438,9 +438,9 @@ def api_sc_sync_account(force: bool = False):
         sources.append({"id": str(it["id"]), "url": it["url"],
                         "title": it.get("title", "?"), "count": it.get("count", 0)})
         added += 1
-    _sc_save_sources(sources)
+    cfg["sc_sources"] = sources
     cfg["sc_last_sync"] = time.time()
-    save_config(cfg)
+    save_config(cfg)  # одна запись: и sources, и last_sync
     return {"added": added, "total": len(sources)}
 @app.get("/api/errors")
 async def api_errors():

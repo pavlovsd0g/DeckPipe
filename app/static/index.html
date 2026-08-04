@@ -138,7 +138,7 @@ let pollTimer = null;
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const fmtDur = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+const fmtDur = s => s ? `${Math.floor(s/60)}:${String(Math.round(s%60)).padStart(2,'0')}` : '—';
 
 async function api(path, opts) {
   const r = await fetch(path, opts ? {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(opts.body||{})} : undefined);

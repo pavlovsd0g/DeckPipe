@@ -148,7 +148,7 @@ def _api_get(path: str, token: str | None, **params) -> dict:
             return r.json()
         last = f"HTTP {r.status_code}"
         if r.status_code in (403, 429) and attempt < 3:
-            time.sleep(3 * (attempt + 1))  # рейт-лимит SC: 3с, 6с, 9с
+            time.sleep(5 * (attempt + 1) ** 2)  # рейт-лимит SC: 5с, 20с, 45с
             continue
         r.raise_for_status()
     raise RuntimeError(last or "ошибка API")
@@ -195,7 +195,8 @@ def _resolve_api(url: str, token: str | None) -> dict:
 
 
 def _resolve_likes(url: str) -> dict:
-    """Лайки — только yt-dlp с oauth-cookie (публичный API их закрыл)."""
+    """Лайки — только yt-dlp с oauth-cookie (публичный API их закрыл).
+    Затем добиваем artist/duration батчами через api-v2 /tracks?ids=."""
     cookies = _oauth_cookiefile()
     if not cookies:
         raise RuntimeError("лайки доступны после входа (SC: вход)")
@@ -217,6 +218,26 @@ def _resolve_likes(url: str) -> dict:
             "duration": int(e.get("duration") or 0),
             "url": e.get("url") or e.get("webpage_url") or "",
         })
+    # добивка метаданных батчами по 50 id (устойчиво к рейт-лимиту: батч не удался — пропускаем)
+    token = sc_oauth_token()
+    for i in range(0, len(tracks), 50):
+        batch = [t for t in tracks[i:i + 50] if not t["artist"] or not t["duration"]]
+        if not batch:
+            continue
+        try:
+            ids = ",".join(t["id"] for t in batch)
+            coll = _api_get("/tracks", token, ids=ids)
+            if isinstance(coll, dict):
+                coll = coll.get("collection", [])
+            by_id = {str(t.get("id")): t for t in coll}
+            for t in batch:
+                full = by_id.get(t["id"])
+                if full:
+                    t["artist"] = (full.get("user") or {}).get("username", t["artist"])
+                    t["duration"] = int((full.get("duration") or 0) / 1000)
+        except Exception:
+            pass
+        time.sleep(0.4)  # пейсинг против рейт-лимита
     return {"id": "likes", "title": info.get("title") or "❤ Лайки", "tracks": tracks}
 
 
