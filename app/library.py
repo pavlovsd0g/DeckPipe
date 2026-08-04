@@ -217,7 +217,9 @@ def scan_playlist(pl_dir: Path, deezer_tracks: list) -> list:
                 changed = True
             else:
                 status, err, fmt, fname = "missing", "", "", ""
-        result.append({**t, "status": status, "error": err, "format": fmt, "file": fname})
+        result.append({**t, "status": status, "error": err, "format": fmt, "file": fname,
+                       "flipped": bool(entry and entry.get("flipped_to") == "wav"),
+                       "mp3_source": bool(entry and entry.get("mp3_source"))})
 
     if changed:
         save_sidecar(pl_dir, sc)

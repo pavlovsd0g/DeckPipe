@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Очередь загрузок: фоновый воркер, авто-ретрай, прогресс, статусы в sidecar."""
+import os
 import threading
 import time
 import uuid
@@ -230,3 +231,143 @@ def _worker():
 def retry_track(playlist_id: str, playlist_title: str, track: dict) -> str:
     """Ручной перезапуск одного трека из листа ошибок."""
     return enqueue(playlist_id, playlist_title, [track])
+
+
+# ---------- WAV-flipper (FLAC⇄WAV с переносом путей в Rekordbox) ----------
+FILETYPE_BY_EXT = {".mp3": 1, ".flac": 5, ".m4a": 4, ".wav": 11, ".aiff": 12}
+
+
+def enqueue_flip(playlist_key: str, playlist_title: str, to_wav: bool, workers: int = 0) -> str:
+    """Конвертация плейлиста в WAV (или обратно) + обновление путей в master.db."""
+    job_id = uuid.uuid4().hex[:8]
+    job = {
+        "id": job_id, "playlist_id": playlist_key, "title": playlist_title,
+        "total": 0, "done": 0, "failed": 0, "current": None,
+        "state": "queued", "mode": "flip_to_wav" if to_wav else "flip_to_source",
+        "results": [], "created_at": _now(),
+    }
+    with _lock:
+        _jobs[job_id] = job
+    threading.Thread(target=_flip_worker, args=(job_id, to_wav, workers), daemon=True).start()
+    return job_id
+
+
+def _flip_worker(job_id: str, to_wav: bool, workers: int):
+    from concurrent.futures import ThreadPoolExecutor
+    from .converter import convert_to_wav
+    from . import rekordbox as rb
+
+    job = _jobs[job_id]
+    job["state"] = "running"
+    pl_dir = playlist_dir(job["playlist_id"], job["title"])
+    sc = load_sidecar(pl_dir)
+    tracks = {tid: e for tid, e in sc.get("tracks", {}).items()
+              if e.get("status") == "ok" and e.get("file") and (pl_dir / e["file"]).exists()}
+
+    # план: только те, кто не в целевом состоянии
+    plan = []
+    for tid, e in tracks.items():
+        src = pl_dir / e["file"]
+        flipped = e.get("flipped_to") == "wav"
+        if to_wav and not flipped and src.suffix.lower() in (".flac", ".mp3", ".m4a", ".aac"):
+            plan.append((tid, e, src, src.with_suffix(".wav")))
+        elif not to_wav and flipped:
+            plan.append((tid, e, src.with_suffix(".wav"), src))
+    job["total"] = len(plan)
+    if not plan:
+        job["state"] = "done"
+        job["results"] = [{"id": "-", "title": "нечего делать — все уже в целевом формате",
+                           "ok": True, "error": "", "quality": ""}]
+        return
+
+    if rb.rb_running():
+        job["state"] = "done"
+        job["results"] = [{"id": "-", "title": "Rekordbox запущен — закройте его", "ok": False,
+                           "error": "Rekordbox запущен", "quality": ""}]
+        job["failed"] = len(plan)
+        return
+
+    # 1. конвертация (параллельно по ядрам), только в WAV
+    converted = {}  # tid -> (wav_path | None, error)
+    if to_wav:
+        workers = workers or min(8, (os.cpu_count() or 4))
+        def _conv(item):
+            tid, e, src, dst = item
+            try:
+                # референс — длительность самого исходника (а не sidecar)
+                from mutagen import File as MutagenFile
+                ref = float(MutagenFile(str(src)).info.length)
+                wav = convert_to_wav(src)
+                v_ok, v_err, _ = verify_file(wav, ref, tolerance=0.5)
+                return tid, wav if v_ok else None, "" if v_ok else v_err
+            except Exception as ex:
+                return tid, None, str(ex)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for tid, wav, err in ex.map(_conv, plan):
+                converted[tid] = (wav, err)
+                e = tracks[tid]
+                job["current"] = e["title"]
+                job["results"].append({"id": tid, "title": e["title"], "ok": wav is not None,
+                                       "error": err, "quality": "wav" if wav else ""})
+                job["done"] += 1
+                if wav is None:
+                    job["failed"] += 1
+    else:
+        for tid, e, wav, src in plan:
+            converted[tid] = (wav if wav.exists() else None,
+                              "" if wav.exists() else "WAV не найден на диске")
+            job["results"].append({"id": tid, "title": e["title"], "ok": wav.exists(),
+                                   "error": "" if wav.exists() else "WAV не найден", "quality": ""})
+            job["done"] += 1
+            if not wav.exists():
+                job["failed"] += 1
+
+    # 2. обновление путей в master.db (одним коммитом)
+    backup = rb.backup_db()
+    db = rb.open_db()
+    rb_updated = 0
+    try:
+        by_path = {}
+        for c in db.get_content():
+            if c.FolderPath:
+                by_path[os.path.normcase(str(c.FolderPath))] = c
+        for tid, e, old_rb, new_rb in plan:
+            wav, _ = converted.get(tid, (None, ""))
+            target = new_rb if (to_wav and wav) or not to_wav else None
+            if target is None:
+                continue
+            content = by_path.get(os.path.normcase(str(old_rb)))
+            if content is None:
+                continue  # трека нет в коллекции RB — просто пропускаем
+            try:
+                db.update_content_path(content, target, save=True, commit=False)
+            except Exception:
+                # нет ANLZ (трек не анализирован) — обновляем поля напрямую
+                new_p = str(target).replace("\\", "/")
+                old_p = content.FolderPath
+                if content.OrgFolderPath == old_p:
+                    content.OrgFolderPath = new_p
+                content.FolderPath = new_p
+                content.FileNameL = new_p.split("/")[-1]
+            content.FileType = FILETYPE_BY_EXT.get(target.suffix.lower(), content.FileType)
+            content.FileSize = target.stat().st_size
+            rb_updated += 1
+        db.commit()
+        # 3. sidecar
+        sc = load_sidecar(pl_dir)
+        for tid, e, old_rb, new_rb in plan:
+            wav, err = converted.get(tid, (None, ""))
+            if to_wav and wav:
+                sc["tracks"][tid]["flipped_to"] = "wav"
+            elif not to_wav and wav is not None:
+                sc["tracks"][tid].pop("flipped_to", None)
+        save_sidecar(pl_dir, sc)
+        job["backup"] = str(backup)
+        job["rb_updated"] = rb_updated
+    except Exception as ex:
+        db.rollback()
+        job["error"] = f"ошибка записи в master.db: {ex}"
+    finally:
+        db.close()
+    job["current"] = None
+    job["state"] = "done"

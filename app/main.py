@@ -690,6 +690,21 @@ def api_rb_sync(body: RbSyncIn):
         raise HTTPException(409, str(e))
 
 
+class FlipIn(BaseModel):
+    playlist_key: str
+    playlist_title: str
+    to_wav: bool
+    workers: int = 0
+
+
+@app.post("/api/flip")
+def api_flip(body: FlipIn):
+    """WAV-flip: конвертация + перенос путей в master.db (все кью/сетка сохраняются)."""
+    job_id = jobs.enqueue_flip(body.playlist_key, body.playlist_title,
+                               body.to_wav, body.workers)
+    return {"job_id": job_id}
+
+
 @app.get("/api/errors")
 async def api_errors():
     """Все треки со статусом verify_failed_* по всем плейлистам и источникам."""

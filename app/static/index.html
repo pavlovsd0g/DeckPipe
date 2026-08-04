@@ -135,6 +135,7 @@
       <button onclick="syncPlaylistOrder()" title="Перенумеровать файлы по порядку в стриминге и докачать недостающие">Синк: по порядку</button>
       <button onclick="syncAppend()" title="Не трогать текущие номера, новые треки — вниз списка">Синк: новые вниз</button>
       <button class="ghost" onclick="rbSync()" title="Синхронизировать скачанные треки в Rekordbox (Rekordbox должен быть закрыт)">→ RB</button>
+      <button class="ghost" id="flipBtn" onclick="flipWav()" title="Конвертировать плейлист в WAV для CDJ с сохранением всех кью/сетки (Rekordbox закрыт)">⇄ WAV</button>
     </div>
     <div id="searchbar" style="display:none">
       <input id="searchInput" placeholder="Трек, альбом или исполнитель…" onkeydown="if(event.key==='Enter')runSearch()">
@@ -686,6 +687,8 @@ function renderTracks() {
   const err = tracks.filter(t=>t.status==='error').length;
   const miss = tracks.length - ok - err;
   $('#plstats').textContent = `✔ ${ok} · ✖ ${miss} · ⚠ ${err}`;
+  const flipped = tracks.filter(t=>t.flipped).length;
+  $('#flipBtn').textContent = flipped ? `⇄ FLAC (${flipped} в WAV)` : '⇄ WAV';
   $('#tracks').innerHTML = `<table>
     <tr><th><input type="checkbox" id="all" onchange="toggleAll(this.checked)"></th>
         <th></th><th>Название</th><th>Исполнитель</th><th>Альбом</th><th>⏱</th><th>Формат</th></tr>
@@ -696,7 +699,7 @@ function renderTracks() {
       <td>${esc(t.title)}${t.error?`<div class="errtext">${esc(t.error)}</div>`:''}</td>
       <td>${esc(t.artist)}</td><td class="dim">${esc(t.album)}</td>
       <td class="dim">${fmtDur(t.duration)}</td>
-      <td>${t.format?`<span class="fmt ${t.format}">${t.format}</span>`:''}</td>
+      <td>${t.format?`<span class="fmt ${t.format}">${t.format}</span>`:''}${t.flipped?'<span class="fmt" style="background:#3a4a2e;color:#b8ff9e">→wav</span>':''}${t.mp3_source?'<span class="fmt" style="background:#4a3a2e;color:#ffd89e" title="mp3-источник: после конвертации в WAV кью могут сместиться на ~26 мс">mp3</span>':''}</td>
     </tr>`).join('')}
   </table>`;
 }
@@ -763,6 +766,18 @@ async function rbSync() {
   } catch (e) {
     alert('⚠ ' + e.message);
   }
+}
+
+async function flipWav() {
+  const flipped = tracks.filter(t => t.flipped).length;
+  const to_wav = flipped === 0;
+  const msg = to_wav
+    ? `Конвертировать «${current.title}» в WAV для CDJ?\nВсе кью, сетка, BPM и порядок сохранятся (пути в master.db переключатся на WAV).\nRekordbox должен быть ЗАКРЫТ.`
+    : `Вернуть «${current.title}» к исходникам (FLAC/MP3)?\nПути в master.db переключатся обратно. Rekordbox должен быть ЗАКРЫТ.`;
+  if (!confirm(msg)) return;
+  const key = current.kind === 'sc' ? 'sc:' + current.id : current.id;
+  await api('/api/flip', {body:{playlist_key:key, playlist_title:current.title, to_wav}});
+  startPolling();
 }
 
 async function bindPath() {
