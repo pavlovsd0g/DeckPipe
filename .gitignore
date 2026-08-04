@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+downloads/
+*.log
+
+# секреты и локальные настройки — НЕ коммитить
+config.local.json

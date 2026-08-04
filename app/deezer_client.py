@@ -1,0 +1,165 @@
+# -*- coding: utf-8 -*-
+"""Deezer-клиент: ARL -> GW (метаданные) + media API (скачивание) + верификация."""
+import functools
+import hashlib
+import json
+import re
+import subprocess
+import time
+from pathlib import Path
+
+import requests
+import imageio_ffmpeg
+from Crypto.Cipher import Blowfish
+from mutagen.flac import FLAC as MutagenFLAC
+from mutagen.mp3 import MP3 as MutagenMP3
+from mutagen.mp4 import MP4 as MutagenMP4
+from mutagen.wave import WAVE as MutagenWAVE
+from mutagen.oggopus import OggOpus as MutagenOpus
+
+_MUTAGEN_BY_EXT = {".flac": MutagenFLAC, ".mp3": MutagenMP3, ".m4a": MutagenMP4,
+                   ".aac": MutagenMP4, ".mp4": MutagenMP4, ".wav": MutagenWAVE,
+                   ".opus": MutagenOpus, ".ogg": MutagenOpus}
+
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+BLOWFISH_SECRET = "g4el58wc0zvf9na1"
+QUALITIES = ["FLAC", "MP3_320", "MP3_128"]
+FILESIZE_KEY = {"FLAC": "FILESIZE_FLAC", "MP3_320": "FILESIZE_MP3_320", "MP3_128": "FILESIZE_MP3_128"}
+
+ROOT = Path(__file__).parent.parent
+CONFIG_PATH = ROOT / "config.local.json"
+
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    return {}
+
+
+def save_config(cfg: dict):
+    CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def sanitize_filename(name: str) -> str:
+    name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    return name.strip().strip(".")[:180] or "track"
+
+
+class DeezerSession:
+    def __init__(self, arl: str):
+        self.s = requests.Session()
+        self.s.cookies.set("arl", arl, domain=".deezer.com")
+        self.s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+        ud = self.gw("deezer.getUserData", token="null")
+        self.token = ud["checkForm"]
+        self.user = ud["USER"]
+        if not int(self.user.get("USER_ID", 0)):
+            raise RuntimeError("ARL недействителен (USER_ID=0)")
+        self.license_token = self.user["OPTIONS"]["license_token"]
+
+    def gw(self, method: str, token: str = None, **params):
+        r = self.s.post(
+            "https://www.deezer.com/ajax/gw-light.php",
+            params={"api_version": "1.0", "api_token": token or self.token,
+                    "method": method, "input": "3"},
+            json=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        err = data.get("error")
+        if err and (err if isinstance(err, str) else any(err.values())):
+            raise RuntimeError(f"GW {method}: {err}")
+        return data.get("results")
+
+    def media_url(self, track_token: str, quality: str) -> str:
+        order = [quality] + [q for q in QUALITIES if q != quality]
+        payload = {"license_token": self.license_token,
+                   "media": [{"type": "FULL",
+                              "formats": [{"cipher": "BF_CBC_STRIPE", "format": q}
+                                          for q in order]}],
+                   "track_tokens": [track_token]}
+        r = self.s.post("https://media.deezer.com/v1/get_url", json=payload, timeout=30)
+        r.raise_for_status()
+        for m in r.json()["data"][0]["media"]:
+            if m["format"] == quality:
+                return m["sources"][0]["url"]
+        raise RuntimeError(f"media API не выдал {quality}")
+
+    def download_track(self, track_id: str, out_dir: Path, prefer: str = "FLAC"):
+        """Скачивает трек с fallback по качеству. Возвращает (path, quality, infos)."""
+        infos = self.gw("song.getData", SNG_ID=track_id)
+        title, artist = infos["SNG_TITLE"], infos["ART_NAME"]
+        order = [prefer] + [q for q in QUALITIES if q != prefer]
+        last_err = None
+        for q in order:
+            if int(infos.get(FILESIZE_KEY[q], "0") or 0) == 0:
+                continue
+            try:
+                url = self.media_url(infos["TRACK_TOKEN"], q)
+                ext = "flac" if q == "FLAC" else "mp3"
+                fpath = out_dir / f"{sanitize_filename(artist + ' - ' + title)}.{ext}"
+                key = _blowfish_key(track_id)
+                with self.s.get(url, stream=True, timeout=180) as r:
+                    r.raise_for_status()
+                    i = 0
+                    with open(fpath, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=2048):
+                            if not chunk:
+                                continue
+                            if i % 3 == 0 and len(chunk) == 2048:
+                                chunk = Blowfish.new(
+                                    key, Blowfish.MODE_CBC,
+                                    b"\x00\x01\x02\x03\x04\x05\x06\x07").decrypt(chunk)
+                            f.write(chunk)
+                            i += 1
+                return fpath, q, infos
+            except Exception as e:
+                last_err = e
+        raise RuntimeError(f"не удалось скачать ни в одном качестве: {last_err}")
+
+
+def _blowfish_key(track_id: str) -> bytes:
+    h = hashlib.md5(str(track_id).encode()).hexdigest()
+    return "".join(
+        chr(functools.reduce(lambda x, y: x ^ y, map(ord, t)))
+        for t in zip(h[:16], h[16:], BLOWFISH_SECRET)
+    ).encode()
+
+
+def verify_file(fpath: Path, expected_duration: int, tolerance: float = 2.0):
+    """Проверка целостности: читаемость + полное декодирование + длительность.
+    Возвращает (ok, error_message, actual_duration)."""
+    try:
+        if not fpath.exists() or fpath.stat().st_size < 30_000:
+            return False, "файл отсутствует или подозрительно мал", 0.0
+        cls = _MUTAGEN_BY_EXT.get(fpath.suffix.lower())
+        if cls is None:
+            return False, f"неизвестный формат {fpath.suffix}", 0.0
+        mf = cls(str(fpath))
+        actual = float(mf.info.length)
+    except Exception as e:
+        return False, f"файл не читается: {e}", 0.0
+    r = subprocess.run([FFMPEG, "-v", "error", "-i", str(fpath), "-f", "null", "-"],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or r.stderr.strip():
+        return False, f"ошибки декодирования: {r.stderr.strip()[:200]}", actual
+    if abs(actual - expected_duration) > tolerance:
+        return False, f"длительность {actual:.1f}c != ожидаемая ~{expected_duration}c (обрезан?)", actual
+    return True, "", actual
+
+
+_session_cache = {"session": None, "arl": None, "ts": 0}
+
+
+def get_session() -> DeezerSession:
+    """Кешированная сессия (пересоздаём, если ARL сменился или прошло >10 мин)."""
+    cfg = load_config()
+    arl = cfg.get("arl")
+    if not arl:
+        raise RuntimeError("ARL не задан в config.local.json")
+    now = time.time()
+    if (_session_cache["session"] is None or _session_cache["arl"] != arl
+            or now - _session_cache["ts"] > 600):
+        _session_cache["session"] = DeezerSession(arl)
+        _session_cache["arl"] = arl
+    _session_cache["ts"] = now
+    return _session_cache["session"]
