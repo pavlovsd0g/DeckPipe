@@ -75,21 +75,29 @@ def _worker():
             provider = t.get("provider", "deezer")
             expected = int(t.get("duration") or 0)
             ok, err, quality, fpath = False, "", "", None
+            meta = None
             for attempt in range(1 + AUTO_RETRIES):
                 try:
                     if provider == "sc":
                         from .soundcloud import download_track as sc_download
-                        fpath, quality, sc_dur = sc_download(t, pl_dir)
+                        from .tagger import _meta_from_sc
+                        fpath, quality, sc_dur, sc_info = sc_download(t, pl_dir)
                         infos_duration = int(sc_dur or expected)
+                        meta = _meta_from_sc(sc_info, None)
                     else:
+                        from .tagger import _meta_from_deezer
                         if ds is None:
                             ds = get_session()
                         fpath, quality, infos = ds.download_track(tid, pl_dir, prefer="FLAC")
                         infos_duration = int(infos["DURATION"])
+                        meta = _meta_from_deezer(infos)
                     # HLS-AAC со SoundCloud может плавать по длительности на неск. секунд
                     tol = 12.0 if (provider == "sc" and fpath.suffix.lower() == ".m4a") else 2.0
                     v_ok, v_err, actual = verify_file(fpath, expected or infos_duration, tolerance=tol)
                     if v_ok:
+                        from .tagger import write_tags
+                        if meta:
+                            write_tags(fpath, meta)
                         ok, err = True, ""
                         _set_track(pl_dir, tid, title=t["title"], artist=t["artist"],
                                    file=fpath.name, format=quality.lower(),

@@ -67,4 +67,4 @@ def download_track(track: dict, out_dir: Path):
     if not fpath.exists():
         cands = sorted(out_dir.glob(base + ".*"), key=lambda p: p.stat().st_mtime, reverse=True)
         fpath = cands[0]
-    return fpath, fpath.suffix.lstrip(".").lower(), float(info.get("duration") or 0)
+    return fpath, fpath.suffix.lstrip(".").lower(), float(info.get("duration") or 0), info

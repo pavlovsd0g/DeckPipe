@@ -274,6 +274,49 @@ def api_sc_download(source_id: str, body: DownloadIn):
     return {"job_id": job_id}
 
 
+# ---------- Лист ошибок ----------
+@app.get("/api/errors")
+async def api_errors():
+    """Все треки со статусом verify_failed_* по всем плейлистам и источникам."""
+    out = []
+    try:
+        playlists = await fetch_playlists()
+    except Exception:
+        playlists = []
+    entries = [(p["id"], p["title"], "deezer") for p in playlists]
+    entries += [(_sc_key(s["id"]), s["title"], "sc") for s in _sc_sources()]
+
+    for key, title, provider in entries:
+        pl_dir = library.playlist_dir(key, title)
+        sc = library.load_sidecar(pl_dir)
+        for tid, e in sc.get("tracks", {}).items():
+            if str(e.get("status", "")).startswith("verify_failed"):
+                out.append({
+                    "playlist_key": key, "playlist_title": title, "provider": provider,
+                    "error": e.get("error", ""), "file": e.get("file", ""),
+                    "status": e["status"],
+                    "track": {"id": tid, "title": e.get("title", "?"),
+                              "artist": e.get("artist", ""),
+                              "duration": e.get("duration_expected", 0),
+                              "url": e.get("url", "")},
+                })
+    return out
+
+
+class RetryIn(BaseModel):
+    playlist_key: str
+    playlist_title: str
+    track: dict
+
+
+@app.post("/api/errors/retry")
+def api_retry(body: RetryIn):
+    provider = "sc" if body.playlist_key.startswith("sc:") else "deezer"
+    track = {**body.track, "provider": provider}
+    job_id = jobs.enqueue(body.playlist_key, body.playlist_title, [track])
+    return {"job_id": job_id}
+
+
 # ---------- статика ----------
 @app.get("/")
 def index():
