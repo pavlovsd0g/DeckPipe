@@ -15,7 +15,7 @@ from .deezer_client import load_config, get_session
 
 app = FastAPI(title="DeckPipe")
 STATIC = Path(__file__).parent / "static"
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.5.0"
 
 
 @app.get("/api/version")
