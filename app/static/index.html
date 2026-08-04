@@ -210,6 +210,8 @@ let loginService = 'deezer';
 
 function openLogin(service) {
   loginService = service;
+  // в десктопной сборке — нативное окно логина с авто-подхватом cookie
+  if (window.__TAURI__) { tauriLogin(service); return; }
   $('#loginResult').textContent = '';
   $('#loginResult').style.color = '';
   $('#loginToken').value = '';
@@ -239,6 +241,20 @@ function openLogin(service) {
 }
 
 function closeLogin() { $('#modalOverlay').style.display = 'none'; }
+
+async function tauriLogin(service) {
+  try {
+    const token = await window.__TAURI__.core.invoke('service_login', {service});
+    const url = service === 'deezer' ? '/api/login/deezer' : '/api/login/soundcloud';
+    const body = service === 'deezer' ? {arl: token} : {oauth_token: token};
+    const r = await api(url, {body});
+    alert(`✔ Вход выполнен: ${r.email || r.username}`);
+    loadConfig();
+    if (service === 'sc') { switchTab('sc'); } else { loadPlaylists(); }
+  } catch (e) {
+    if (!String(e).includes('закрыто')) alert('Логин не удался: ' + e);
+  }
+}
 
 async function doLogin() {
   const token = $('#loginToken').value.trim();

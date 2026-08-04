@@ -3,8 +3,10 @@
 import functools
 import hashlib
 import json
+import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -26,7 +28,17 @@ BLOWFISH_SECRET = "g4el58wc0zvf9na1"
 QUALITIES = ["FLAC", "MP3_320", "MP3_128"]
 FILESIZE_KEY = {"FLAC": "FILESIZE_FLAC", "MP3_320": "FILESIZE_MP3_320", "MP3_128": "FILESIZE_MP3_128"}
 
-ROOT = Path(__file__).parent.parent
+
+def _data_dir() -> Path:
+    """Конфиг/данные: рядом с проектом в dev, %APPDATA%\\DeckPipe в сборке."""
+    if getattr(sys, "frozen", False):
+        d = Path(os.environ.get("APPDATA", ".")) / "DeckPipe"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    return Path(__file__).parent.parent
+
+
+ROOT = _data_dir()
 CONFIG_PATH = ROOT / "config.local.json"
 
 

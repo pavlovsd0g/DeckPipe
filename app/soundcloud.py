@@ -120,7 +120,8 @@ def _oauth_cookiefile() -> str | None:
     token = sc_oauth_token()
     if not token:
         return None
-    p = Path(__file__).parent.parent / ".sc_cookies.txt"
+    from .deezer_client import ROOT
+    p = ROOT / ".sc_cookies.txt"
     if not p.exists() or token not in p.read_text():
         p.write_text(
             "# Netscape HTTP Cookie File\n"

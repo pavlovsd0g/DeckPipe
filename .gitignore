@@ -5,6 +5,13 @@ node_modules/
 downloads/
 *.log
 
+# сборка
+dist/
+build/
+desktop/node_modules/
+desktop/src-tauri/target/
+*.spec
+
 # секреты и локальные настройки — НЕ коммитить
 config.local.json
 .sc_cookies.txt

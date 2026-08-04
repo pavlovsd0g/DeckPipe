@@ -1,0 +1,12 @@
+{
+  "name": "deckpipe-desktop",
+  "private": true,
+  "version": "0.5.0",
+  "scripts": {
+    "tauri": "tauri",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
