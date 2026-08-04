@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"DeckPipe default capabilities","remote":{"urls":["http://127.0.0.1:*","http://localhost:*"]},"local":true,"windows":["main"],"permissions":["core:default","allow-service-login"]}}

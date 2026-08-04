@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-service-login"
+description = "Разрешает команду service_login (окно логина с подхватом cookie)"
+commands = { allow = ["service_login"] }
