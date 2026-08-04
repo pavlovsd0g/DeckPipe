@@ -16,3 +16,4 @@ desktop/src-tauri/target/
 config.local.json
 .sc_cookies.txt
 desktop/src-tauri/binaries/
+release/
