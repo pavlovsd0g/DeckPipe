@@ -143,6 +143,39 @@ def _blowfish_key(track_id: str) -> bytes:
     ).encode()
 
 
+# client_id/secret веб-плеера Deezer (как у Saturn/deezloader)
+DZ_CLIENT_ID = "172365"
+DZ_CLIENT_SECRET = "fb0bec7ccc063dab0417eb7b0d847f34"
+DZ_GW = "https://www.deezer.com/ajax/gw-light.php"
+
+
+def login_with_password(email: str, password: str) -> "DeezerSession":
+    """Вход по email+паролю -> ARL (поток как в Saturn): user_auth.php -> user.getArl."""
+    s = requests.Session()
+    s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    s.get(DZ_GW, params={"method": "deezer.getUserData", "input": "3",
+                         "api_version": "1.0", "api_token": "null"}, timeout=20)
+    hp = hashlib.md5(password.encode()).hexdigest()
+    h = hashlib.md5(f"{DZ_CLIENT_ID}{email}{hp}{DZ_CLIENT_SECRET}".encode()).hexdigest()
+    r = s.get("https://connect.deezer.com/oauth/user_auth.php",
+              params={"app_id": DZ_CLIENT_ID, "login": email, "password": hp, "hash": h},
+              timeout=20)
+    data = r.json()
+    if "error" in data:
+        code = data["error"].get("code")
+        msg = "неверный email или пароль" if code == 50 else data["error"].get("message", "ошибка входа")
+        raise RuntimeError(msg)
+    if not data.get("access_token") and not s.cookies.get("sid"):
+        raise RuntimeError("не удалось авторизоваться")
+    # sid-cookie есть — берём ARL
+    r2 = s.get(DZ_GW, params={"method": "user.getArl", "input": "3",
+                              "api_version": "1.0", "api_token": "null"}, timeout=20)
+    arl = r2.json().get("results")
+    if not arl:
+        raise RuntimeError("ARL не получен")
+    return DeezerSession(arl), arl  # валидация: бросит при невалидном
+
+
 def verify_file(fpath: Path, expected_duration: int, tolerance: float = 2.0):
     """Проверка целостности: читаемость + полное декодирование + длительность.
     Возвращает (ok, error_message, actual_duration)."""

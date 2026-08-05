@@ -165,6 +165,10 @@
       <button class="ghost" onclick="closeLogin()">×</button>
     </div>
     <div id="loginSteps" style="color:var(--dim);font-size:13px;margin:10px 0"></div>
+    <div id="loginPasswordBlock" style="display:none">
+      <input id="loginEmail" style="width:100%;background:var(--panel2);border:1px solid #343743;color:var(--text);padding:8px 10px;border-radius:6px;margin-bottom:6px" placeholder="Email Deezer" autocomplete="username">
+      <input id="loginPassword" type="password" style="width:100%;background:var(--panel2);border:1px solid #343743;color:var(--text);padding:8px 10px;border-radius:6px" placeholder="Пароль" autocomplete="current-password">
+    </div>
     <input id="loginToken" style="width:100%;background:var(--panel2);border:1px solid #343743;color:var(--text);padding:8px 10px;border-radius:6px" placeholder="">
     <div style="display:flex;gap:8px;margin-top:12px;align-items:center">
       <button onclick="doLogin()">Войти</button>
@@ -218,11 +222,11 @@ function openLogin(service) {
   $('#scImport').style.display = 'none';
   if (service === 'deezer') {
     $('#loginTitle').textContent = 'Вход в Deezer';
-    $('#loginSteps').innerHTML = `<b>Способ 1 — расширение DeckPipe Helper</b> (папка extension/):<br>
-      opera://extensions → Режим разработчика → Загрузить распакованное → клик по иконке DeckPipe — вход подхватится из браузера сам.<br>
-      <b>Способ 2 — вручную:</b> F12 → Application → Cookies → <b>arl</b> на deezer.com → вставить ниже`;
-    $('#loginToken').placeholder = 'ARL cookie (192 символа)';
+    $('#loginSteps').innerHTML = `<b>Просто email и пароль</b> — как в Saturn:<br>`;
+    $('#loginPasswordBlock').style.display = 'block';
+    $('#loginToken').placeholder = '…или вставьте ARL cookie вручную сюда';
   } else {
+    $('#loginPasswordBlock').style.display = 'none';
     $('#loginTitle').textContent = 'Вход в SoundCloud';
     $('#loginSteps').innerHTML = `<b>Способ 1 — расширение DeckPipe Helper</b> (папка extension/):<br>
       opera://extensions → Режим разработчика → Загрузить распакованное → клик по иконке DeckPipe — вход подхватится из браузера сам.<br>
@@ -258,9 +262,22 @@ async function tauriLogin(service) {
 
 async function doLogin() {
   const token = $('#loginToken').value.trim();
-  if (!token) return;
-  const url = loginService === 'deezer' ? '/api/login/deezer' : '/api/login/soundcloud';
-  const body = loginService === 'deezer' ? {arl: token} : {oauth_token: token};
+  const email = $('#loginEmail').value.trim();
+  const password = $('#loginPassword').value;
+  let url, body;
+  if (loginService === 'deezer') {
+    if (email && password) {
+      url = '/api/login/deezer/password';
+      body = {email, password};
+    } else if (token) {
+      url = '/api/login/deezer';
+      body = {arl: token};
+    } else return;
+  } else {
+    if (!token) return;
+    url = '/api/login/soundcloud';
+    body = {oauth_token: token};
+  }
   try {
     const r = await api(url, {body});
     $('#loginResult').style.color = 'var(--ok)';

@@ -406,6 +406,11 @@ class LoginDeezerIn(BaseModel):
     arl: str
 
 
+class LoginPasswordIn(BaseModel):
+    email: str
+    password: str
+
+
 class LoginScIn(BaseModel):
     oauth_token: str
 
@@ -443,6 +448,22 @@ def api_login_from_browser(body: LoginFromBrowserIn):
     if not out:
         raise HTTPException(400, "пустые токены")
     return out
+
+
+@app.post("/api/login/deezer/password")
+def api_login_deezer_password(body: LoginPasswordIn):
+    """Вход в Deezer по email+паролю (как в Saturn)."""
+    from .deezer_client import login_with_password, _session_cache
+    try:
+        ds, arl = login_with_password(body.email.strip(), body.password)
+    except Exception as e:
+        raise HTTPException(401, str(e))
+    cfg = load_config()
+    cfg["arl"] = arl
+    save_config(cfg)
+    _session_cache["session"] = ds
+    _session_cache["arl"] = arl
+    return {"id": ds.user["USER_ID"], "email": ds.user.get("EMAIL")}
 
 
 @app.post("/api/login/deezer")
