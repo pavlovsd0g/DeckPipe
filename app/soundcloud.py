@@ -14,7 +14,7 @@ FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 SC_API = "https://api-v2.soundcloud.com"
 
 _cache = {}  # url -> (ts, data)
-TTL = 60
+TTL = 600  # 10 мин: рейт-лимит SC делает повторные резолвы дорогими
 
 
 # ---------- авторизация ----------
