@@ -69,7 +69,7 @@ Expected: no unsafe match.
 
 Commit: `feat(security): enforce authenticated loopback API`
 
-### Task 2: Bundle the frontend and own the sidecar lifecycle
+### Task 2A: Create one CSP-compatible frontend build
 
 **Files:**
 - Create: `frontend/index.html`
@@ -78,6 +78,43 @@ Commit: `feat(security): enforce authenticated loopback API`
 - Create: `frontend/build.mjs`
 - Modify: `package.json`
 - Create: `package-lock.json`
+- Generate: `app/static/index.html`
+- Generate: `app/static/app.js`
+- Generate: `app/static/styles.css`
+- Generate: `desktop/ui/index.html`
+- Generate: `desktop/ui/app.js`
+- Generate: `desktop/ui/styles.css`
+- Create: `qa/tests/test_frontend_build_contract.py`
+
+**Step 1: Write failing frontend-build tests**
+
+Assert: `frontend/` is the only editable source; a clean build emits byte-identical assets to `app/static/` and `desktop/ui/`; JavaScript imports `invoke` from `@tauri-apps/api/core` instead of using `window.__TAURI__`; HTML contains no inline scripts, styles, event handlers, or `javascript:` URLs; generated assets contain no source-map path disclosure; the current user-visible controls and API actions remain present.
+
+**Step 2: Run RED**
+
+Run: `python -m unittest qa.tests.test_frontend_build_contract -v`
+
+Expected: FAIL because the real UI is one inline FastAPI document while the desktop target is a placeholder.
+
+**Step 3: Extract and mechanically preserve UI behavior**
+
+Split the existing document into canonical HTML/CSS/JavaScript. Replace static and generated inline event attributes with delegated listeners and fixed `data-action` values; replace inline style attributes with named classes. Introduce one API wrapper whose release path obtains `{baseUrl, token}` through a narrow Tauri `backend_connection` command and caches it in memory only. Browser development may use an explicit synthetic test injection, but release assets must not persist or render the token. Keep deeper untrusted-HTML removal, accessibility semantics, responsive polish, and honest error-state redesign for Task 6.
+
+**Step 4: Run GREEN and deterministic-build gates**
+
+Run: `npm ci && npm run build:frontend && python -m unittest qa.tests.test_frontend_build_contract -v`
+
+Run the build a second time in a temporary output directory and compare hashes; do not modify runtime outputs during the comparison.
+
+Expected: tests pass and both runtime targets are identical.
+
+**Step 5: Commit**
+
+Commit: `build(frontend): create canonical CSP-safe assets`
+
+### Task 2B: Bundle the Tauri window and own the sidecar lifecycle
+
+**Files:**
 - Modify: `desktop/package.json`
 - Modify: `desktop/package-lock.json`
 - Modify: `desktop/src-tauri/Cargo.toml`
@@ -86,27 +123,23 @@ Commit: `feat(security): enforce authenticated loopback API`
 - Modify: `desktop/src-tauri/tauri.conf.json`
 - Modify: `desktop/src-tauri/capabilities/default.json`
 - Modify: `desktop/src-tauri/permissions/service-login.toml`
-- Generate: `app/static/index.html`
-- Generate: `app/static/app.js`
-- Generate: `app/static/styles.css`
-- Generate: `desktop/ui/index.html`
-- Generate: `desktop/ui/app.js`
-- Generate: `desktop/ui/styles.css`
+- Create: `desktop/src-tauri/permissions/backend-connection.toml`
+- Modify: `run_backend.py`
 - Create: `qa/tests/test_desktop_contract.py`
 
 **Step 1: Write failing desktop contract tests**
 
-Assert: one canonical frontend source builds byte-identical web/desktop assets; `withGlobalTauri` is false; CSP has no `unsafe-inline`/`unsafe-eval`; no remote URL/capability scope; only the named login command is allowed; the Rust launcher creates a random token, passes token and parent PID through environment, retains the child, kills it on exit/error, forbids port fallback, and enforces one desktop instance.
+Assert: `withGlobalTauri` is false; CSP has no `unsafe-inline`/`unsafe-eval`; no external main-window URL or remote capability scope; IPC permits only login and read-once/in-memory backend connection data to the `main` window; the Rust launcher creates a random 32-byte token, passes token and parent PID through environment, retains the child, kills it on exit/error, and enforces one desktop instance. The backend must bind the actual listening socket before publishing `DECKPIPE_PORT`, use that same socket for Uvicorn, and exit when its parent dies.
 
 **Step 2: Run RED**
 
 Run: `python -m unittest qa.tests.test_desktop_contract -v`
 
-Expected: FAIL against the external localhost window and placeholder desktop UI.
+Expected: FAIL against the external localhost window, dropped child handle, and close-then-rebind free-port probe.
 
 **Step 3: Build the bundled architecture**
 
-Extract the current UI into `frontend/`; bundle `@tauri-apps/api/core` with esbuild and emit both runtime targets from one build. Load `WebviewUrl::App`. Add strict CSP and security headers. Generate a 32-byte token with OS randomness, pass it plus `DECKPIPE_PARENT_PID` via sidecar environment, retain the child in managed state, terminate it during teardown and failed startup, and add single-instance behavior. Port discovery is allowed only through a reserved loopback listener or a fail-closed explicit port handoff; never silently choose a different public contract.
+Load `WebviewUrl::App` from the Task 2A assets. Add strict CSP and security headers. Generate a 32-byte token with OS randomness, store connection data in Tauri managed state, expose it only through the narrow main-window command, pass token plus `DECKPIPE_PARENT_PID` through sidecar environment, retain the child in managed state, terminate it during teardown and failed startup, and add single-instance behavior. Replace port probing with one pre-bound listening socket handed directly to Uvicorn; print the selected port only after successful bind and never close/rebind it.
 
 **Step 4: Run GREEN and compiler gates**
 
