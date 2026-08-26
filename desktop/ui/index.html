@@ -1,1 +1,104 @@
-<!doctype html><title>DeckPipe</title>
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>DeckPipe</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+<header>
+  <h1>Deck<span>Pipe</span></h1>
+  <button class="ghost" id="btnLoginDeezer" data-action="open-login" data-service="deezer">Deezer: вход</button>
+  <button class="ghost" id="btnLoginSc" data-action="open-login" data-service="sc">SC: вход</button>
+  <div id="settings">
+    <select id="wavMode" data-action="save-wav-mode" title="Режим хранения скачанных файлов">
+      <option value="source">Исходный формат</option>
+      <option value="wav">WAV (+ исходник)</option>
+      <option value="wav_delete">WAV (удалять исходник)</option>
+    </select>
+    <input id="musicRoot" placeholder="Корень библиотеки (общая папка, напр. E:\Music)">
+    <button class="ghost" data-action="save-root">Сохранить</button>
+    <button class="ghost" data-action="send-report">🐞 Багрепорт</button>
+  </div>
+</header>
+<main>
+  <div id="side">
+    <div id="tabs">
+      <button id="tab-deezer" class="active" data-action="switch-tab" data-tab="deezer">Deezer</button>
+      <button id="tab-sc" data-action="switch-tab" data-tab="sc">SoundCloud</button>
+      <button id="tab-search" data-action="switch-tab" data-tab="search">Поиск</button>
+      <button id="tab-errors" data-action="switch-tab" data-tab="errors">Ошибки</button>
+    </div>
+    <div id="sc-add">
+      <input id="scUrl" placeholder="URL плейлиста/страницы SoundCloud (необязательно)">
+      <button data-action="add-sc-source">+</button>
+    </div>
+    <div id="playlists"></div>
+  </div>
+  <div id="content">
+    <div id="toolbar" class="hidden">
+      <div>
+        <div id="pltitle"></div>
+        <div id="plpath"></div>
+      </div>
+      <div class="spacer"></div>
+      <span id="plstats" class="dim"></span>
+      <label class="dim label-compact" title="Файлы с номерами: 01 - Artist - Title">
+        <input type="checkbox" id="numbering" data-action="save-numbering"> NN</label>
+      <button class="ghost" data-action="rescan">Пересканировать</button>
+      <button class="ghost" data-action="bind-path">Папка плейлиста…</button>
+      <button data-action="download-selected">Скачать выбранные</button>
+      <button data-action="sync-playlist-order" title="Перенумеровать файлы по порядку в стриминге и докачать недостающие">Синк: по порядку</button>
+      <button data-action="sync-append" title="Не трогать текущие номера, новые треки — вниз списка">Синк: новые вниз</button>
+      <button class="ghost" data-action="rb-sync" title="Синхронизировать скачанные треки в Rekordbox (Rekordbox должен быть закрыт)">→ RB</button>
+      <button class="ghost" id="flipBtn" data-action="flip-wav" title="Конвертировать плейлист в WAV для CDJ с сохранением всех кью/сетки (Rekordbox закрыт)">⇄ WAV</button>
+    </div>
+    <div id="searchbar" class="hidden">
+      <input id="searchInput" placeholder="Трек, альбом или исполнитель…">
+      <select id="searchService">
+        <option value="both">Deezer + SC</option>
+        <option value="deezer">Deezer</option>
+        <option value="sc">SoundCloud</option>
+      </select>
+      <button data-action="run-search">Найти</button>
+    </div>
+    <div id="searchFilters">
+      <span class="chip" data-action="set-search-filter" data-filter="all" data-f="all">Все</span>
+      <span class="chip" data-action="set-search-filter" data-filter="tracks" data-f="tracks">Треки</span>
+      <span class="chip" data-action="set-search-filter" data-filter="albums" data-f="albums">Альбомы</span>
+      <span class="chip" data-action="set-search-filter" data-filter="playlists" data-f="playlists">Плейлисты/Сеты</span>
+      <span class="chip" data-action="set-search-filter" data-filter="artists" data-f="artists">Исполнители</span>
+    </div>
+    <div id="tracks"><div id="empty">Выберите плейлист слева</div></div>
+  </div>
+</main>
+<div id="jobs"></div>
+
+<div id="modalOverlay" class="hidden" data-action="overlay-close">
+  <div id="modal">
+    <div class="modal-head">
+      <h2 id="loginTitle"></h2>
+      <button class="ghost" data-action="close-login">×</button>
+    </div>
+    <div id="loginSteps"></div>
+    <div id="loginPasswordBlock" class="hidden">
+      <input id="loginEmail" class="login-input login-input-gap" placeholder="Email Deezer" autocomplete="username">
+      <input id="loginPassword" class="login-input" type="password" placeholder="Пароль" autocomplete="current-password">
+    </div>
+    <input id="loginToken" class="login-input" placeholder="">
+    <div class="login-actions">
+      <button data-action="do-login">Войти</button>
+      <span id="loginResult"></span>
+    </div>
+    <div id="scImport" class="hidden">
+      <div class="section-caption">Импортировать в источники:</div>
+      <div id="scAccountList"></div>
+      <button class="button-offset" data-action="import-sc-account">Импортировать выбранные</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>
