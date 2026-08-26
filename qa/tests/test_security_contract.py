@@ -122,6 +122,12 @@ class SecurityContractTests(unittest.TestCase):
         status, _headers, body = request("GET", "/api/version")
         self.assertEqual({"version": "0.5.0"}, json.loads(body.decode("utf-8")))
 
+    def test_framework_documentation_surfaces_are_disabled(self) -> None:
+        for path in ("/docs", "/redoc", "/openapi.json"):
+            status, _headers, body = request("GET", path)
+            self.assertEqual(404, status, path)
+            self.assertNotIn(SENTINEL_TOKEN.encode("utf-8"), body)
+
     def test_sensitive_api_routes_require_exact_bearer_token(self) -> None:
         unauthenticated = request("GET", "/api/jobs")
         malformed = request("GET", "/api/jobs", {"authorization": SENTINEL_TOKEN})
@@ -166,8 +172,12 @@ class SecurityContractTests(unittest.TestCase):
         self.assertNotEqual("*", headers.get("access-control-allow-origin"))
         self.assertNotIn("access-control-allow-credentials", headers)
         self.assertNotIn("access-control-allow-private-network", headers)
-        self.assertIn("GET", headers.get("access-control-allow-methods", ""))
-        self.assertIn("POST", headers.get("access-control-allow-methods", ""))
+        allowed_methods = {
+            method.strip()
+            for method in headers.get("access-control-allow-methods", "").split(",")
+            if method.strip()
+        }
+        self.assertEqual({"GET", "POST", "DELETE", "OPTIONS"}, allowed_methods)
         self.assertIn("Authorization", headers.get("access-control-allow-headers", ""))
 
     def test_hostile_browser_requests_are_rejected_before_auth_or_routing(self) -> None:

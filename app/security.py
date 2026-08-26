@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 PUBLIC_PATHS = {"/", "/api/version"}
 PUBLIC_PREFIXES = ("/static/",)
 ALLOWED_ORIGIN = "http://tauri.localhost"
-ALLOWED_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
+ALLOWED_METHODS = ("GET", "POST", "DELETE", "OPTIONS")
 ALLOWED_HEADERS = ("Authorization", "Content-Type")
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 

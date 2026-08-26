@@ -15,7 +15,7 @@ from . import jobs, library
 from .deezer_client import load_config, get_session
 from .security import LoopbackSecurityMiddleware, SecuritySettings
 
-app = FastAPI(title="DeckPipe")
+app = FastAPI(title="DeckPipe", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(LoopbackSecurityMiddleware, settings=SecuritySettings.from_env())
 STATIC = Path(__file__).parent / "static"
 APP_VERSION = "0.5.0"
