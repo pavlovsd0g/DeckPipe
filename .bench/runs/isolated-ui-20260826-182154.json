@@ -1,0 +1,484 @@
+{
+  "schema_version": 1,
+  "run_id": "isolated-ui-20260826-182154",
+  "generated_at": "2026-08-26T18:22:33.3416728+00:00",
+  "target": {
+    "product": "DeckPipe",
+    "version": "0.5.0",
+    "executable": "deckpipe.exe",
+    "executable_sha256": "1B07F67D4CEE8610CFCF7C36E2043C15505260EA70F59C95041B50AD6D67D31A",
+    "mode": "isolated-ui"
+  },
+  "safety": {
+    "live_mutation_endpoints_called": 0,
+    "protected_config_unchanged": true,
+    "rekordbox_database_unchanged": true,
+    "rekordbox_backup_count_unchanged": true,
+    "isolated_fixture_config_unchanged": true,
+    "isolation_directory_removed": true
+  },
+  "summary": {
+    "status": "fail",
+    "passed": 19,
+    "failed": 1,
+    "warnings": 1,
+    "skipped": 0
+  },
+  "checks": [
+    {
+      "id": "A1",
+      "status": "pass",
+      "message": "installed shell and sidecar became ready",
+      "data": {
+        "port_ready_ms": 3969.4,
+        "window_ready_ms": 3992.7
+      }
+    },
+    {
+      "id": "A2",
+      "status": "pass",
+      "message": "installed version matches the QA target",
+      "data": {
+        "reported_version": "0.5.0",
+        "expected_version": "0.5.0"
+      }
+    },
+    {
+      "id": "A3",
+      "status": "pass",
+      "message": "root document is readable UTF-8 HTML",
+      "data": {
+        "response_bytes": 42813,
+        "content_type": "text/html; charset=utf-8"
+      }
+    },
+    {
+      "id": "A4",
+      "status": "pass",
+      "message": "configuration endpoint exposes status fields only",
+      "data": {
+        "unexpected_sensitive_field_count": 0,
+        "state": {
+          "kind": "configuration-state",
+          "deezer_session_configured": false,
+          "soundcloud_session_configured": false,
+          "music_root_configured": true,
+          "wav_mode": "source",
+          "numbering": true
+        }
+      }
+    },
+    {
+      "id": "A5",
+      "status": "pass",
+      "message": "unknown route returns 404",
+      "data": null
+    },
+    {
+      "id": "B1",
+      "status": "pass",
+      "message": "Deezer playlist listing returned a parseable response",
+      "data": {
+        "kind": "deezer-playlists",
+        "item_count": 0,
+        "declared_track_count": 0,
+        "ok_track_count": 0,
+        "error_track_count": 0,
+        "cyrillic_string_count": 0,
+        "bad_glyph_string_count": 0
+      }
+    },
+    {
+      "id": "B2",
+      "status": "pass",
+      "message": "SoundCloud source listing returned a parseable response",
+      "data": {
+        "kind": "soundcloud-sources",
+        "item_count": 0,
+        "declared_track_count": 0,
+        "ok_track_count": 0,
+        "error_track_count": 0,
+        "cyrillic_string_count": 0,
+        "bad_glyph_string_count": 0
+      }
+    },
+    {
+      "id": "B4",
+      "status": "pass",
+      "message": "Rekordbox read-only status returned a parseable response",
+      "data": {
+        "kind": "rekordbox-state",
+        "database_exists": false,
+        "rekordbox_running": false,
+        "playlist_count": 0,
+        "content_count": 0,
+        "has_read_error": false,
+        "cyrillic_string_count": 0,
+        "bad_glyph_string_count": 0
+      }
+    },
+    {
+      "id": "B5",
+      "status": "pass",
+      "message": "error listing returned a parseable response",
+      "data": {
+        "kind": "errors-state",
+        "error_count": 0,
+        "cyrillic_string_count": 0,
+        "bad_glyph_string_count": 0
+      }
+    },
+    {
+      "id": "D2",
+      "status": "pass",
+      "message": "all read-only endpoint medians are within budget",
+      "data": {
+        "over_budget_count": 0,
+        "over_budget_paths": []
+      }
+    },
+    {
+      "id": "C1",
+      "status": "pass",
+      "message": "main controls are visible at normal size",
+      "data": {
+        "client_size": {
+          "width": 1320,
+          "height": 840
+        },
+        "ui": {
+          "descendant_count": 33,
+          "focusable_count": 12,
+          "empty_focusable_name_count": 1,
+          "cyrillic_name_count": 10,
+          "bad_glyph_name_count": 0,
+          "required_control_count": 6,
+          "required_visible_count": 6,
+          "required_focusable_count": 6,
+          "missing_control_ids": [],
+          "playlist_title_count": 0,
+          "playlist_title_found_count": 0,
+          "playlist_keyboard_accessible_count": 0
+        }
+      }
+    },
+    {
+      "id": "C2",
+      "status": "pass",
+      "message": "main controls remain visible at minimum size",
+      "data": {
+        "client_size": {
+          "width": 1000,
+          "height": 640
+        },
+        "ui": {
+          "descendant_count": 33,
+          "focusable_count": 12,
+          "empty_focusable_name_count": 1,
+          "cyrillic_name_count": 10,
+          "bad_glyph_name_count": 0,
+          "required_control_count": 6,
+          "required_visible_count": 6,
+          "required_focusable_count": 6,
+          "missing_control_ids": [],
+          "playlist_title_count": 0,
+          "playlist_title_found_count": 0,
+          "playlist_keyboard_accessible_count": 0
+        }
+      }
+    },
+    {
+      "id": "C3",
+      "status": "pass",
+      "message": "all tabs activate in the isolated profile",
+      "data": {
+        "tabs": [
+          {
+            "tab_id": "deezer",
+            "invoked": true,
+            "state_visible": true
+          },
+          {
+            "tab_id": "soundcloud",
+            "invoked": true,
+            "state_visible": true
+          },
+          {
+            "tab_id": "search",
+            "invoked": true,
+            "state_visible": true
+          },
+          {
+            "tab_id": "errors",
+            "invoked": true,
+            "state_visible": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "C4",
+      "status": "pass",
+      "message": "each isolated tab exposes an explanatory state",
+      "data": {
+        "tabs": [
+          {
+            "tab_id": "deezer",
+            "invoked": true,
+            "state_visible": true
+          },
+          {
+            "tab_id": "soundcloud",
+            "invoked": true,
+            "state_visible": true
+          },
+          {
+            "tab_id": "search",
+            "invoked": true,
+            "state_visible": true
+          },
+          {
+            "tab_id": "errors",
+            "invoked": true,
+            "state_visible": true
+          }
+        ]
+      }
+    },
+    {
+      "id": "C5",
+      "status": "warn",
+      "message": "no playlist cards were available for keyboard checks",
+      "data": {
+        "playlist_count": 0,
+        "located_count": 0,
+        "keyboard_accessible_count": 0,
+        "empty_focusable_name_count": 1
+      }
+    },
+    {
+      "id": "C6",
+      "status": "pass",
+      "message": "Cyrillic is present without detected replacement glyphs",
+      "data": {
+        "cyrillic_string_count": 10,
+        "bad_glyph_string_count": 0
+      }
+    },
+    {
+      "id": "D1",
+      "status": "pass",
+      "message": "window-ready time is within budget",
+      "data": {
+        "window_ready_ms": 3992.7,
+        "budget_ms": 5000.0
+      }
+    },
+    {
+      "id": "D3",
+      "status": "pass",
+      "message": "idle process footprint is within budget",
+      "data": {
+        "process_count": 10,
+        "working_set_mb": 538.2,
+        "private_memory_mb": 1059.5,
+        "idle_cpu_ms_over_2s": 0.0
+      }
+    },
+    {
+      "id": "E1",
+      "status": "pass",
+      "message": "protected user files are unchanged",
+      "data": {
+        "config_unchanged": true,
+        "rekordbox_database_unchanged": true,
+        "isolated_fixture_config_unchanged": true
+      }
+    },
+    {
+      "id": "E2",
+      "status": "pass",
+      "message": "only allowlisted GET requests ran and no Rekordbox backup was created",
+      "data": {
+        "allowlisted_get_count": 9,
+        "unsafe_request_count": 0,
+        "isolated_ui_interaction_count": 4,
+        "rekordbox_backup_count_unchanged": true
+      }
+    },
+    {
+      "id": "E3",
+      "status": "fail",
+      "message": "DeckPipe left an owned process after graceful close; the runner removed it",
+      "data": {
+        "orphan_detected": true,
+        "lingering_owned_process_count": 0,
+        "port_closed": true,
+        "isolation_directory_removed": true
+      }
+    }
+  ],
+  "performance": {
+    "port_ready_ms": 3969.4,
+    "window_ready_ms": 3992.7,
+    "api/api/version median_ms": 1.272,
+    "api/ median_ms": 1.302,
+    "api/api/config median_ms": 0.937,
+    "api/api/playlists median_ms": 164.513,
+    "api/api/sc/sources median_ms": 0.642,
+    "api/api/rb/status median_ms": 74.642,
+    "api/api/errors median_ms": 169.328,
+    "api/api/jobs median_ms": 0.407,
+    "api/__deckpipe_qa_missing__ median_ms": 0.273,
+    "process_count": 10,
+    "working_set_mb": 538.2,
+    "private_memory_mb": 1059.5,
+    "idle_cpu_ms_over_2s": 0.0
+  },
+  "endpoint_metrics": {
+    "/api/version": {
+      "expected_status": 200,
+      "unexpected_status_count": 0,
+      "response_bytes": 19,
+      "min_ms": 0.403,
+      "median_ms": 1.272,
+      "p95_ms": 257.133,
+      "max_ms": 257.133,
+      "payload": {
+        "kind": "version",
+        "reported_version": "0.5.0"
+      }
+    },
+    "/": {
+      "expected_status": 200,
+      "unexpected_status_count": 0,
+      "response_bytes": 42813,
+      "min_ms": 0.862,
+      "median_ms": 1.302,
+      "p95_ms": 4.826,
+      "max_ms": 4.826,
+      "payload": {
+        "kind": "html",
+        "utf8_replacement_detected": false,
+        "bad_glyph_detected": false
+      }
+    },
+    "/api/config": {
+      "expected_status": 200,
+      "unexpected_status_count": 0,
+      "response_bytes": 245,
+      "min_ms": 0.791,
+      "median_ms": 0.937,
+      "p95_ms": 0.982,
+      "max_ms": 0.982,
+      "payload": {
+        "kind": "configuration-state",
+        "deezer_session_configured": false,
+        "soundcloud_session_configured": false,
+        "music_root_configured": true,
+        "wav_mode": "source",
+        "numbering": true
+      }
+    },
+    "/api/playlists": {
+      "expected_status": 200,
+      "unexpected_status_count": 0,
+      "response_bytes": 2,
+      "min_ms": 163.16,
+      "median_ms": 164.513,
+      "p95_ms": 172.369,
+      "max_ms": 172.369,
+      "payload": {
+        "kind": "deezer-playlists",
+        "item_count": 0,
+        "declared_track_count": 0,
+        "ok_track_count": 0,
+        "error_track_count": 0,
+        "cyrillic_string_count": 0,
+        "bad_glyph_string_count": 0
+      }
+    },
+    "/api/sc/sources": {
+      "expected_status": 200,
+      "unexpected_status_count": 0,
+      "response_bytes": 2,
+      "min_ms": 0.569,
+      "median_ms": 0.642,
+      "p95_ms": 1.262,
+      "max_ms": 1.262,
+      "payload": {
+        "kind": "soundcloud-sources",
+        "item_count": 0,
+        "declared_track_count": 0,
+        "ok_track_count": 0,
+        "error_track_count": 0,
+        "cyrillic_string_count": 0,
+        "bad_glyph_string_count": 0
+      }
+    },
+    "/api/rb/status": {
+      "expected_status": 200,
+      "unexpected_status_count": 0,
+      "response_bytes": 50,
+      "min_ms": 66.398,
+      "median_ms": 74.642,
+      "p95_ms": 78.223,
+      "max_ms": 78.223,
+      "payload": {
+        "kind": "rekordbox-state",
+        "database_exists": false,
+        "rekordbox_running": false,
+        "playlist_count": 0,
+        "content_count": 0,
+        "has_read_error": false,
+        "cyrillic_string_count": 0,
+        "bad_glyph_string_count": 0
+      }
+    },
+    "/api/errors": {
+      "expected_status": 200,
+      "unexpected_status_count": 0,
+      "response_bytes": 2,
+      "min_ms": 166.769,
+      "median_ms": 169.328,
+      "p95_ms": 192.647,
+      "max_ms": 192.647,
+      "payload": {
+        "kind": "errors-state",
+        "error_count": 0,
+        "cyrillic_string_count": 0,
+        "bad_glyph_string_count": 0
+      }
+    },
+    "/api/jobs": {
+      "expected_status": 200,
+      "unexpected_status_count": 0,
+      "response_bytes": 2,
+      "min_ms": 0.363,
+      "median_ms": 0.407,
+      "p95_ms": 0.777,
+      "max_ms": 0.777,
+      "payload": {
+        "kind": "jobs-state",
+        "job_count": 0,
+        "active_job_count": 0
+      }
+    },
+    "/__deckpipe_qa_missing__": {
+      "expected_status": 404,
+      "unexpected_status_count": 0,
+      "response_bytes": 22,
+      "min_ms": 0.269,
+      "median_ms": 0.273,
+      "p95_ms": 0.32,
+      "max_ms": 0.32,
+      "payload": {
+        "kind": "generic",
+        "string_count": 1,
+        "cyrillic_string_count": 0,
+        "bad_glyph_string_count": 0
+      }
+    }
+  },
+  "fatal_error_type": null
+}

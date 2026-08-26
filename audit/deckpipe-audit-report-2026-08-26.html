@@ -1,0 +1,583 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DeckPipe — технический аудит, 26 августа 2026</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0c0f14;
+      --panel: #131923;
+      --panel-2: #182131;
+      --line: #293548;
+      --text: #eef3fb;
+      --muted: #9eacc0;
+      --accent: #8b7bff;
+      --cyan: #56d8dc;
+      --ok: #57d38c;
+      --warn: #f2b84b;
+      --high: #ff795f;
+      --critical: #ff4f76;
+      --shadow: 0 18px 50px rgba(0, 0, 0, .28);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 8% 0%, rgba(139, 123, 255, .14), transparent 31rem),
+        radial-gradient(circle at 95% 12%, rgba(86, 216, 220, .09), transparent 28rem),
+        var(--bg);
+      color: var(--text);
+      font: 15px/1.58 Inter, "Segoe UI", system-ui, sans-serif;
+    }
+    a { color: #b9afff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code, .mono {
+      font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+      font-size: .92em;
+    }
+    code {
+      background: rgba(139, 123, 255, .10);
+      border: 1px solid rgba(139, 123, 255, .18);
+      border-radius: 5px;
+      padding: .08rem .35rem;
+    }
+    .layout { display: grid; grid-template-columns: 270px minmax(0, 1fr); min-height: 100vh; }
+    nav {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      padding: 28px 20px;
+      border-right: 1px solid var(--line);
+      background: rgba(11, 15, 21, .86);
+      backdrop-filter: blur(14px);
+      overflow: auto;
+    }
+    .brand { font-size: 21px; font-weight: 760; letter-spacing: -.02em; }
+    .brand span { color: var(--accent); }
+    .nav-meta { margin: 5px 0 24px; color: var(--muted); font-size: 12px; }
+    nav a {
+      display: block;
+      color: var(--muted);
+      border-left: 2px solid transparent;
+      padding: 7px 10px;
+      margin: 2px 0;
+      font-size: 13px;
+    }
+    nav a:hover { color: var(--text); border-left-color: var(--accent); text-decoration: none; }
+    .nav-foot {
+      margin-top: 24px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    main { width: min(1180px, 100%); padding: 48px 52px 90px; }
+    header.hero { padding: 10px 0 36px; border-bottom: 1px solid var(--line); }
+    .eyebrow { color: var(--cyan); text-transform: uppercase; letter-spacing: .13em; font-size: 11px; font-weight: 800; }
+    h1 { font-size: clamp(36px, 5vw, 66px); line-height: 1.02; letter-spacing: -.045em; margin: 14px 0 18px; }
+    h1 em { color: var(--accent); font-style: normal; }
+    .lead { color: #c2cddd; font-size: 18px; max-width: 900px; margin: 0; }
+    .verdict {
+      margin-top: 28px;
+      display: grid;
+      grid-template-columns: 150px minmax(0, 1fr);
+      gap: 20px;
+      align-items: center;
+      padding: 22px;
+      background: linear-gradient(135deg, rgba(255, 79, 118, .13), rgba(139, 123, 255, .09));
+      border: 1px solid rgba(255, 79, 118, .35);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+    }
+    .score { font-size: 54px; font-weight: 850; letter-spacing: -.06em; color: #ff829d; }
+    .score small { font-size: 16px; color: var(--muted); letter-spacing: 0; }
+    .verdict strong { display: block; font-size: 20px; margin-bottom: 5px; }
+    section { scroll-margin-top: 24px; padding-top: 48px; }
+    h2 { font-size: 29px; letter-spacing: -.025em; margin: 0 0 9px; }
+    h3 { margin: 28px 0 8px; font-size: 19px; }
+    .section-intro { color: var(--muted); max-width: 900px; margin: 0 0 22px; }
+    .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; }
+    .card {
+      grid-column: span 4;
+      padding: 19px;
+      background: linear-gradient(180deg, rgba(25, 33, 48, .94), rgba(17, 23, 33, .94));
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      box-shadow: 0 10px 26px rgba(0, 0, 0, .13);
+    }
+    .card.wide { grid-column: span 6; }
+    .card.full { grid-column: 1 / -1; }
+    .card .kicker { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+    .card .metric { display: block; font-size: 28px; font-weight: 780; margin: 5px 0 3px; }
+    .card p { color: #bdc8d8; margin: 6px 0 0; }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .bad { color: #ff8b76; }
+    .critical { color: var(--critical); }
+    .pill {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 3px 9px;
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      vertical-align: middle;
+    }
+    .pill.critical { background: rgba(255, 79, 118, .16); border: 1px solid rgba(255, 79, 118, .45); }
+    .pill.high { color: #ff9b88; background: rgba(255, 121, 95, .13); border: 1px solid rgba(255, 121, 95, .38); }
+    .pill.medium { color: #ffd281; background: rgba(242, 184, 75, .11); border: 1px solid rgba(242, 184, 75, .35); }
+    .pill.pass { color: #86e2ac; background: rgba(87, 211, 140, .11); border: 1px solid rgba(87, 211, 140, .35); }
+    .finding {
+      margin: 12px 0;
+      padding: 18px 20px;
+      background: rgba(18, 25, 36, .88);
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--warn);
+      border-radius: 10px;
+    }
+    .finding.critical-border { border-left-color: var(--critical); }
+    .finding.high-border { border-left-color: var(--high); }
+    .finding h3 { margin: 0 0 7px; font-size: 17px; }
+    .finding p { margin: 7px 0; color: #c0cbda; }
+    .finding .evidence { color: var(--muted); font-size: 13px; }
+    ul, ol { padding-left: 21px; }
+    li { margin: 5px 0; }
+    table { width: 100%; border-collapse: collapse; margin: 16px 0 24px; font-size: 13px; }
+    th, td { padding: 10px 11px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+    th { color: #aebbd0; background: rgba(24, 33, 49, .78); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+    tr:hover td { background: rgba(139, 123, 255, .035); }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+      margin: 20px 0;
+    }
+    .flow > div { position: relative; padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+    .flow > div:not(:last-child)::after { content: "→"; position: absolute; right: -17px; top: 33%; z-index: 2; color: var(--accent); font-weight: 900; }
+    .flow b { display: block; margin-bottom: 5px; }
+    .flow span { color: var(--muted); font-size: 12px; }
+    .callout {
+      margin: 18px 0;
+      padding: 16px 18px;
+      border-radius: 10px;
+      background: rgba(86, 216, 220, .07);
+      border: 1px solid rgba(86, 216, 220, .24);
+      color: #c8e8e9;
+    }
+    .timeline { border-left: 2px solid var(--line); margin: 18px 0 0 8px; padding-left: 22px; }
+    .timeline article { position: relative; margin: 0 0 22px; }
+    .timeline article::before { content: ""; position: absolute; left: -29px; top: 7px; width: 10px; height: 10px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 4px var(--bg); }
+    .timeline time { color: var(--cyan); font-size: 12px; font-weight: 700; }
+    .timeline p { margin: 4px 0; color: #bdc8d8; }
+    details { margin: 12px 0; border: 1px solid var(--line); border-radius: 9px; background: rgba(18, 25, 36, .7); }
+    summary { cursor: pointer; padding: 13px 16px; font-weight: 700; }
+    details > div { padding: 0 16px 15px; color: #bdc8d8; }
+    .priority { display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 15px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+    .priority b { color: var(--accent); }
+    footer { margin-top: 58px; padding-top: 24px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+    @media (max-width: 980px) {
+      .layout { display: block; }
+      nav { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+      nav a, .nav-foot { display: none; }
+      main { padding: 34px 22px 70px; }
+      .card, .card.wide { grid-column: span 6; }
+      .flow { grid-template-columns: 1fr 1fr; }
+      .flow > div::after { display: none; }
+    }
+    @media (max-width: 620px) {
+      .verdict { grid-template-columns: 1fr; }
+      .card, .card.wide { grid-column: 1 / -1; }
+      .flow { grid-template-columns: 1fr; }
+      table { display: block; overflow-x: auto; }
+    }
+    @media print {
+      :root { color-scheme: light; --bg: #fff; --panel: #fff; --panel-2: #f5f7fa; --line: #d8dee8; --text: #111827; --muted: #4b5563; }
+      body { background: #fff; color: #111827; }
+      nav { display: none; }
+      .layout { display: block; }
+      main { width: 100%; padding: 0; }
+      .card, .finding, details { box-shadow: none; background: #fff; break-inside: avoid; }
+      a { color: #3430a4; }
+    }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <nav aria-label="Навигация по отчёту">
+    <div class="brand">Deck<span>Pipe</span></div>
+    <div class="nav-meta">Технический аудит · 26.08.2026</div>
+    <a href="#summary">Итог</a>
+    <a href="#scope">Контур проверки</a>
+    <a href="#kimi">Контекст Kimi</a>
+    <a href="#architecture">Архитектура</a>
+    <a href="#encoding">Кириллица и Rekordbox</a>
+    <a href="#findings">Критичные дефекты</a>
+    <a href="#ui">UI и доступность</a>
+    <a href="#security">Безопасность</a>
+    <a href="#performance">Эффективность</a>
+    <a href="#verification">Что проверено</a>
+    <a href="#roadmap">План исправлений</a>
+    <a href="#limitations">Ограничения</a>
+    <div class="nav-foot">Отчёт не содержит ARL, OAuth-токенов, паролей, Telegram-реквизитов, email, имени SoundCloud или названий приватных треков.</div>
+  </nav>
+
+  <main>
+    <header class="hero" id="summary">
+      <div class="eyebrow">Независимый read-only аудит установленного EXE и исходников</div>
+      <h1>Хороший прототип.<br><em>Ненадёжный синхронизатор.</em></h1>
+      <p class="lead">DeckPipe уже решает реальную задачу: показывает Deezer и SoundCloud, ведёт локальную библиотеку, конвертирует аудио и читает Rekordbox. Но текущую версию нельзя считать безопасной для автоматической синхронизации рабочей DJ-библиотеки: семантика синка неполная, новые записи Rekordbox теряют метаданные, а локальный backend открыт любому сайту.</p>
+      <div class="verdict">
+        <div class="score">3<small>/10</small></div>
+        <div>
+          <strong>Статус: функциональный alpha-прототип, не production</strong>
+          Положительные стороны — широкое покрытие сценариев, рабочая Unicode-цепочка API/UI, проверка длительности и бэкап перед записью. Блокеры — целостность Rekordbox, безопасность localhost API, XSS, отсутствие тестов и неуправляемый lifecycle backend.
+        </div>
+      </div>
+    </header>
+
+    <section aria-labelledby="score-title">
+      <h2 id="score-title">Оценка по направлениям</h2>
+      <p class="section-intro">Баллы показывают готовность к ежедневной эксплуатации, а не количество реализованных функций.</p>
+      <div class="grid">
+        <div class="card"><div class="kicker">Функциональный охват</div><span class="metric ok">7/10</span><p>Deezer, SoundCloud, поиск, локальная библиотека, WAV и Rekordbox связаны в одном продукте.</p></div>
+        <div class="card"><div class="kicker">Корректность синка</div><span class="metric bad">3/10</span><p>«Синк» только добавляет; порядок, удаления и метаданные не приводятся к целевому состоянию.</p></div>
+        <div class="card"><div class="kicker">Целостность данных</div><span class="metric critical">2/10</span><p>Неатомарные sidecar, гонки, ложные успехи WAV/RB и 68 подтверждённых пустых Title.</p></div>
+        <div class="card"><div class="kicker">Безопасность</div><span class="metric critical">1/10</span><p>Wildcard CORS, нет авторизации, воспроизводимый XSS, слабая проверка helper-расширения.</p></div>
+        <div class="card"><div class="kicker">UI / UX</div><span class="metric warn">5/10</span><p>Нормальный основной вид, но сломанный минимальный размер и плохая обработка ошибок.</p></div>
+        <div class="card"><div class="kicker">Accessibility</div><span class="metric bad">2/10</span><p>Плейлисты недоступны клавиатурой; нет семантики диалога, live-region и явных label.</p></div>
+        <div class="card"><div class="kicker">Эффективность</div><span class="metric warn">5/10</span><p>Локальные ответы быстрые, но idle footprint высокий, а несколько алгоритмов масштабируются квадратично.</p></div>
+        <div class="card"><div class="kicker">Тесты и релизы</div><span class="metric critical">2/10</span><p>Нет тестового набора и Python lock-файла; установленный 0.5.0 не совпадает с исходным 0.5.0.</p></div>
+        <div class="card"><div class="kicker">Поддерживаемость</div><span class="metric bad">3/10</span><p>Большие монолитные файлы, глобальное состояние и смешение UI, API, файлов и удалённых сервисов.</p></div>
+      </div>
+    </section>
+
+    <section id="scope">
+      <h2>Контур проверки</h2>
+      <p class="section-intro">Проверялся именно установленный <code>E:\DeckPipe\deckpipe.exe</code>, без in-app browser. Исходники использовались для трассировки причин и сопоставления установленной сборки с HEAD.</p>
+      <table>
+        <thead><tr><th>Объект</th><th>Факт</th><th>Результат</th></tr></thead>
+        <tbody>
+          <tr><td>Установленный shell</td><td>DeckPipe 0.5.0, 8,313,856 байт</td><td>Запускается, окно создаётся, UI загружается</td></tr>
+          <tr><td>Установленный backend</td><td>81,368,698 байт, <code>127.0.0.1:24680</code></td><td>34 API-маршрута, локальные GET работают</td></tr>
+          <tr><td>Исходники</td><td>HEAD <code>be13580</code>, Python + FastAPI + Tauri + vanilla HTML/JS</td><td>Новее установленной сборки, но всё ещё версия 0.5.0</td></tr>
+          <tr><td>Данные сервисов</td><td>39 Deezer-плейлистов, 17 SoundCloud-источников</td><td>Списки читаются; кириллица корректна</td></tr>
+          <tr><td>Rekordbox</td><td>1,061 трек, 17 плейлистов, Rekordbox закрыт</td><td>Проверена копия БД и пять существующих бэкапов; live DB не изменялась</td></tr>
+          <tr><td>Действия с последствиями</td><td>Скачивание, remote add/create, RB sync, flip, report</td><td><span class="pill medium">не запускались</span> — требуют отдельного sandbox и разрешения</td></tr>
+        </tbody>
+      </table>
+      <div class="callout"><b>Приватность.</b> Временные window-only скриншоты и копия <code>master.db</code> удалены после анализа. Хеш конфигурации не изменился. В отчёт попали только агрегаты.</div>
+    </section>
+
+    <section id="kimi">
+      <h2>Что восстановлено из сессий Kimi</h2>
+      <p class="section-intro">Контекст не пришлось угадывать: найдена основная сессия разработки и её служебная title-сессия в хранилище Daimon/Kimi.</p>
+      <div class="grid">
+        <div class="card wide"><div class="kicker">Основная сессия</div><span class="metric mono">conv-78685…a8a</span><p>Создана 28 июля, обновлялась до 5 августа 2026; 33 пользовательских сообщения, около 8.85 MB событий.</p></div>
+        <div class="card wide"><div class="kicker">Ошибка индекса Kimi</div><span class="metric bad">stale binding</span><p><code>session_index.jsonl</code> указывает на уже несуществующий старый workspace, хотя физическая сессия перенесена в папку проекта.</p></div>
+      </div>
+      <div class="timeline">
+        <article><time>Начальный запрос</time><p>Плейлисты Deezer в стиле Saturn, локальные статусы missing/ok/error, загрузка выбранного и полного списка.</p></article>
+        <article><time>Расширение задачи</time><p>Синхронизация плейлистов Rekordbox, FLAC/MP3 → WAV для CDJ с сохранением cues, grid, BPM и порядка.</p></article>
+        <article><time>Дальнейший scope</time><p>Поиск треков/альбомов/артистов, добавление в Deezer, SoundCloud, логин, Telegram bug reports, Tauri EXE, нумерация.</p></article>
+        <article><time>Повторяющиеся жалобы</time><p>Не открывался picker, путь удваивался, preview и EXE выглядели по-разному, приватный плейлист и SoundCloud синхронизировались нестабильно.</p></article>
+        <article><time>Финальный контекст</time><p>Пользователь требовал не демонстрацию, а установленное приложение с полной функциональной и визуальной проверкой.</p></article>
+      </div>
+      <div class="finding high-border">
+        <h3><span class="pill high">качество тестов</span> Исторический E2E дал ложноположительный результат</h3>
+        <p>Задача Kimi зафиксировала <code>source_deleted: true</code>, но тот же журнал после операции всё ещё показывал исходный FLAC рядом с WAV. Проверялся флаг, а не постусловие на диске.</p>
+        <p class="evidence">Вывод: старые заявления «E2E пройден» нельзя использовать как доказательство корректности. Нужны независимые проверки фактического состояния файлов и БД.</p>
+      </div>
+      <div class="finding critical-border">
+        <h3><span class="pill critical">срочно</span> В transcript присутствовали реальные credentials</h3>
+        <p>В сессии были вставлены ARL Deezer, Telegram bot token/chat и SoundCloud token. Они намеренно не извлекались в отчёт. Их следует считать скомпрометированными и ротировать.</p>
+      </div>
+    </section>
+
+    <section id="architecture">
+      <h2>Архитектура и поток данных</h2>
+      <p class="section-intro">Концепция разумна для персонального desktop-инструмента, но границы ответственности и транзакций размыты.</p>
+      <div class="flow" aria-label="Поток данных DeckPipe">
+        <div><b>Deezer / SoundCloud</b><span>неофициальные API, cookies, yt-dlp, remote metadata</span></div>
+        <div><b>FastAPI backend</b><span>глобальные jobs/cache, скачивание, конвертация, API без auth</span></div>
+        <div><b>Файлы + sidecar</b><span>аудио и <code>.deckpipe.json</code> в пользовательских папках</span></div>
+        <div><b>Rekordbox master.db</b><span>прямая запись через pyrekordbox, бэкап последних пяти</span></div>
+      </div>
+      <div class="flow" aria-label="Desktop shell">
+        <div><b>Tauri shell</b><span>запускает PyInstaller sidecar</span></div>
+        <div><b>WebView2</b><span>открывает HTTP UI на loopback</span></div>
+        <div><b>Vanilla HTML/JS</b><span>innerHTML + inline handlers</span></div>
+        <div><b>Helper extension</b><span>пересылает cookies в найденный localhost port</span></div>
+      </div>
+      <h3>Что сделано правильно</h3>
+      <ul>
+        <li>Backend слушает только loopback, а API конфигурации не возвращает raw-токены.</li>
+        <li>Перед записью в Rekordbox есть проверка, что приложение закрыто, и создаётся копия БД.</li>
+        <li>Файлы проверяются Mutagen + полным декодированием ffmpeg и сравнением длительности.</li>
+        <li>JSON и HTML используют UTF-8; <code>ensure_ascii=False</code> сохраняет читаемую кириллицу.</li>
+        <li>WAV-конвертация сверяет длительность и старается обновить ANLZ-пути.</li>
+      </ul>
+      <h3>Системная проблема</h3>
+      <p>Операция «синхронизировать» распределена между remote API, очередью в памяти, аудиофайлом, sidecar и Rekordbox, но общего transaction/journal/reconciliation слоя нет. Поэтому частичный успех легко выглядит как полный.</p>
+    </section>
+
+    <section id="encoding">
+      <h2>Кириллица: фактическая картина</h2>
+      <p class="section-intro">Под одним симптомом скрывались две разные категории. Их важно не смешивать.</p>
+      <div class="grid">
+        <div class="card wide"><div class="kicker">Legacy replacement characters</div><span class="metric warn">23 Title / 22 Artist</span><p>Все 23 — существующие WAV с кириллицей в filename и реальным <code>U+FFFD</code> в базе.</p></div>
+        <div class="card wide"><div class="kicker">DeckPipe blank metadata</div><span class="metric critical">68 Title / 72 Artist</span><p>Все 68 пустых Title точно сопоставлены с DeckPipe sidecar, где метаданные сохранены.</p></div>
+      </div>
+
+      <h3>1. «Квадраты» / U+FFFD — подтверждены, но не приписываются DeckPipe</h3>
+      <ul>
+        <li>В 23 Title найдено 212 символов <code>U+FFFD</code>; в 22 Artist — ещё 228.</li>
+        <li>Все повреждённые Title относятся к WAV, все 23 filename содержат нормальную кириллицу.</li>
+        <li>Дата создания записей: 10 штук — 24.12.2024, 13 штук — 17.03.2025.</li>
+        <li>Они уже присутствуют во всех пяти DeckPipe-бэкапах 5 августа 2026 и не совпадают с текущими sidecar.</li>
+        <li>В самих WAV RIFF/INFO chunks присутствуют, но их значения ASCII; восстановить исходный Title из них нельзя.</li>
+      </ul>
+      <div class="callout"><b>Вывод с ограниченной причинностью.</b> Сохранившиеся артефакты доказывают наличие старой порчи, но не доказывают, какой именно импортёр её создал. Наиболее правдоподобен старый WAV/Rekordbox metadata path, однако это inference, а не установленный виновник.</div>
+
+      <h3>2. Пустые названия — подтверждённый дефект DeckPipe</h3>
+      <ul>
+        <li>68 записей без Title: 66 FLAC и 2 MP3.</li>
+        <li>4 созданы 4 августа 2026, 64 — 5 августа 2026.</li>
+        <li>Все 68 сопоставлены с десятью <code>.deckpipe.json</code>; файлы существуют, sidecar title не повреждены.</li>
+        <li><code>app/rekordbox.py:91</code> вызывает <code>db.add_content(f)</code> без <code>Title</code>, <code>ArtistID</code>, Album и других полей.</li>
+        <li>Реализация pyrekordbox <code>database.py:1936-1952</code> создаёт только технические поля файла и переданные kwargs; она не читает теги автоматически.</li>
+      </ul>
+      <p><b>Это не ошибка UTF-8.</b> Это отсутствие записи метаданных, визуально похожее на «названия пропали».</p>
+
+      <h3>Безопасный путь восстановления</h3>
+      <ol>
+        <li>Сделать отдельную repair-команду только с <code>--dry-run</code> по умолчанию.</li>
+        <li>Для 68 пустых записей построить mapping <code>FolderPath → sidecar → Title/Artist</code> и экспортировать preview CSV/HTML.</li>
+        <li>Для 23 legacy U+FFFD брать данные только из проверенных тегов или подтверждённого пользователем файла; не угадывать Artist по имени.</li>
+        <li>Перед apply: Rekordbox закрыт, уникальный timestamp+UUID backup, хеш, пробное открытие копии, затем единая транзакция.</li>
+        <li>После apply: перечитать БД, проверить code points, количество строк и плейлисты; предоставить rollback.</li>
+      </ol>
+    </section>
+
+    <section id="findings">
+      <h2>Критичные технические находки</h2>
+      <p class="section-intro">Приоритет учитывает вероятность, масштаб ущерба и наличие фактического воспроизведения.</p>
+
+      <div class="finding critical-border">
+        <h3><span class="pill critical">Critical · SEC-01</span> Любой сайт может управлять локальным DeckPipe API</h3>
+        <p><code>app/main.py:17-19</code> включает <code>allow_origins=["*"]</code>, все методы и headers; authentication/CSRF token отсутствуют. Runtime-проверка с Origin <code>https://attacker.invalid</code> получила <code>Access-Control-Allow-Origin: *</code>; preflight к <code>/api/rb/sync</code> разрешил POST.</p>
+        <p>Потенциальный сценарий: открытая веб-страница вызывает localhost API, читает конфигурацию и запускает bind/download/RB sync/flip/report от имени пользователя. Loopback сам по себе не является контролем доступа.</p>
+        <p class="evidence">Исправление: per-launch random bearer, привязанный к Tauri window; deny-by-default Origin/Host; отдельный nonce/confirmation для мутаций; убрать wildcard CORS.</p>
+      </div>
+
+      <div class="finding high-border">
+        <h3><span class="pill high">High · RB-01</span> Новые треки попадают в Rekordbox без Title и Artist</h3>
+        <p>Воспроизведено на реальной базе агрегатами: 68 пустых Title полностью совпадают с DeckPipe sidecar. Причина в <code>app/rekordbox.py:88-95</code> и контракте <code>pyrekordbox.add_content</code>.</p>
+        <p class="evidence">Исправление: создавать/переиспользовать Artist/Album и передавать нормализованные метаданные; отклонять commit, если обязательные поля пусты.</p>
+      </div>
+
+      <div class="finding high-border">
+        <h3><span class="pill high">High · RB-02</span> «Sync playlist» не синхронизирует состояние</h3>
+        <p><code>app/rekordbox.py:83-99</code> добавляет только отсутствующие ContentID. Старые треки не удаляются, существующие не переставляются, изменившиеся пути/метаданные не reconciliate. <code>track_no=i</code> применяется только к новым строкам.</p>
+        <p class="evidence">Повторный запуск не приводит RB-плейлист к порядку streaming-плейлиста. UI и название операции обещают больше, чем выполняет код.</p>
+      </div>
+
+      <div class="finding high-border">
+        <h3><span class="pill high">High · SEC-02</span> Stored XSS в названии плейлиста воспроизводится</h3>
+        <p><code>app/static/index.html:351</code> и <code>:661</code> вставляют remote title внутрь inline JavaScript string. Экранируются HTML-символы и одиночная кавычка, но не предшествующий backslash. Синтетический title <code>\');…//</code> вышел из строки; probe statement выполнился.</p>
+        <p><code>withGlobalTauri=true</code> и <code>csp=null</code> в <code>tauri.conf.json:11-14</code> повышают влияние: injected code имеет same-origin доступ к localhost API.</p>
+        <p class="evidence">Исправление: строить DOM через <code>textContent</code>, хранить id/title в JS state, использовать <code>addEventListener</code>; включить строгий CSP без inline-script.</p>
+      </div>
+
+      <div class="finding high-border">
+        <h3><span class="pill high">High · LIFE-01</span> Backend остаётся после закрытия EXE</h3>
+        <p>После нормального <code>CloseMainWindow()</code> shell завершился, но оба <code>deckpipe-backend.exe</code> оставались живы более 12 секунд. Конфигурация не менялась, jobs были пусты.</p>
+        <p>Это сохраняет незащищённый API и credentials в памяти после визуального закрытия приложения и создаёт конфликт порта при следующем запуске.</p>
+        <p class="evidence">Исправление: хранить sidecar child handle, завершать на RunEvent::Exit/ExitRequested, добавить parent-death watchdog и single-instance lock.</p>
+      </div>
+
+      <div class="finding high-border">
+        <h3><span class="pill high">High · RB-03</span> WAV flip может сообщить успех без обновления Rekordbox</h3>
+        <p><code>app/jobs.py:339-341</code> молча пропускает файл, которого нет в коллекции RB; затем sidecar получает <code>flipped_to=wav</code>. Ошибка commit кладётся в <code>job.error</code>, но <code>state</code> всё равно становится <code>done</code> (<code>:367-373</code>), а UI top-level error не показывает.</p>
+        <p class="evidence">Заявление «все cues/grid/BPM сохранены» не подтверждается, если <code>rb_updated &lt; converted</code>. Операция должна завершаться failed/partial и запрещать удаление source.</p>
+      </div>
+
+      <div class="finding high-border">
+        <h3><span class="pill high">High · DATA-01</span> Нет единой блокировки и атомарности</h3>
+        <p>Sidecar пишется напрямую (<code>library.py:46-65</code>) и на каждой записи перечитывается целиком. Несколько download/flip потоков выполняют read-modify-write без file lock. Flip запускает отдельный thread на каждый запрос; <code>workers</code> не ограничен.</p>
+        <p>Бэкап называется с точностью до секунды (<code>rekordbox.py:33-40</code>), поэтому параллельные операции могут перезаписать один backup. Нет lock на master.db и проверки восстановления копии.</p>
+      </div>
+
+      <div class="finding high-border">
+        <h3><span class="pill high">High · SEC-03</span> Helper доверяет любому процессу на двух портах</h3>
+        <p><code>extension/popup.js:1-8</code> считает DeckPipe найденным при любом HTTP 200 от <code>/api/version</code>. После этого читает ARL и SoundCloud OAuth cookie и POST-ит их на этот порт (<code>:23-38</code>).</p>
+        <p class="evidence">Локальный процесс, первым занявший 24680/7100 и выставивший CORS, может выдать себя за DeckPipe. Нужен challenge-response с публичным ключом приложения или ручное pairing secret.</p>
+      </div>
+
+      <details>
+        <summary>Остальные значимые дефекты</summary>
+        <div>
+          <ul>
+            <li><b>Неатомарная загрузка:</b> аудио пишется прямо в конечный filename (<code>deezer_client.py:117-132</code>), без <code>.part</code> и atomic rename.</li>
+            <li><b>Коллизии:</b> filename содержит только Artist + Title, но не provider/track ID; разные версии могут перезаписать друг друга.</li>
+            <li><b>Ложная верификация:</b> существующий или fuzzy-adopted файл становится <code>ok</code> без полного <code>verify_file</code> (<code>library.py:187-217</code>).</li>
+            <li><b>Ошибки тегов скрываются:</b> <code>tagger.write_tags</code> ловит exception и не меняет итоговый status.</li>
+            <li><b>Retry выбирает provider по target:</b> local/dir цель с SoundCloud-треком повторяется как Deezer (<code>main.py:823-829</code>).</li>
+            <li><b>Errors неполны:</b> endpoint собирает только Deezer и <code>sc:</code>, исключая <code>local:</code> и <code>dir:</code> (<code>main.py:769-795</code>).</li>
+            <li><b>Удалённые ошибки скрываются:</b> search-download проглатывает exception добавления в Deezer и возвращает частичный успех (<code>main.py:637-648</code>).</li>
+            <li><b>Hardcoded Rekordbox path:</b> <code>%APPDATA%\Pioneer\rekordbox\master.db</code>, приватный <code>pyrekordbox.config.__config__</code>; нет определения активного профиля/version.</li>
+            <li><b>Jobs исчезают при рестарте:</b> очередь и результаты полностью in-memory (<code>jobs.py:12-49</code>).</li>
+            <li><b>Установленная версия устарела:</b> OpenAPI EXE не содержит password login, хотя HEAD содержит; обе сборки называются 0.5.0.</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+    <section id="ui">
+      <h2>UI, UX и доступность</h2>
+      <p class="section-intro">Визуальный аудит выполнялся по собственному Tauri-окну установленного EXE и Windows UI Automation. Критерии сверялись с актуальными <a href="https://raw.githubusercontent.com/vercel-labs/web-interface-guidelines/main/command.md">Vercel Web Interface Guidelines</a>.</p>
+      <h3>Что выглядит нормально</h3>
+      <ul>
+        <li>При 1320×840 интерфейс визуально цельный: понятная тёмная тема, список слева, рабочая зона справа.</li>
+        <li>Русские названия, символ <code>ё</code> и кириллическое имя аккаунта отрисовались без квадратов.</li>
+        <li>Состояния плейлистов и ошибки визуально различимы; длинные названия сокращаются.</li>
+      </ul>
+      <h3>Подтверждённые дефекты</h3>
+      <table>
+        <thead><tr><th>Приоритет</th><th>Проблема</th><th>Доказательство</th></tr></thead>
+        <tbody>
+          <tr><td><span class="pill high">High</span></td><td>Header ломается при минимальном размере</td><td>При min inner 1000×640 «Сохранить» обрезано, «Баг-репорт» вне viewport; настройки имеют фиксированную ширину 340px и header не переносится.</td></tr>
+          <tr><td><span class="pill high">High</span></td><td>Плейлисты недоступны клавиатурой</td><td>UIA: 172 элемента, только 10 focusable; playlist card — <code>div onclick</code> без role/tabindex.</td></tr>
+          <tr><td><span class="pill medium">Medium</span></td><td>Нет честного error/empty state</td><td><code>/api/playlists</code> на любую auth/network ошибку возвращает <code>[]</code>; sidebar выглядит просто пустым.</td></tr>
+          <tr><td><span class="pill medium">Medium</span></td><td>Стартовые promises без catch</td><td><code>loadConfig(); loadPlaylists();</code> вызываются напрямую; startup race backend даёт unhandled rejection/blank UI.</td></tr>
+          <tr><td><span class="pill medium">Medium</span></td><td>Диалог логина не является dialog</td><td>Нет <code>role=dialog</code>, aria-modal, focus trap, возврата фокуса, Escape и inert background; close button без aria-label.</td></tr>
+          <tr><td><span class="pill medium">Medium</span></td><td>Picker cancel ненадёжен</td><td>Системный «Обзор папок» открылся, но после автоматической отмены HTTP-запрос не завершился за 30 секунд.</td></tr>
+          <tr><td><span class="pill medium">Medium</span></td><td>Нет live status</td><td>Jobs и ошибки обновляются визуально, но без <code>aria-live</code>; screen reader не узнаёт о прогрессе.</td></tr>
+          <tr><td><span class="pill medium">Medium</span></td><td>Duration edge-case</td><td><code>Math.round(s%60)</code> может показать <code>3:60</code> вместо <code>4:00</code>.</td></tr>
+        </tbody>
+      </table>
+      <p><b>Приоритет UI:</b> сначала не «косметика», а header layout, keyboard semantics, error states и честное отображение partial/failed sync.</p>
+    </section>
+
+    <section id="security">
+      <h2>Безопасность: OWASP + STRIDE</h2>
+      <p class="section-intro">В таблицу включены только находки с высокой уверенностью; теоретические CVE без доказательства не перечислялись.</p>
+      <table>
+        <thead><tr><th>STRIDE</th><th>Сценарий</th><th>Контроль сейчас</th><th>Риск</th></tr></thead>
+        <tbody>
+          <tr><td>Spoofing</td><td>Фальшивый localhost backend получает cookies из helper</td><td>Только HTTP 200 `/api/version`</td><td><span class="pill high">High</span></td></tr>
+          <tr><td>Tampering</td><td>Веб-страница вызывает RB sync/flip/config через wildcard CORS</td><td>Loopback bind, auth отсутствует</td><td><span class="pill critical">Critical</span></td></tr>
+          <tr><td>Repudiation</td><td>Нельзя доказать, какой job изменил файл/БД</td><td>Только in-memory jobs, нет operation journal</td><td><span class="pill medium">Medium</span></td></tr>
+          <tr><td>Information disclosure</td><td>Plaintext ARL/OAuth/TG credentials и credentials в Kimi transcript</td><td>Обычный JSON; ACL допускает локальную read-группу</td><td><span class="pill high">High</span></td></tr>
+          <tr><td>Denial of service</td><td>Неограниченный flip workers / очередь / повторные ffmpeg</td><td>Нет limit/rate/fencing</td><td><span class="pill medium">Medium</span></td></tr>
+          <tr><td>Elevation / Injection</td><td>Remote playlist title выполняет inline JavaScript</td><td>CSP выключен, global Tauri включён</td><td><span class="pill high">High</span></td></tr>
+        </tbody>
+      </table>
+      <h3>Credentials</h3>
+      <p>Конфиг хранит ARL, SoundCloud OAuth и Telegram token в plaintext. Значения не выводились. ACL файла позволяет ReadAndExecute группе <code>Dog\CodexSandboxUsers</code>; это шире, чем только текущий пользователь. Рекомендуется Windows Credential Manager/DPAPI с ACL current-user-only. Credentials из transcript необходимо ротировать независимо от защиты config.</p>
+    </section>
+
+    <section id="performance">
+      <h2>Эффективность и масштабирование</h2>
+      <p class="section-intro">Локальный API достаточно быстрый. Основной риск — footprint desktop-стека и алгоритмы на больших плейлистах.</p>
+      <div class="grid">
+        <div class="card"><div class="kicker">Idle working set</div><span class="metric warn">563.9 MiB</span><p>10 процессов: Tauri, WebView2, PyInstaller backend и console host.</p></div>
+        <div class="card"><div class="kicker">Idle private bytes</div><span class="metric warn">1,074.5 MiB</span><p>Один snapshot; это не доказательство leak, но footprint велик для sync-утилиты.</p></div>
+        <div class="card"><div class="kicker">Idle CPU, 2 сек</div><span class="metric ok">0 ms</span><p>Фоновая активность в спокойном состоянии не обнаружена.</p></div>
+      </div>
+      <table>
+        <thead><tr><th>Endpoint</th><th>Bytes</th><th>Median</th><th>Max</th><th>Комментарий</th></tr></thead>
+        <tbody>
+          <tr><td><code>/api/config</code></td><td>177</td><td>1.8 ms</td><td>2.4 ms</td><td>Хорошо</td></tr>
+          <tr><td><code>/api/playlists</code></td><td>10,246</td><td>40.3 ms</td><td>476 ms</td><td>Есть cold/remote variance</td></tr>
+          <tr><td><code>/api/sc/sources</code></td><td>2,900</td><td>13.7 ms</td><td>13.8 ms</td><td>Хорошо</td></tr>
+          <tr><td><code>/api/rb/status</code></td><td>934</td><td>154.5 ms</td><td>229 ms</td><td>Каждый раз открывает и читает DB</td></tr>
+          <tr><td><code>/api/errors</code></td><td>687</td><td>29.4 ms</td><td>31.6 ms</td><td>Неполный набор источников</td></tr>
+        </tbody>
+      </table>
+      <h3>Горячие точки</h3>
+      <ul>
+        <li><code>scan_playlist</code>: fuzzy match каждого streaming track по списку файлов — <code>O(tracks × files)</code>.</li>
+        <li><code>_set_track</code>: каждый track повторно читает и полностью переписывает sidecar — итоговая стоимость близка к <code>O(N²)</code> по JSON-объёму.</li>
+        <li>Frontend строит коллекции через большой <code>innerHTML</code>; виртуализации нет. Уже есть плейлист на 3,649 треков.</li>
+        <li>Единственный serial download worker снижает throughput, а отдельные flip thread pools обходят эту очередь и могут перегрузить CPU/диск.</li>
+      </ul>
+      <p>Полный baseline сохранён в <a href="../.bench/baseline-2026-08-26.md"><code>.bench/baseline-2026-08-26.md</code></a>.</p>
+    </section>
+
+    <section id="verification">
+      <h2>Что реально прошло, а что нет</h2>
+      <table>
+        <thead><tr><th>Проверка</th><th>Статус</th><th>Результат</th></tr></thead>
+        <tbody>
+          <tr><td>Запуск установленного EXE</td><td><span class="pill pass">Pass</span></td><td>Окно и backend поднялись на 24680</td></tr>
+          <tr><td>Deezer / SoundCloud list read</td><td><span class="pill pass">Pass</span></td><td>39 / 17, без U+FFFD и квадратов</td></tr>
+          <tr><td>Rekordbox status read</td><td><span class="pill pass">Pass</span></td><td>DB доступна, 17 плейлистов, Rekordbox закрыт</td></tr>
+          <tr><td>Unicode UI/API</td><td><span class="pill pass">Pass</span></td><td>Кириллица отрисовывается и декодируется корректно</td></tr>
+          <tr><td>Rekordbox metadata audit</td><td><span class="pill high">Fail</span></td><td>23 legacy U+FFFD + 68 DeckPipe blank Title</td></tr>
+          <tr><td>Minimum window layout</td><td><span class="pill high">Fail</span></td><td>Header controls clipped/off-screen</td></tr>
+          <tr><td>Keyboard access</td><td><span class="pill high">Fail</span></td><td>Плейлисты нельзя выбрать клавиатурой</td></tr>
+          <tr><td>Folder picker opens</td><td><span class="pill pass">Pass</span></td><td>Системный диалог появился</td></tr>
+          <tr><td>Folder picker cancellation</td><td><span class="pill medium">Fail</span></td><td>Запрос не завершился за 30 секунд после автоматического close</td></tr>
+          <tr><td>Graceful shutdown</td><td><span class="pill high">Fail</span></td><td>Два backend-процесса остались после закрытия GUI</td></tr>
+          <tr><td>Python compileall / pip check</td><td><span class="pill pass">Pass</span></td><td>Ошибок синтаксиса и broken requirements нет</td></tr>
+          <tr><td>Rust cargo check --locked</td><td><span class="pill pass">Pass</span></td><td>0 ошибок, 1 warning (unused variable)</td></tr>
+          <tr><td>JS syntax</td><td><span class="pill pass">Pass</span></td><td>popup.js и dev.js валидны</td></tr>
+          <tr><td>npm audit</td><td><span class="pill pass">Pass</span></td><td>0 известных npm vulnerabilities; это не покрывает Python/Rust</td></tr>
+          <tr><td>Automated project tests</td><td><span class="pill high">Fail</span></td><td><code>pytest</code> не установлен; test/spec файлов нет</td></tr>
+          <tr><td>cargo fmt --check</td><td><span class="pill medium">Blocked</span></td><td>Компонент rustfmt не установлен</td></tr>
+          <tr><td>Remote mutation / real download / RB write</td><td><span class="pill medium">Not run</span></td><td>Сознательно исключено из read-only аудита</td></tr>
+        </tbody>
+      </table>
+      <p>Воспроизводящие проверки сохранены в <a href="check_rekordbox_unicode.py"><code>audit/check_rekordbox_unicode.py</code></a> и <a href="reproduce_inline_handler_xss.js"><code>audit/reproduce_inline_handler_xss.js</code></a>. Скрипт БД печатает только агрегаты.</p>
+    </section>
+
+    <section id="roadmap">
+      <h2>Рекомендуемый план исправлений</h2>
+      <p class="section-intro">Сначала нужно вернуть доверие к данным и закрыть локальную поверхность атаки. Визуальный polish — после.</p>
+      <div class="priority"><b>P0 · сейчас</b><div><b>Ротировать credentials.</b> Deezer ARL, SoundCloud OAuth и Telegram bot token/chat из Kimi transcript; затем удалить/зашифровать локальные копии.</div></div>
+      <div class="priority"><b>P0 · сейчас</b><div><b>Временно отключить RB write/flip в распространяемой сборке</b> или пометить experimental до metadata + reconciliation + lock + rollback gates.</div></div>
+      <div class="priority"><b>P0</b><div><b>Закрыть localhost API.</b> Per-launch secret, origin allowlist, Host validation, mutation nonce; helper pairing вместо blind port probe.</div></div>
+      <div class="priority"><b>P0</b><div><b>Убрать inline HTML handlers/XSS.</b> DOM API, event listeners, строгий CSP, <code>withGlobalTauri=false</code> если не требуется.</div></div>
+      <div class="priority"><b>P0</b><div><b>Исправить Rekordbox sync.</b> Metadata-aware upsert, idempotent diff (add/remove/reorder/update), dry-run preview, одна транзакция, unique backup и post-commit verification.</div></div>
+      <div class="priority"><b>P0</b><div><b>Выпустить уникальную версию</b> (например 0.5.1/0.6.0) с commit/build ID в UI и API; обновить установленный EXE и корректно завершать sidecar.</div></div>
+      <div class="priority"><b>P1</b><div><b>Сделать файловый pipeline crash-safe.</b> <code>.part</code> → fsync → atomic rename, track ID в filename, atomic sidecar, per-playlist lock, durable job journal.</div></div>
+      <div class="priority"><b>P1</b><div><b>Починить error model.</b> failed/partial/done, отображать top-level error, проверять <code>rb_updated == planned</code>, не удалять source до всех postconditions.</div></div>
+      <div class="priority"><b>P1</b><div><b>Repair tool для существующей БД.</b> Отдельный preview для 68 blank rows и 23 legacy U+FFFD; никакого автоматического угадывания.</div></div>
+      <div class="priority"><b>P1</b><div><b>UI reliability.</b> Responsive header, семантические playlist buttons, labels/dialog/focus, visible startup/auth errors, честный partial-sync report.</div></div>
+      <div class="priority"><b>P2</b><div><b>Оптимизация.</b> Индекс filename/track ID, batched sidecar writes, bounded worker pool, virtualization, cache Rekordbox status.</div></div>
+
+      <h3>Минимальная обязательная тестовая матрица</h3>
+      <ul>
+        <li>Кириллица: <code>ё</code>, NFC/NFD, em dash, emoji; FLAC, MP3, WAV; metadata round-trip через копию DB.</li>
+        <li>Sync: add, delete, reorder, rename, duplicate title, changed path, idempotent second run.</li>
+        <li>Crash tests: оборвать download, sidecar write, ffmpeg, DB commit; затем восстановить без ложного <code>ok</code>.</li>
+        <li>Security tests: hostile Origin, missing/invalid token, backslash+quote title, helper spoof port.</li>
+        <li>WAV flip: source exists/deleted как фактическое postcondition; <code>planned == converted == rb_updated</code>; cues/grid hash before/after.</li>
+        <li>UI: min window, 200% scaling, keyboard-only, screen reader names, 3,649-row list, offline/auth-expired states.</li>
+      </ul>
+    </section>
+
+    <section id="limitations">
+      <h2>Ограничения и уровень уверенности</h2>
+      <ul>
+        <li><b>Высокая уверенность:</b> CORS, XSS, blank RB metadata, append-only sync, orphan backend, min-size clipping, keyboard inaccessibility — воспроизведены или напрямую доказаны кодом + состоянием.</li>
+        <li><b>Средняя уверенность:</b> точный первоисточник 23 legacy U+FFFD. Повреждение и возраст доказаны; виновник — нет.</li>
+        <li><b>Не проверялось:</b> реальное скачивание, удалённое изменение Deezer/SoundCloud, запись/repair live <code>master.db</code>, качество cues/grid после настоящего flip.</li>
+        <li><b>Dependency security:</b> npm audit выполнен; полноценные pip-audit/cargo-audit/SBOM невозможны без закреплённого Python dependency manifest и дополнительных инструментов.</li>
+      </ul>
+      <div class="callout"><b>Следующий безопасный шаг:</b> не исправлять live DB напрямую. Сначала сделать isolated test fixture из копии, добавить RED-тесты на 68 blank records и playlist reconciliation, затем независимый review и только после этого — dry-run repair.</div>
+    </section>
+
+    <footer>
+      <p><b>Артефакты:</b> этот HTML, агрегатный Rekordbox audit script, XSS reproducer, QA plan и performance baseline. Исходный код приложения не изменялся.</p>
+      <p>Сформировано 26 августа 2026 · Europe/Moscow · read-only installed-app audit.</p>
+    </footer>
+  </main>
+</div>
+</body>
+</html>

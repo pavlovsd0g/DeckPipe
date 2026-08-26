@@ -1,0 +1,488 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>DeckPipe 0.5.0 — QA execution &amp; performance baseline</title>
+  <style>
+    :root {
+      --ink: #e8e4d8;
+      --muted: #98958c;
+      --black: #090b0b;
+      --panel: #111514;
+      --panel-2: #171c1a;
+      --line: #303733;
+      --acid: #b9f26c;
+      --amber: #ffbe55;
+      --red: #ff655d;
+      --cyan: #6ee7df;
+      --paper: #d9d2bf;
+      --shadow: 0 24px 80px rgba(0, 0, 0, .44);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        linear-gradient(rgba(185, 242, 108, .025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(185, 242, 108, .025) 1px, transparent 1px),
+        radial-gradient(circle at 78% 5%, rgba(110, 231, 223, .08), transparent 26rem),
+        var(--black);
+      background-size: 28px 28px, 28px 28px, auto, auto;
+      font: 15px/1.58 Bahnschrift, "Aptos Narrow", "Segoe UI", sans-serif;
+    }
+
+    a { color: var(--cyan); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+    a:hover { color: #baf8f3; }
+    code, .mono { font-family: "Cascadia Mono", Consolas, monospace; }
+    code { color: #d7f8ac; font-size: .92em; }
+    strong { color: #fff; }
+
+    .skip {
+      position: fixed;
+      left: 12px;
+      top: -60px;
+      z-index: 50;
+      padding: 10px 14px;
+      background: var(--acid);
+      color: #10140d;
+    }
+    .skip:focus { top: 12px; }
+
+    .shell { width: min(1460px, calc(100% - 40px)); margin: 0 auto; }
+    .masthead {
+      position: relative;
+      min-height: 78vh;
+      display: grid;
+      align-items: end;
+      padding: 72px 0 56px;
+      overflow: hidden;
+      border-bottom: 1px solid var(--line);
+    }
+    .masthead::after {
+      content: "";
+      position: absolute;
+      width: 58vw;
+      height: 58vw;
+      right: -22vw;
+      top: -27vw;
+      border: 1px solid rgba(185, 242, 108, .2);
+      border-radius: 50%;
+      box-shadow: 0 0 0 5vw rgba(185, 242, 108, .025), 0 0 0 12vw rgba(110, 231, 223, .018);
+      pointer-events: none;
+    }
+    .eyebrow {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--acid);
+      text-transform: uppercase;
+      letter-spacing: .16em;
+      font: 700 12px/1 "Cascadia Mono", Consolas, monospace;
+    }
+    .eyebrow::before { content: ""; width: 42px; height: 2px; background: var(--acid); }
+    h1, h2, h3 { text-wrap: balance; }
+    h1 {
+      max-width: 1080px;
+      margin: 22px 0 16px;
+      font: 700 clamp(48px, 8.3vw, 126px)/.86 Georgia, "Times New Roman", serif;
+      letter-spacing: -.065em;
+    }
+    h1 em { color: var(--acid); font-style: normal; }
+    .lede { max-width: 820px; margin: 0; color: #c7c4ba; font-size: clamp(18px, 2vw, 25px); }
+    .verdict-strip {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 18px;
+      align-items: center;
+      margin-top: 42px;
+      padding: 14px 18px;
+      border: 1px solid rgba(255, 101, 93, .55);
+      background: linear-gradient(90deg, rgba(255, 101, 93, .15), rgba(255, 101, 93, .025));
+      box-shadow: var(--shadow);
+    }
+    .verdict-strip .stamp {
+      padding: 7px 10px 5px;
+      border: 2px solid var(--red);
+      color: var(--red);
+      transform: rotate(-2deg);
+      font: 900 18px/1 "Cascadia Mono", Consolas, monospace;
+      letter-spacing: .1em;
+    }
+    .verdict-strip small { color: var(--muted); }
+
+    .rail {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      border-bottom: 1px solid var(--line);
+      background: rgba(9, 11, 11, .9);
+      backdrop-filter: blur(12px);
+    }
+    .rail .shell { display: flex; gap: 18px; align-items: center; min-height: 54px; overflow-x: auto; }
+    .rail b { color: var(--acid); margin-right: auto; white-space: nowrap; }
+    .rail a { color: var(--muted); text-decoration: none; white-space: nowrap; font-size: 13px; }
+    .rail a:hover { color: var(--ink); }
+
+    main { padding: 18px 0 100px; }
+    section { padding: 74px 0; border-bottom: 1px solid var(--line); }
+    .section-head { display: grid; grid-template-columns: 140px minmax(0, 1fr); gap: 32px; margin-bottom: 30px; }
+    .index { color: var(--acid); font: 700 13px/1 "Cascadia Mono", Consolas, monospace; letter-spacing: .12em; }
+    h2 { margin: 0; font: 700 clamp(31px, 4vw, 58px)/.96 Georgia, "Times New Roman", serif; letter-spacing: -.04em; }
+    h3 { margin: 0 0 8px; font-size: 18px; line-height: 1.3; }
+    .intro { max-width: 900px; color: var(--muted); font-size: 17px; }
+
+    .signal-grid {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 12px;
+    }
+    .signal {
+      grid-column: span 3;
+      min-height: 180px;
+      padding: 22px;
+      border: 1px solid var(--line);
+      background: linear-gradient(145deg, rgba(255,255,255,.025), transparent), var(--panel);
+      position: relative;
+      overflow: hidden;
+    }
+    .signal.wide { grid-column: span 6; }
+    .signal::after {
+      content: "";
+      position: absolute;
+      right: -30px;
+      bottom: -30px;
+      width: 92px;
+      height: 92px;
+      border: 1px solid rgba(255,255,255,.07);
+      transform: rotate(45deg);
+    }
+    .signal .label { color: var(--muted); text-transform: uppercase; letter-spacing: .11em; font-size: 11px; }
+    .signal .number { display: block; margin: 16px 0 6px; font: 700 clamp(35px, 5vw, 68px)/.9 "Cascadia Mono", Consolas, monospace; letter-spacing: -.07em; }
+    .signal .unit { color: var(--muted); font-size: 13px; }
+    .signal.fail .number { color: var(--red); }
+    .signal.warn .number { color: var(--amber); }
+    .signal.pass .number { color: var(--acid); }
+
+    .status { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border: 1px solid; border-radius: 99px; font: 700 11px/1 "Cascadia Mono", Consolas, monospace; text-transform: uppercase; letter-spacing: .05em; }
+    .status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    .status.pass { color: var(--acid); border-color: rgba(185,242,108,.35); background: rgba(185,242,108,.06); }
+    .status.fail { color: var(--red); border-color: rgba(255,101,93,.42); background: rgba(255,101,93,.07); }
+    .status.warn { color: var(--amber); border-color: rgba(255,190,85,.4); background: rgba(255,190,85,.06); }
+    .status.info { color: var(--cyan); border-color: rgba(110,231,223,.35); background: rgba(110,231,223,.06); }
+
+    .finding-list { display: grid; gap: 12px; }
+    .finding {
+      display: grid;
+      grid-template-columns: 92px minmax(0, 1fr) minmax(220px, .45fr);
+      gap: 22px;
+      align-items: start;
+      padding: 22px 24px;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--red);
+      background: var(--panel);
+    }
+    .finding.medium { border-left-color: var(--amber); }
+    .finding .code { color: var(--muted); font: 700 12px/1.2 "Cascadia Mono", Consolas, monospace; }
+    .finding p { margin: 5px 0 0; color: #bab7ae; }
+    .finding .proof { padding-left: 18px; border-left: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+
+    .data-callout {
+      display: grid;
+      grid-template-columns: minmax(280px, .8fr) minmax(0, 1.2fr);
+      gap: 28px;
+      padding: 28px;
+      border: 1px solid rgba(255, 101, 93, .4);
+      background: linear-gradient(120deg, rgba(255,101,93,.1), transparent 55%), var(--panel);
+    }
+    .big-glyph { color: var(--red); font: 700 clamp(100px, 16vw, 210px)/.78 Georgia, serif; text-shadow: 8px 8px 0 rgba(255,101,93,.08); }
+    .evidence-numbers { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 20px; }
+    .evidence-numbers div { padding: 14px; border-top: 1px solid var(--line); }
+    .evidence-numbers b { display: block; color: var(--red); font: 700 28px/1 "Cascadia Mono", monospace; }
+    .evidence-numbers span { color: var(--muted); font-size: 12px; }
+
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); }
+    table { width: 100%; border-collapse: collapse; min-width: 780px; background: var(--panel); }
+    th, td { padding: 13px 15px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { position: sticky; top: 54px; z-index: 2; color: var(--muted); background: #121715; font: 700 11px/1.2 "Cascadia Mono", monospace; text-transform: uppercase; letter-spacing: .09em; }
+    td.num { text-align: right; font-family: "Cascadia Mono", Consolas, monospace; font-variant-numeric: tabular-nums; }
+    tr:last-child td { border-bottom: 0; }
+    tbody tr:hover { background: rgba(185,242,108,.025); }
+
+    .perf-layout { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(300px, .7fr); gap: 18px; }
+    .meters { padding: 22px; border: 1px solid var(--line); background: var(--panel); }
+    .meter { margin: 0 0 19px; }
+    .meter:last-child { margin-bottom: 0; }
+    .meter-head { display: flex; justify-content: space-between; gap: 15px; margin-bottom: 7px; font-size: 13px; }
+    .track { height: 8px; background: #262b29; overflow: hidden; }
+    .fill { display: block; height: 100%; width: var(--w); background: var(--acid); transform-origin: left; animation: meter-in .85s ease-out both; }
+    .fill.warn { background: var(--amber); }
+    .fill.fail { background: var(--red); }
+    @keyframes meter-in { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+
+    .ratio {
+      display: grid;
+      place-items: center;
+      min-height: 310px;
+      padding: 24px;
+      text-align: center;
+      border: 1px solid rgba(255,190,85,.45);
+      background: repeating-linear-gradient(-45deg, rgba(255,190,85,.035) 0 10px, transparent 10px 20px), var(--panel);
+    }
+    .ratio b { display: block; color: var(--amber); font: 700 clamp(60px, 8vw, 108px)/.85 "Cascadia Mono", monospace; letter-spacing: -.08em; }
+    .ratio span { max-width: 280px; color: var(--muted); }
+
+    .matrix { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .matrix-card { padding: 20px; border: 1px solid var(--line); background: var(--panel); }
+    .matrix-card header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+    .matrix-card p { margin: 0; color: var(--muted); }
+    .matrix-card ul { margin: 13px 0 0; padding-left: 19px; color: #bbb8ae; }
+
+    .priority-list { counter-reset: priority; display: grid; gap: 10px; }
+    .priority {
+      counter-increment: priority;
+      display: grid;
+      grid-template-columns: 64px minmax(0, 1fr);
+      gap: 20px;
+      padding: 18px 20px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+    }
+    .priority::before { content: "0" counter(priority); color: var(--acid); font: 700 24px/1 "Cascadia Mono", monospace; }
+    .priority p { margin: 4px 0 0; color: var(--muted); }
+
+    details { border: 1px solid var(--line); background: var(--panel); }
+    details + details { margin-top: 10px; }
+    summary { cursor: pointer; padding: 16px 18px; color: #f1eee4; font-weight: 700; }
+    details > div { padding: 0 18px 18px; color: var(--muted); }
+    .artifact-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 20px; padding: 0; list-style: none; }
+    .artifact-list li { padding: 10px 0; border-bottom: 1px dotted var(--line); }
+
+    footer { padding: 34px 0 58px; color: var(--muted); font-size: 13px; }
+    footer .shell { display: flex; justify-content: space-between; gap: 20px; }
+
+    @media (max-width: 980px) {
+      .signal { grid-column: span 6; }
+      .finding { grid-template-columns: 72px 1fr; }
+      .finding .proof { grid-column: 2; }
+      .data-callout, .perf-layout { grid-template-columns: 1fr; }
+      .matrix { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 640px) {
+      .shell { width: min(100% - 24px, 1460px); }
+      .masthead { min-height: auto; padding-top: 58px; }
+      .verdict-strip { grid-template-columns: 1fr; }
+      .section-head { grid-template-columns: 1fr; gap: 10px; }
+      .signal, .signal.wide { grid-column: 1 / -1; }
+      .finding { grid-template-columns: 1fr; }
+      .finding .proof { grid-column: 1; padding-left: 0; padding-top: 12px; border-left: 0; border-top: 1px solid var(--line); }
+      .evidence-numbers { grid-template-columns: 1fr; }
+      .artifact-list { grid-template-columns: 1fr; }
+      footer .shell { flex-direction: column; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      .fill { animation: none; }
+    }
+    @media print {
+      :root { --ink: #111; --muted: #555; --panel: #fff; --line: #bbb; --black: #fff; }
+      body { background: #fff; color: #111; font-size: 11px; }
+      .rail { display: none; }
+      .masthead { min-height: 0; padding: 20px 0; }
+      section { padding: 24px 0; }
+      .signal, .finding, .matrix-card, .meters, .ratio, details, .data-callout { break-inside: avoid; box-shadow: none; }
+      a { color: #000; }
+      th { position: static; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#report">К отчёту</a>
+
+  <header class="masthead">
+    <div class="shell">
+      <div class="eyebrow">QA flight recorder · 26.08.2026</div>
+      <h1>DeckPipe <em>0.5.0</em></h1>
+      <p class="lede">Результат реализации QA-плана, изолированных Unicode-сценариев и воспроизводимого performance baseline для установленной Windows-сборки.</p>
+      <div class="verdict-strip" role="note" aria-label="Итоговый вердикт">
+        <span class="stamp">HOLD</span>
+        <div><strong>Сборка работает, но пока не готова к безопасному распространению.</strong><br><small>Блокеры: integrity/sync-контракт Rekordbox, localhost security из основного аудита, lifecycle backend и подтверждённые UX-дефекты.</small></div>
+        <span class="mono">confidence: HIGH</span>
+      </div>
+    </div>
+  </header>
+
+  <nav class="rail" aria-label="Разделы отчёта">
+    <div class="shell">
+      <b class="mono">DECKPIPE / QA</b>
+      <a href="#summary">Итог</a>
+      <a href="#findings">Дефекты</a>
+      <a href="#unicode">Unicode</a>
+      <a href="#performance">Performance</a>
+      <a href="#matrix">Матрица</a>
+      <a href="#next">Приоритеты</a>
+      <a href="#evidence">Артефакты</a>
+    </div>
+  </nav>
+
+  <main id="report" class="shell">
+    <section id="summary">
+      <div class="section-head"><div class="index">01 / SIGNALS</div><div><h2>Короткий итог</h2><p class="intro">QA infrastructure реализована и воспроизводима. Read-only live API, startup, UIA, process footprint, защищённые file snapshots, изолированные вкладки и библиотечный scan теперь дают машинные JSON + Markdown артефакты.</p></div></div>
+      <div class="signal-grid">
+        <article class="signal pass"><div class="label">PowerShell contracts</div><span class="number">21/21</span><div class="unit">GREEN · allowlist, агрегация, cleanup, UIA, compare</div></article>
+        <article class="signal pass"><div class="label">Python core</div><span class="number">4/4</span><div class="unit">GREEN · B3 + UTF-8 sidecar</div></article>
+        <article class="signal fail"><div class="label">Known core gap</div><span class="number">1 XF</span><div class="unit">expected failure · B5 local errors</div></article>
+        <article class="signal pass"><div class="label">Live safety</div><span class="number">0</span><div class="unit">mutation endpoints; protected files unchanged</div></article>
+        <article class="signal wide fail"><div class="label">Rekordbox stored replacements</div><span class="number">212 × U+FFFD</span><div class="unit">23 Title + 22 Artist rows affected; aggregated from a temporary DB copy</div></article>
+        <article class="signal wide warn"><div class="label">Synthetic scan gap</div><span class="number">22.05 s</span><div class="unit">200 tracks × 1000 files; warm sidecar path = 36.6 ms</div></article>
+      </div>
+    </section>
+
+    <section id="findings">
+      <div class="section-head"><div class="index">02 / GATES</div><div><h2>Что реально не прошло</h2><p class="intro">Ниже только подтверждённые текущим прогоном дефекты. Security и архитектурные находки полного аудита остаются в отдельном основном отчёте.</p></div></div>
+      <div class="finding-list">
+        <article class="finding"><div class="code">DATA-02<br><span class="status fail">High</span></div><div><h3>Повреждённые Title/Artist уже записаны в Rekordbox</h3><p>Это не визуальный шрифт: в строках базы находится U+FFFD. Файлы существуют, кириллические filename сохранены.</p></div><div class="proof"><strong>Доказательство</strong><br>23 bad Title, 22 bad Artist, 212 replacement chars. Все 23 Title — WAV.</div></article>
+        <article class="finding"><div class="code">LIFE-01<br><span class="status fail">High</span></div><div><h3>Backend не завершается вместе с окном</h3><p>Live и isolated run повторили проблему: после 8 секунд graceful-close остался install-owned процесс.</p></div><div class="proof"><strong>Cleanup</strong><br>Runner остановил только подтверждённые бинарники из <code>E:\DeckPipe</code>; порт 24680 освобождён.</div></article>
+        <article class="finding"><div class="code">PERF-01<br><span class="status fail">High</span></div><div><h3>Fuzzy scan масштабируется квадратично по данным</h3><p>Каждый трек повторно сравнивается с полным списком файлов и делает множественные path resolution.</p></div><div class="proof"><strong>Baseline</strong><br>Missing: 22.05 s; adoption: 20.17 s; warm sidecar: 36.6 ms.</div></article>
+        <article class="finding medium"><div class="code">ERR-01<br><span class="status warn">Medium</span></div><div><h3>Global errors не включает local playlists</h3><p><code>/api/errors</code> обходит только Deezer и SoundCloud sources; ошибки локальных целей становятся невидимыми.</p></div><div class="proof"><strong>Contract</strong><br>Формализовано как <code>expectedFailure</code>, чтобы дефект не потерялся и не ломал весь QA-runner.</div></article>
+        <article class="finding medium"><div class="code">UI-01<br><span class="status warn">Medium</span></div><div><h3>Минимальное окно скрывает один обязательный control</h3><p>При client-size 1000×640 UIA видит все шесть controls, но только пять находятся on-screen.</p></div><div class="proof"><strong>Повторяемость</strong><br>C2 стабильно fail после устранения transient UIA snapshot.</div></article>
+        <article class="finding medium"><div class="code">A11Y-01<br><span class="status warn">Medium</span></div><div><h3>Карточки плейлистов недоступны с клавиатуры</h3><p>38 уникальных title найдены в accessibility tree; ни один actionable ancestor до Document не focusable.</p></div><div class="proof"><strong>Live UIA</strong><br>Located 38 / keyboard-accessible 0.</div></article>
+      </div>
+    </section>
+
+    <section id="unicode">
+      <div class="section-head"><div class="index">03 / UNICODE</div><div><h2>Русские названия: где ломается цепочка</h2><p class="intro">Проверка проводилась на временной копии <code>master.db</code>. Скрипт выводит только агрегаты — без названий, артистов и путей.</p></div></div>
+      <div class="data-callout">
+        <div><div class="big-glyph">&#xfffd;</div><span class="status fail">stored data</span></div>
+        <div>
+          <h3>Проблема подтверждена в данных Rekordbox, а не только в UI</h3>
+          <p>В базе: 1061 content row, 26 кириллических Title, 63 кириллических filename, 23 Title с replacement glyph и 68 пустых Title. 23/23 повреждённых Title относятся к WAV; их файлы существуют, а filename содержит кириллицу.</p>
+          <div class="evidence-numbers">
+            <div><b>23</b><span>bad Title rows</span></div>
+            <div><b>22</b><span>bad Artist rows</span></div>
+            <div><b>212</b><span>U+FFFD occurrences</span></div>
+            <div><b>68</b><span>empty Title rows</span></div>
+            <div><b>72</b><span>empty Artist rows</span></div>
+            <div><b>0</b><span>bad filename glyphs</span></div>
+          </div>
+          <p><strong>Интерпретация.</strong> Сильная корреляция с WAV и отсутствие non-ASCII в RIFF INFO у этих 23 файлов указывают на metadata/import path. Но причинность текущей DeckPipe 0.5.0 не доказана: повреждённые rows датированы 2024–2025, а текущий WAV flip меняет path/type/size, не Title/Artist. Нужен preview-only repair audit, не автоматическая перезапись.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="performance">
+      <div class="section-head"><div class="index">04 / BASELINE</div><div><h2>Performance baseline</h2><p class="intro">Пять измерений на endpoint, установленный EXE, текущий пользовательский dataset. При пяти samples P95 равен самому медленному sample, поэтому regression gate основан на median и отдельном budget.</p></div></div>
+      <div class="perf-layout">
+        <div class="meters">
+          <div class="meter"><div class="meter-head"><span>EXE → window ready</span><b class="mono">3306.8 / 5000 ms</b></div><div class="track"><span class="fill" style="--w:66.1%"></span></div></div>
+          <div class="meter"><div class="meter-head"><span><code>/api/playlists</code> median</span><b class="mono">37.589 / 800 ms</b></div><div class="track"><span class="fill" style="--w:4.7%"></span></div></div>
+          <div class="meter"><div class="meter-head"><span><code>/api/rb/status</code> median</span><b class="mono">167.919 / 800 ms</b></div><div class="track"><span class="fill" style="--w:21%"></span></div></div>
+          <div class="meter"><div class="meter-head"><span>Working set</span><b class="mono">563.8 / 650 MiB</b></div><div class="track"><span class="fill warn" style="--w:86.7%"></span></div></div>
+          <div class="meter"><div class="meter-head"><span>Private memory</span><b class="mono">1090.4 / 1250 MiB</b></div><div class="track"><span class="fill warn" style="--w:87.2%"></span></div></div>
+          <div class="meter"><div class="meter-head"><span>Idle CPU / 2 s</span><b class="mono">0 / 100 ms</b></div><div class="track"><span class="fill" style="--w:0%"></span></div></div>
+        </div>
+        <div class="ratio"><div><b>602×</b><span>missing fuzzy-scan медленнее warm sidecar на синтетическом наборе 200×1000</span></div></div>
+      </div>
+
+      <div class="table-wrap" style="margin-top:18px">
+        <table>
+          <thead><tr><th>Endpoint</th><th>Status</th><th>Bytes</th><th>Min ms</th><th>Median ms</th><th>P95 ms</th><th>Budget</th></tr></thead>
+          <tbody>
+            <tr><td><code>/api/version</code></td><td><span class="status pass">200</span></td><td class="num">19</td><td class="num">0.420</td><td class="num">1.071</td><td class="num">25.768</td><td class="num">250</td></tr>
+            <tr><td><code>/</code></td><td><span class="status pass">200</span></td><td class="num">42 813</td><td class="num">0.991</td><td class="num">1.137</td><td class="num">396.987</td><td class="num">250 median</td></tr>
+            <tr><td><code>/api/config</code></td><td><span class="status pass">200</span></td><td class="num">177</td><td class="num">1.193</td><td class="num">1.588</td><td class="num">262.420</td><td class="num">800</td></tr>
+            <tr><td><code>/api/playlists</code></td><td><span class="status pass">200</span></td><td class="num">10 246</td><td class="num">36.999</td><td class="num">37.589</td><td class="num">391.084</td><td class="num">800</td></tr>
+            <tr><td><code>/api/sc/sources</code></td><td><span class="status pass">200</span></td><td class="num">2 900</td><td class="num">10.749</td><td class="num">11.654</td><td class="num">12.793</td><td class="num">500</td></tr>
+            <tr><td><code>/api/rb/status</code></td><td><span class="status pass">200</span></td><td class="num">934</td><td class="num">161.839</td><td class="num">167.919</td><td class="num">211.647</td><td class="num">800</td></tr>
+            <tr><td><code>/api/errors</code></td><td><span class="status pass">200</span></td><td class="num">687</td><td class="num">27.365</td><td class="num">27.911</td><td class="num">28.554</td><td class="num">800</td></tr>
+            <tr><td><code>/api/jobs</code></td><td><span class="status pass">200</span></td><td class="num">2</td><td class="num">0.397</td><td class="num">0.420</td><td class="num">0.832</td><td class="num">250</td></tr>
+            <tr><td><code>/__deckpipe_qa_missing__</code></td><td><span class="status pass">404</span></td><td class="num">22</td><td class="num">0.254</td><td class="num">0.274</td><td class="num">0.344</td><td class="num">250</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <details style="margin-top:12px"><summary>Сравнение с ручным baseline</summary><div><ul><li><code>/api/playlists</code>: 40.3 → 37.589 ms (−6.7%).</li><li><code>/api/rb/status</code>: 154.5 → 167.919 ms (+8.7%, в пределах 25% regression gate).</li><li>Working set: 563.9 → 563.8 MiB; private memory: 1074.5 → 1090.4 MiB (+1.5%).</li><li>Новый runner впервые сохранил валидный cold window-ready: 3306.8 ms, но lifecycle gate всё равно fail.</li></ul></div></details>
+    </section>
+
+    <section id="matrix">
+      <div class="section-head"><div class="index">05 / MATRIX</div><div><h2>Что покрыто автоматически</h2><p class="intro">Live и isolated контуры намеренно разделены: потенциально пишущие UI-flow никогда не активируются на пользовательском профиле.</p></div></div>
+      <div class="matrix">
+        <article class="matrix-card"><header><h3>Installed live / read-only</h3><span class="status fail">16P · 3F · 2W</span></header><p>9 allowlisted GET, startup, UIA, normal/min size, Unicode aggregates, process footprint, hash snapshots, cleanup.</p><ul><li>Fail: C2, C5, E3.</li><li>Warn: C3/C4 перенесены в isolation.</li></ul></article>
+        <article class="matrix-card"><header><h3>Isolated desktop profile</h3><span class="status warn">19P · 1F · 1W</span></header><p>Новый временный APPDATA/LOCALAPPDATA без credentials; UIA активирует Deezer, SoundCloud, Search, Errors.</p><ul><li>C3/C4: pass 4/4.</li><li>E3: тот же orphan; C5 warn из-за пустого fixture.</li></ul></article>
+        <article class="matrix-card"><header><h3>Core playlist scan</h3><span class="status pass">4P · 1XF</span></header><p>ok/missing/error, adoption, UTF-8 sidecar, кириллица, missing file status.</p><ul><li>B3: pass.</li><li>B5 local error coverage: expected failure.</li></ul></article>
+        <article class="matrix-card"><header><h3>Rekordbox copy audit</h3><span class="status fail">data fail</span></header><p>1061 rows агрегированы на временной копии; source snapshot совпал до/после, temp удалён.</p><ul><li>23 bad Title.</li><li>68 empty Title.</li></ul></article>
+        <article class="matrix-card"><header><h3>Performance</h3><span class="status warn">mixed</span></header><p>Startup/API/RAM проходят budget. Синтетический cold scan не проходит практический UX threshold.</p></article>
+        <article class="matrix-card"><header><h3>Explicit exclusions</h3><span class="status info">untouched</span></header><p>Downloads, remote playlist mutations, RB write/flip, bug report, authentication changes, Kimi history и credential rotation не выполнялись.</p></article>
+      </div>
+    </section>
+
+    <section id="next">
+      <div class="section-head"><div class="index">06 / NEXT</div><div><h2>Рекомендуемый порядок исправлений</h2><p class="intro">QA-план реализован; дальше нужны отдельные change-итерации с RED/GREEN и обязательным backup/rollback для Rekordbox.</p></div></div>
+      <div class="priority-list">
+        <article class="priority"><div><h3>Закрыть P0 security gates из полного аудита</h3><p>Per-launch auth для localhost, strict Origin/Host, убрать inline-handler XSS и blind helper pairing. Credentials remediation остаётся вне этого QA-run по прямому указанию владельца.</p></div></article>
+        <article class="priority"><div><h3>Спроектировать metadata-aware Rekordbox sync</h3><p>Dry-run diff, add/remove/reorder/update, обязательные Title/Artist, post-commit reconciliation и idempotence. До этого RB write/flip считать experimental.</p></div></article>
+        <article class="priority"><div><h3>Сделать preview-only repair для существующей базы</h3><p>Отдельно показать 23 U+FFFD и 68 empty Title, источники метаданных и confidence. Никакого автоугадывания или записи без ручного подтверждения и backup verification.</p></div></article>
+        <article class="priority"><div><h3>Исправить lifecycle sidecar</h3><p>Хранить child handle, завершать backend на Exit/ExitRequested, добавить parent-death watchdog и single-instance/port lock.</p></div></article>
+        <article class="priority"><div><h3>Заменить fuzzy nested-loop индексом</h3><p>Один раз нормализовать filename и ключи; сначала exact track-id/normalized key, затем ограниченный fuzzy fallback. Добавить perf gate на 200×1000.</p></div></article>
+        <article class="priority"><div><h3>Довести UI и error model</h3><p>Responsive header, playlist card как semantic button/list item, Tab/Enter/Space, local_sources в errors, явные loading/partial/failure states.</p></div></article>
+      </div>
+    </section>
+
+    <section id="evidence">
+      <div class="section-head"><div class="index">07 / LEDGER</div><div><h2>Артефакты и воспроизведение</h2><p class="intro">Все ссылки локальные. JSON не содержит playlist title/path payloads; config endpoint свёрнут в булевы статусы.</p></div></div>
+      <details open><summary>Итоговые evidence-файлы</summary><div><ul class="artifact-list">
+        <li><a href="../.bench/runs/installed-20260826-181548.json">Live run · JSON</a></li>
+        <li><a href="../.bench/runs/installed-20260826-181548.md">Live run · Markdown</a></li>
+        <li><a href="../.bench/runs/isolated-ui-20260826-182154.json">Isolated UI · JSON</a></li>
+        <li><a href="../.bench/runs/isolated-ui-20260826-182154.md">Isolated UI · Markdown</a></li>
+        <li><a href="../.bench/runs/library-scan-20260826-182546.json">Library scan · JSON</a></li>
+        <li><a href="../.bench/runs/library-scan-20260826-182546.md">Library scan · Markdown</a></li>
+        <li><a href="../.bench/runs/rekordbox-unicode-20260826-182719181.json">Rekordbox Unicode aggregates</a></li>
+        <li><a href="../.bench/baseline-installed-0.5.0.json">Canonical baseline 0.5.0</a></li>
+        <li><a href="../.bench/runs/performance-compare-20260826-183604357.json">Baseline self-compare · 15/15</a></li>
+        <li><a href="deckpipe-audit-report-2026-08-26.html">Полный архитектурный/security аудит</a></li>
+        <li><a href="../.qa-artifacts/qa-deckpipe-installed-test-plan-2026-08-26.md">Исходный QA-план</a></li>
+      </ul></div></details>
+      <details><summary>Реализованный QA-код</summary><div><ul class="artifact-list">
+        <li><a href="../qa/DeckPipe.QA.psm1">QA module</a></li>
+        <li><a href="../qa/run-installed-qa.ps1">Installed / isolated runner</a></li>
+        <li><a href="../qa/run-rekordbox-unicode-audit.ps1">Unicode copy runner</a></li>
+        <li><a href="../qa/performance-budget.json">Performance budgets</a></li>
+        <li><a href="../qa/benchmark_library_scan.py">Synthetic scan benchmark</a></li>
+        <li><a href="../qa/compare-performance.ps1">Performance comparator</a></li>
+        <li><a href="../qa/tests/DeckPipe.QA.Tests.ps1">Module contracts</a></li>
+        <li><a href="../qa/tests/DeckPipe.Orchestrator.Tests.ps1">Runner contracts</a></li>
+        <li><a href="../qa/tests/test_isolated_core.py">Core Unicode/B3/B5 tests</a></li>
+      </ul></div></details>
+      <details><summary>Команды повторного запуска</summary><div><pre class="mono"># contracts
+&amp; .\qa\tests\DeckPipe.QA.Tests.ps1
+&amp; .\qa\tests\DeckPipe.Orchestrator.Tests.ps1
+&amp; .\.venv\Scripts\python.exe -m unittest -v qa.tests.test_isolated_core
+
+# installed read-only baseline
+&amp; .\qa\run-installed-qa.ps1 -NoFailOnFindings -Samples 5
+
+# isolated UI profile
+&amp; .\qa\run-installed-qa.ps1 -IsolatedUi -NoFailOnFindings -Samples 3
+
+# synthetic library scan
+&amp; .\.venv\Scripts\python.exe .\qa\benchmark_library_scan.py `
+  --tracks 200 --files 1000 --output-directory .\.bench\runs
+
+# compare a future run against the promoted 0.5.0 baseline
+&amp; .\qa\compare-performance.ps1 `
+  -BaselineJson .\.bench\baseline-installed-0.5.0.json `
+  -CurrentJson .\.bench\runs\&lt;future-run&gt;.json
+
+# read-only source + temporary Rekordbox copy
+&amp; .\qa\run-rekordbox-unicode-audit.ps1</pre></div></details>
+      <details><summary>Ограничения</summary><div><ul><li>Installed EXE и application source не исправлялись в этой фазе; fail — это release gates, а не незавершённость runner.</li><li>Live B3 не вызывается: endpoint scan может переписать sidecar. B3 покрыт только временной библиотекой.</li><li>Live C3/C4 не кликаются: SoundCloud tab вызывает sync-account. Клики выполняются только в профиле без credentials.</li><li>UI проверен через Windows UI Automation, не через in-app browser и не через pixel-diff.</li><li>Результаты внешних streaming listings зависят от текущей сети и dataset; mutation не выполнялась.</li></ul></div></details>
+    </section>
+  </main>
+
+  <footer><div class="shell"><span>DeckPipe QA execution report · локальный self-contained HTML</span><span class="mono">generated 2026-08-26 · Europe/Moscow</span></div></footer>
+</body>
+</html>

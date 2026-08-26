@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "run_id": "isolated-ui-20260826-182000",
+  "generated_at": "2026-08-26T18:20:15.7885906+00:00",
+  "target": {
+    "product": "DeckPipe",
+    "version": null,
+    "executable": "deckpipe.exe",
+    "executable_sha256": "1B07F67D4CEE8610CFCF7C36E2043C15505260EA70F59C95041B50AD6D67D31A",
+    "mode": "isolated-ui"
+  },
+  "safety": {
+    "live_mutation_endpoints_called": 0,
+    "protected_config_unchanged": true,
+    "rekordbox_database_unchanged": true,
+    "rekordbox_backup_count_unchanged": true,
+    "isolated_fixture_config_unchanged": true,
+    "isolation_directory_removed": true
+  },
+  "summary": {
+    "status": "fail",
+    "passed": 3,
+    "failed": 2,
+    "warnings": 0,
+    "skipped": 0
+  },
+  "checks": [
+    {
+      "id": "A1",
+      "status": "pass",
+      "message": "installed shell and sidecar became ready",
+      "data": {
+        "port_ready_ms": 3611.1,
+        "window_ready_ms": 3635.4
+      }
+    },
+    {
+      "id": "RUNNER",
+      "status": "fail",
+      "message": "installed QA stopped after a PropertyNotFoundException",
+      "data": null
+    },
+    {
+      "id": "E1",
+      "status": "pass",
+      "message": "protected user files are unchanged",
+      "data": {
+        "config_unchanged": true,
+        "rekordbox_database_unchanged": true,
+        "isolated_fixture_config_unchanged": true
+      }
+    },
+    {
+      "id": "E2",
+      "status": "pass",
+      "message": "only allowlisted GET requests ran and no Rekordbox backup was created",
+      "data": {
+        "allowlisted_get_count": 3,
+        "unsafe_request_count": 0,
+        "isolated_ui_interaction_count": 0,
+        "rekordbox_backup_count_unchanged": true
+      }
+    },
+    {
+      "id": "E3",
+      "status": "fail",
+      "message": "DeckPipe left an owned process after graceful close; the runner removed it",
+      "data": {
+        "orphan_detected": true,
+        "lingering_owned_process_count": 0,
+        "port_closed": true,
+        "isolation_directory_removed": true
+      }
+    }
+  ],
+  "performance": {
+    "port_ready_ms": 3611.1,
+    "window_ready_ms": 3635.4
+  },
+  "endpoint_metrics": {
+    "/api/version": {
+      "expected_status": 200,
+      "unexpected_status_count": 0,
+      "response_bytes": 19,
+      "min_ms": 0.462,
+      "median_ms": 1.466,
+      "p95_ms": 349.332,
+      "max_ms": 349.332,
+      "payload": {
+        "kind": "version",
+        "reported_version": "0.5.0"
+      }
+    },
+    "/": {
+      "expected_status": 200,
+      "unexpected_status_count": 0,
+      "response_bytes": 42813,
+      "min_ms": 1.06,
+      "median_ms": 1.24,
+      "p95_ms": 3.541,
+      "max_ms": 3.541,
+      "payload": {
+        "kind": "html",
+        "utf8_replacement_detected": false,
+        "bad_glyph_detected": false
+      }
+    },
+    "/api/config": {
+      "expected_status": 200,
+      "unexpected_status_count": 0,
+      "response_bytes": 245,
+      "min_ms": 0.774,
+      "median_ms": 0.828,
+      "p95_ms": 1.047,
+      "max_ms": 1.047,
+      "payload": {
+        "kind": "configuration-state",
+        "deezer_session_configured": false,
+        "soundcloud_session_configured": false,
+        "music_root_configured": true,
+        "wav_mode": "source",
+        "numbering": true
+      }
+    }
+  },
+  "fatal_error_type": "PropertyNotFoundException"
+}

@@ -1,0 +1,71 @@
+{
+  "artist_bad_glyph": 22,
+  "artist_bad_glyph_occurrences": {
+    "U+25A0": 0,
+    "U+25A1": 0,
+    "U+25AF": 0,
+    "U+FFFD": 228
+  },
+  "artist_cyrillic": 23,
+  "artist_missing": 72,
+  "artist_mojibake_candidates": 0,
+  "bad_title_and_bad_artist": 15,
+  "bad_title_date_created": {
+    "2024-12-24": 10,
+    "2025-03-17": 13
+  },
+  "bad_title_extensions": {
+    ".wav": 23
+  },
+  "bad_title_file_exists": 23,
+  "bad_title_stock_date": {
+    "2025-04-15": 6,
+    "2025-04-24": 17
+  },
+  "bad_title_wav_info_non_ascii": 0,
+  "bad_title_wav_info_utf8_cyrillic": 0,
+  "bad_title_wav_info_utf8_replacement": 0,
+  "bad_title_wav_info_utf8_valid": 23,
+  "bad_title_wav_with_riff_info": 23,
+  "bad_title_with_cyrillic_filename": 23,
+  "content_count": 1061,
+  "database_bytes": 10211328,
+  "filename_bad_glyph": 0,
+  "filename_cyrillic": 63,
+  "missing_title_date_created": {
+    "2026-08-04": 4,
+    "2026-08-05": 64
+  },
+  "missing_title_extensions": {
+    ".flac": 66,
+    ".mp3": 2
+  },
+  "missing_title_sidecar_evidence": {
+    "checked": false
+  },
+  "missing_title_stock_date": {
+    "2026-08-04": 4,
+    "2026-08-05": 64
+  },
+  "music_root_content_count": 1044,
+  "music_root_filename_cyrillic": 63,
+  "music_root_title_bad_glyph": 23,
+  "music_root_title_missing": 68,
+  "non_nfc_title": 1,
+  "playlist_count": 17,
+  "playlist_name_bad_glyph": 0,
+  "playlist_name_cyrillic": 0,
+  "sidecar_evidence": {
+    "checked": false
+  },
+  "title_bad_glyph": 23,
+  "title_bad_glyph_occurrences": {
+    "U+25A0": 0,
+    "U+25A1": 0,
+    "U+25AF": 0,
+    "U+FFFD": 212
+  },
+  "title_cyrillic": 26,
+  "title_missing": 68,
+  "title_mojibake_candidates": 0
+}

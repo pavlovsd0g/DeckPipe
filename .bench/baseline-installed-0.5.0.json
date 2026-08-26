@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "product": "DeckPipe",
+  "version": "0.5.0",
+  "captured_at": "2026-08-26T15:15:48Z",
+  "source_run": ".bench/runs/installed-20260826-181548.json",
+  "samples_per_endpoint": 5,
+  "startup_ms": {
+    "port_ready": 3252.5,
+    "window_ready": 3306.8
+  },
+  "process_footprint": {
+    "process_count": 10,
+    "working_set_mb": 563.8,
+    "private_memory_mb": 1090.4,
+    "idle_cpu_ms_over_2s": 0.0
+  },
+  "api_median_ms": {
+    "/api/version": 1.071,
+    "/": 1.137,
+    "/api/config": 1.588,
+    "/api/playlists": 37.589,
+    "/api/sc/sources": 11.654,
+    "/api/rb/status": 167.919,
+    "/api/errors": 27.911,
+    "/api/jobs": 0.42,
+    "/__deckpipe_qa_missing__": 0.274
+  },
+  "api_response_bytes": {
+    "/api/version": 19,
+    "/": 42813,
+    "/api/config": 177,
+    "/api/playlists": 10246,
+    "/api/sc/sources": 2900,
+    "/api/rb/status": 934,
+    "/api/errors": 687,
+    "/api/jobs": 2,
+    "/__deckpipe_qa_missing__": 22
+  },
+  "dataset": {
+    "deezer_playlists": 39,
+    "soundcloud_sources": 17,
+    "rekordbox_playlists": 17,
+    "rekordbox_content_rows": 1061
+  },
+  "isolated_library_scan": {
+    "tracks": 200,
+    "files": 1000,
+    "estimated_pair_comparisons": 200000,
+    "missing_scan_ms": 22051.576,
+    "adoption_scan_ms": 20165.258,
+    "warm_sidecar_scan_ms": 36.618
+  }
+}

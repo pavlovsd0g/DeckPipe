@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-26T18:25:46.593318+00:00",
+  "mode": "isolated-synthetic-library-scan",
+  "dataset": {
+    "track_count": 200,
+    "file_count": 1000,
+    "estimated_pair_comparisons": 200000
+  },
+  "metrics_ms": {
+    "missing_scan": 22051.576,
+    "adoption_scan": 20165.258,
+    "warm_sidecar_scan": 36.618
+  },
+  "outcomes": {
+    "missing_count": 200,
+    "adopted_ok_count": 200,
+    "warm_ok_count": 200,
+    "sidecar_utf8": true
+  }
+}
