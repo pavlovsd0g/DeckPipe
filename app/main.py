@@ -13,10 +13,10 @@ from pydantic import BaseModel
 
 from . import jobs, library
 from .deezer_client import load_config, get_session
+from .security import LoopbackSecurityMiddleware, SecuritySettings
 
 app = FastAPI(title="DeckPipe")
-from fastapi.middleware.cors import CORSMiddleware
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(LoopbackSecurityMiddleware, settings=SecuritySettings.from_env())
 STATIC = Path(__file__).parent / "static"
 APP_VERSION = "0.5.0"
 
