@@ -96,8 +96,8 @@ def _b64encode(value: bytes) -> str:
 def _b64decode(value: str) -> bytes:
     try:
         return base64.b64decode(value.encode("ascii"), validate=True)
-    except Exception as exc:
-        raise SecureStoreError("secure store is unreadable") from exc
+    except Exception:
+        raise SecureStoreError("secure store is unreadable") from None
 
 
 def _make_blob(buffer) -> DATA_BLOB:
@@ -196,15 +196,15 @@ def _validate_records(payload: object) -> dict[str, str]:
 def _record_name(field: str) -> str:
     try:
         return _FIELD_TO_RECORD[field]
-    except KeyError as exc:
-        raise SecureStoreError("unknown secure credential field") from exc
+    except KeyError:
+        raise SecureStoreError("unknown secure credential field") from None
 
 
 def _read_json_file(path: Path) -> object:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise SecureStoreError("secure store is unreadable") from exc
+    except Exception:
+        raise SecureStoreError("secure store is unreadable") from None
 
 
 def _atomic_write_json(path: Path, payload: object, replace: Callable[[Path, Path], None] = os.replace) -> None:
@@ -217,10 +217,8 @@ def _atomic_write_json(path: Path, payload: object, replace: Callable[[Path, Pat
             handle.flush()
             os.fsync(handle.fileno())
         replace(tmp, path)
-    except Exception as exc:
-        if isinstance(exc, SecureStoreError):
-            raise
-        raise SecureStoreError("atomic secure write failed") from exc
+    except Exception:
+        raise SecureStoreError("atomic secure write failed") from None
     finally:
         try:
             tmp.unlink()
@@ -249,10 +247,8 @@ class SecureCredentialStore:
             )
             decoded = json.loads(bytes(plaintext).decode("utf-8"))
             return _validate_records(decoded)
-        except SecureStoreError:
-            raise
-        except Exception as exc:
-            raise SecureStoreError("secure store is unreadable") from exc
+        except Exception:
+            raise SecureStoreError("secure store is unreadable") from None
         finally:
             for index in range(len(plaintext)):
                 plaintext[index] = 0
@@ -273,10 +269,8 @@ class SecureCredentialStore:
                 "ciphertext": _b64encode(ciphertext),
             }
             _atomic_write_json(self.path, file_payload, self._replace)
-        except SecureStoreError:
-            raise
-        except Exception as exc:
-            raise SecureStoreError("secure store write failed") from exc
+        except Exception:
+            raise SecureStoreError("secure store write failed") from None
         finally:
             for index in range(len(plaintext)):
                 plaintext[index] = 0
@@ -329,8 +323,8 @@ def _load_legacy_config(config_path: Path) -> dict:
         return json.loads(config_path.read_text(encoding="utf-8"))
     except UnicodeDecodeError:
         return json.loads(config_path.read_text(encoding="cp1251"))
-    except Exception as exc:
-        raise SecureStoreError("legacy preference file is unreadable") from exc
+    except Exception:
+        raise SecureStoreError("legacy preference file is unreadable") from None
 
 
 def _default_readback_validator(store: SecureCredentialStore, records: dict[str, str]) -> None:
@@ -360,16 +354,25 @@ def migrate_legacy_config(
             records[field] = value
 
     store = SecureCredentialStore(store_path, dpapi=dpapi, replace=replace)
-    already_present = tuple(field for field in LEGACY_SECRET_FIELDS if field not in records and store.has_secret(field))
+    try:
+        already_present = tuple(field for field in LEGACY_SECRET_FIELDS if field not in records and store.has_secret(field))
+    except Exception:
+        raise SecureStoreError("secure migration failed") from None
     if not records:
         return MigrationResult(migrated_fields=(), already_present_fields=already_present)
 
-    for field, value in records.items():
-        store.set_secret(field, value)
-    readback_validator(store, records)
+    try:
+        for field, value in records.items():
+            store.set_secret(field, value)
+        readback_validator(store, records)
+    except Exception:
+        raise SecureStoreError("secure migration failed") from None
 
     sanitized = dict(config)
     for field in records:
         sanitized.pop(field, None)
-    _atomic_write_json(config_path, sanitized, replace)
+    try:
+        _atomic_write_json(config_path, sanitized, replace)
+    except Exception:
+        raise SecureStoreError("legacy preference rewrite failed") from None
     return MigrationResult(migrated_fields=tuple(records), already_present_fields=already_present)

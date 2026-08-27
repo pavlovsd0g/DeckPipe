@@ -40,7 +40,7 @@ def _data_dir() -> Path:
         if base:
             d = Path(base) / "DeckPipe"
         else:
-            d = Path.home() / ".deckpipe"
+            raise RuntimeError("DeckPipe data directory is unavailable")
     return d
 
 

@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+import traceback
 import unittest
 import uuid
 from pathlib import Path
@@ -84,7 +85,11 @@ class FailingDpapi:
         raise RuntimeError("injected dependency saw " + plaintext.decode("utf-8", errors="replace"))
 
     def unprotect(self, ciphertext: bytes, *, optional_entropy, flags: int) -> bytes:
-        raise RuntimeError("injected dependency failure")
+        raise RuntimeError("injected dependency failure " + getattr(self, "leak_value", ""))
+
+
+def formatted_exception(exc: BaseException) -> str:
+    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
 
 @unittest.skipUnless(os.name == "nt", "Windows current-user DPAPI is required")
@@ -212,6 +217,7 @@ class SecureStoreTests(unittest.TestCase):
             base = Path(tmp)
             override = base / "override"
             appdata = base / "appdata"
+            fake_home = base / "home"
             with patch.object(sys, "frozen", False, create=True):
                 with isolated_app_modules(override):
                     deezer_client = importlib.import_module("app.deezer_client")
@@ -236,6 +242,27 @@ class SecureStoreTests(unittest.TestCase):
                         self.assertEqual(appdata / "DeckPipe", deezer_client.ROOT)
                         self.assertFalse((appdata / "DeckPipe").exists())
                     finally:
+                        for name in TASK_MODULES:
+                            sys.modules.pop(name, None)
+
+            with patch.object(sys, "frozen", False, create=True):
+                with patch.object(Path, "home", return_value=fake_home):
+                    with patch.dict(
+                        os.environ,
+                        {
+                            "DECKPIPE_API_TOKEN": "secure-store-test-launch-token",
+                            "DECKPIPE_BOUND_PORT": "8123",
+                        },
+                        clear=True,
+                    ):
+                        for name in TASK_MODULES:
+                            sys.modules.pop(name, None)
+                        with self.assertRaises(RuntimeError) as captured:
+                            importlib.import_module("app.deezer_client")
+                        formatted = formatted_exception(captured.exception)
+                        self.assertIn("DeckPipe data directory is unavailable", formatted)
+                        self.assertNotIn(str(fake_home), formatted)
+                        self.assertFalse((fake_home / ".deckpipe").exists())
                         for name in TASK_MODULES:
                             sys.modules.pop(name, None)
 
@@ -403,13 +430,51 @@ class SecureStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with isolated_app_modules(Path(tmp)):
                 secure_store = importlib.import_module("app.secure_store")
-                store = secure_store.SecureCredentialStore(Path(tmp) / "secrets.dpapi", dpapi=FailingDpapi())
+                store_path = Path(tmp) / "secrets.dpapi"
+                store = secure_store.SecureCredentialStore(store_path, dpapi=FailingDpapi())
                 with contextlib.redirect_stdout(io.StringIO()) as stdout:
                     with contextlib.redirect_stderr(io.StringIO()) as stderr:
                         with self.assertRaises(secure_store.SecureStoreError) as captured:
                             store.set_deezer_arl(values["deezer"])
-                combined = str(captured.exception) + stdout.getvalue() + stderr.getvalue()
+                combined = formatted_exception(captured.exception) + stdout.getvalue() + stderr.getvalue()
                 self.assertFalse(any(value in combined for value in values.values()))
+
+                def leaking_replace(_src: Path, _dst: Path) -> None:
+                    raise secure_store.SecureStoreError("replace leaked " + values["deezer"])
+
+                store = secure_store.SecureCredentialStore(store_path, replace=leaking_replace)
+                with self.assertRaises(secure_store.SecureStoreError) as replace_capture:
+                    store.set_deezer_arl(values["deezer"])
+                self.assertFalse(any(value in formatted_exception(replace_capture.exception) for value in values.values()))
+
+                recorder = RecordingDpapi()
+                protected = recorder.protect(
+                    json.dumps(
+                        {
+                            "version": secure_store.STORE_VERSION,
+                            "purpose": secure_store.STORE_PAYLOAD_PURPOSE,
+                            "records": {"deezer_arl": values["deezer"]},
+                        }
+                    ).encode("utf-8"),
+                    description=None,
+                    optional_entropy=None,
+                    flags=secure_store.CRYPTPROTECT_UI_FORBIDDEN,
+                )
+                store_path.write_text(
+                    json.dumps(
+                        {
+                            "version": secure_store.STORE_VERSION,
+                            "purpose": secure_store.STORE_FILE_PURPOSE,
+                            "ciphertext": secure_store._b64encode(protected),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                failing = FailingDpapi()
+                failing.leak_value = values["deezer"]
+                with self.assertRaises(secure_store.SecureStoreError) as unprotect_capture:
+                    secure_store.SecureCredentialStore(store_path, dpapi=failing).get_deezer_arl()
+                self.assertFalse(any(value in formatted_exception(unprotect_capture.exception) for value in values.values()))
 
 
 if __name__ == "__main__":
