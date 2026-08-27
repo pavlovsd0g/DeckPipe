@@ -24,6 +24,20 @@ if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
 
 Import-Module $modulePath -Force
 
+function New-DeckPipeUnicodeString {
+    param([Parameter(Mandatory)][int[]]$CodePoints)
+
+    $builder = [Text.StringBuilder]::new()
+    foreach ($codePoint in $CodePoints) {
+        if ($codePoint -gt 0xFFFF) {
+            [void]$builder.Append([char]::ConvertFromUtf32($codePoint))
+        } else {
+            [void]$builder.Append([char]$codePoint)
+        }
+    }
+    return $builder.ToString()
+}
+
 function Get-PropertyValue {
     param(
         [AllowNull()]$InputObject,
@@ -505,14 +519,9 @@ function Stop-DeckPipeOwnedProcesses {
     return $stopped.ToArray()
 }
 
-if (-not (Test-Path -LiteralPath $ExePath -PathType Leaf)) {
-    throw "DeckPipe executable was not found: $ExePath"
-}
 if (-not (Test-Path -LiteralPath $budgetPath -PathType Leaf)) {
     throw "Performance budget was not found: $budgetPath"
 }
-$resolvedExe = (Resolve-Path -LiteralPath $ExePath).Path
-$installDirectory = Split-Path -Parent $resolvedExe
 $budget = Get-Content -LiteralPath $budgetPath -Raw | ConvertFrom-Json
 $endpoints = @(Get-DeckPipeReadOnlyEndpoints)
 
@@ -524,6 +533,12 @@ if ($ValidateOnly) {
     Write-Host "VALID installed-runner mode=$validationMode endpoints=$($endpoints.Count) samples=$Samples"
     return
 }
+
+if (-not (Test-Path -LiteralPath $ExePath -PathType Leaf)) {
+    throw "DeckPipe executable was not found: $ExePath"
+}
+$resolvedExe = (Resolve-Path -LiteralPath $ExePath).Path
+$installDirectory = Split-Path -Parent $resolvedExe
 
 $checks = [Collections.Generic.List[object]]::new()
 $requestLog = [Collections.Generic.List[object]]::new()
@@ -715,13 +730,28 @@ try {
         $httpHandler.Dispose()
     }
 
+    $uiNameSearch = New-DeckPipeUnicodeString -CodePoints @(0x041F, 0x043E, 0x0438, 0x0441, 0x043A)
+    $uiNameErrors = New-DeckPipeUnicodeString -CodePoints @(0x041E, 0x0448, 0x0438, 0x0431, 0x043A, 0x0438)
+    $uiNameSave = New-DeckPipeUnicodeString -CodePoints @(0x0421, 0x043E, 0x0445, 0x0440, 0x0430, 0x043D, 0x0438, 0x0442, 0x044C)
+    $uiNameBugReport = New-DeckPipeUnicodeString -CodePoints @(0x1F41E, 0x20, 0x0411, 0x0430, 0x0433, 0x0440, 0x0435, 0x043F, 0x043E, 0x0440, 0x0442)
+    $uiWordChoose = New-DeckPipeUnicodeString -CodePoints @(0x0412, 0x044B, 0x0431, 0x0435, 0x0440, 0x0438, 0x0442, 0x0435)
+    $uiWordPlaylist = New-DeckPipeUnicodeString -CodePoints @(0x043F, 0x043B, 0x0435, 0x0439, 0x043B, 0x0438, 0x0441, 0x0442)
+    $uiWordSource = New-DeckPipeUnicodeString -CodePoints @(0x0438, 0x0441, 0x0442, 0x043E, 0x0447, 0x043D, 0x0438, 0x043A)
+    $uiWordLeft = New-DeckPipeUnicodeString -CodePoints @(0x0441, 0x043B, 0x0435, 0x0432, 0x0430)
+    $uiWordLeftTitle = New-DeckPipeUnicodeString -CodePoints @(0x0421, 0x043B, 0x0435, 0x0432, 0x0430)
+    $uiWordTarget = New-DeckPipeUnicodeString -CodePoints @(0x0446, 0x0435, 0x043B, 0x044C)
+    $uiWordTracks = New-DeckPipeUnicodeString -CodePoints @(0x0422, 0x0440, 0x0435, 0x043A, 0x0438)
+    $uiWordWith = New-DeckPipeUnicodeString -CodePoints @(0x0441)
+    $uiWordErrorsPlural = New-DeckPipeUnicodeString -CodePoints @(0x043E, 0x0448, 0x0438, 0x0431, 0x043A, 0x0430, 0x043C, 0x0438)
+    $uiWordNoErrors = New-DeckPipeUnicodeString -CodePoints @(0x041E, 0x0448, 0x0438, 0x0431, 0x043E, 0x043A)
+    $uiWordNone = New-DeckPipeUnicodeString -CodePoints @(0x043D, 0x0435, 0x0442)
     $requiredControls = @(
         [pscustomobject]@{ Id = 'deezer_tab'; Name = 'Deezer' },
         [pscustomobject]@{ Id = 'soundcloud_tab'; Name = 'SoundCloud' },
-        [pscustomobject]@{ Id = 'search_tab'; Name = 'Поиск' },
-        [pscustomobject]@{ Id = 'errors_tab'; Name = 'Ошибки' },
-        [pscustomobject]@{ Id = 'save'; Name = 'Сохранить' },
-        [pscustomobject]@{ Id = 'bug_report'; Name = '🐞 Багрепорт' }
+        [pscustomobject]@{ Id = 'search_tab'; Name = $uiNameSearch },
+        [pscustomobject]@{ Id = 'errors_tab'; Name = $uiNameErrors },
+        [pscustomobject]@{ Id = 'save'; Name = $uiNameSave },
+        [pscustomobject]@{ Id = 'bug_report'; Name = $uiNameBugReport }
     )
     $normalSize = Set-DeckPipeClientSize -Handle $windowHandle -Width 1320 -Height 840
     $uiNormal = Wait-DeckPipeUiSnapshot -Handle $windowHandle -RequiredControls $requiredControls -PlaylistTitles $playlistTitles
@@ -751,10 +781,10 @@ try {
     $tabsReady = $uiNormal.required_visible_count -ge 4 -and $uiNormal.required_focusable_count -ge 4
     if ($IsolatedUi -and $tabsReady) {
         $tabResults = @(
-            Invoke-DeckPipeUiTab -Handle $windowHandle -TabId 'deezer' -ButtonName 'Deezer' -ExpectedStatePattern 'Выберите\s+плейлист\s+слева'
-            Invoke-DeckPipeUiTab -Handle $windowHandle -TabId 'soundcloud' -ButtonName 'SoundCloud' -ExpectedStatePattern 'Выберите\s+источник\s+слева'
-            Invoke-DeckPipeUiTab -Handle $windowHandle -TabId 'search' -ButtonName 'Поиск' -ExpectedStatePattern 'Слева\s+—\s+цель'
-            Invoke-DeckPipeUiTab -Handle $windowHandle -TabId 'errors' -ButtonName 'Ошибки' -ExpectedStatePattern 'Треки\s+с\s+ошибками|Ошибок\s+нет'
+            Invoke-DeckPipeUiTab -Handle $windowHandle -TabId 'deezer' -ButtonName 'Deezer' -ExpectedStatePattern ($uiWordChoose + '\s+' + $uiWordPlaylist + '\s+' + $uiWordLeft)
+            Invoke-DeckPipeUiTab -Handle $windowHandle -TabId 'soundcloud' -ButtonName 'SoundCloud' -ExpectedStatePattern ($uiWordChoose + '\s+' + $uiWordSource + '\s+' + $uiWordLeft)
+            Invoke-DeckPipeUiTab -Handle $windowHandle -TabId 'search' -ButtonName $uiNameSearch -ExpectedStatePattern ($uiWordLeftTitle + '\s+' + (New-DeckPipeUnicodeString -CodePoints @(0x2014)) + '\s+' + $uiWordTarget)
+            Invoke-DeckPipeUiTab -Handle $windowHandle -TabId 'errors' -ButtonName $uiNameErrors -ExpectedStatePattern ($uiWordTracks + '\s+' + $uiWordWith + '\s+' + $uiWordErrorsPlural + '|' + $uiWordNoErrors + '\s+' + $uiWordNone)
         )
         $isolatedTabInteractions = @($tabResults | Where-Object invoked).Count
         $allInvoked = @($tabResults | Where-Object { -not $_.invoked }).Count -eq 0

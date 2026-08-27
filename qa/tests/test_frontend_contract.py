@@ -37,6 +37,113 @@ def run_frontend_probe(probe_script):
         )
 
 
+def run_frontend_app_probe(probe_script):
+    source = read_text(FRONTEND / "app.js")
+    source = re.sub(
+        r"import\s+\{\s*invoke\s*\}\s+from\s+['\"]@tauri-apps/api/core['\"]\s*;",
+        "const invoke = async name => { globalThis.__invokeCalls.push(name); return globalThis.__invokeResult; };",
+        source,
+        count=1,
+    )
+    source = source.replace("\ninit();\n", "\n// init skipped by frontend behavior probe\n")
+    prelude = r"""
+class FakeClassList {
+  constructor(owner) { this.owner = owner; this.values = new Set(); }
+  add(...names) { names.forEach(name => this.values.add(name)); this.sync(); }
+  remove(...names) { names.forEach(name => this.values.delete(name)); this.sync(); }
+  contains(name) { return this.values.has(name); }
+  toggle(name, force) {
+    const enabled = force === undefined ? !this.values.has(name) : !!force;
+    if (enabled) this.values.add(name); else this.values.delete(name);
+    this.sync();
+    return enabled;
+  }
+  sync() { this.owner.className = [...this.values].join(' '); }
+}
+class FakeElement {
+  constructor(tag) {
+    this.tagName = tag.toUpperCase();
+    this.children = [];
+    this.dataset = {};
+    this.attributes = {};
+    this.className = '';
+    this.classList = new FakeClassList(this);
+    this.value = '';
+    this.checked = false;
+    this.disabled = false;
+    this._textContent = '';
+  }
+  set id(value) {
+    this._id = String(value);
+    if (globalThis.__elementMap) globalThis.__elementMap.set(`#${this._id}`, this);
+  }
+  get id() { return this._id || ''; }
+  set textContent(value) { this._textContent = String(value ?? ''); }
+  get textContent() {
+    return this._textContent + this.children.map(child => child && child.textContent !== undefined ? child.textContent : '').join('');
+  }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  getAttribute(name) { return this.attributes[name] || null; }
+  append(...items) { this.children.push(...items.flat().filter(item => item !== null && item !== undefined)); }
+  replaceChildren(...items) { this.children = []; this._textContent = ''; this.append(...items); }
+  querySelectorAll() { return []; }
+  closest() { return null; }
+  matches() { return false; }
+  addEventListener() {}
+  focus() { globalThis.document.activeElement = this; }
+  remove() { this.removed = true; }
+}
+const elements = new Map();
+globalThis.__elementMap = elements;
+function fixture(selector) {
+  const node = new FakeElement(selector.replace(/^[#.]/, '') || 'div');
+  if (selector === '#modalOverlay') node.classList.add('hidden');
+  elements.set(selector, node);
+  return node;
+}
+[
+  '#statusRegion', '#errorRegion', '#modalOverlay', '#modal', '#searchInput',
+  '#tracks', '#playlists', '#toolbar', '#pltitle', '#plpath', '#plstats',
+  '#flipBtn', '#searchFilters'
+].forEach(fixture);
+globalThis.__invokeCalls = [];
+globalThis.__invokeResult = {baseUrl: 'http://127.0.0.1:24680', token: 'packaged-token'};
+globalThis.window = {location: {protocol: 'tauri:', origin: 'http://tauri.localhost'}};
+globalThis.document = {
+  activeElement: null,
+  querySelector(selector) { return elements.get(selector) || fixture(selector); },
+  querySelectorAll() { return []; },
+  getElementById(id) { return elements.get(`#${id}`) || null; },
+  createElement(tag) { return new FakeElement(tag); },
+  createTextNode(value) { const node = new FakeElement('#text'); node.textContent = value; return node; },
+  addEventListener() {},
+};
+function collectActions(node, out = []) {
+  if (!node) return out;
+  if (node.dataset && node.dataset.action) {
+    out.push({
+      action: node.dataset.action,
+      label: node.textContent,
+      aria: node.getAttribute ? node.getAttribute('aria-label') : null,
+      title: node.title || '',
+    });
+  }
+  for (const child of node.children || []) collectActions(child, out);
+  return out;
+}
+"""
+    with tempfile.TemporaryDirectory() as td:
+        probe = Path(td) / "frontend-app-probe.mjs"
+        probe.write_text(prelude + "\n" + source + "\n" + probe_script, encoding="utf-8")
+        return subprocess.run(
+            ["node", str(probe)],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+
 class FrontendInteractionContractTests(unittest.TestCase):
     maxDiff = None
 
@@ -152,6 +259,131 @@ console.log(JSON.stringify({first, same: first === second, invokeCalls: globalTh
         self.assertIn('"invokeCalls":["backend_connection"]', result.stdout)
         self.assertIn('"writes":[]', result.stdout)
         self.assertIn('"cookie":""', result.stdout)
+
+    def test_rekordbox_sync_defaults_to_truthful_dry_run_without_legacy_fields(self):
+        result = run_frontend_app_probe(
+            r"""
+const fetchCalls = [];
+globalThis.fetch = async (url, request) => {
+  fetchCalls.push({url, body: JSON.parse(request.body)});
+  return {ok: true, json: async () => ({
+    dry_run: true,
+    applied: false,
+    reconciled: false,
+    unresolved: [{code: 'missing_desired_path'}],
+    backup_id: null,
+    error: null,
+    plan: {
+      hash: 'a'.repeat(64),
+      counts: {desired: 9, current: 8, resolved: 7, add: 2, remove: 1, reorder: 3, metadata: 4, path: 5, unresolved: 6},
+    },
+  })};
+};
+const confirms = [];
+globalThis.confirm = message => { confirms.push(message); return false; };
+current = {kind: 'deezer', id: 'playlist-1', title: 'Set One'};
+await rbSync();
+const status = elements.get('#statusRegion').textContent;
+console.log(JSON.stringify({
+  fetchCalls,
+  confirms,
+  status,
+  dryRunSaysNoMutation: status.includes('изменения не применялись'),
+  dryRunSaysNoBackup: status.includes('бэкап не создавался'),
+  error: elements.get('#errorRegion').textContent,
+}));
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        payload = __import__("json").loads(result.stdout)
+        self.assertEqual(len(payload["fetchCalls"]), 1)
+        self.assertRegex(payload["fetchCalls"][0]["url"], r"/api/rb/sync\?dry_run=true$")
+        self.assertEqual(payload["fetchCalls"][0]["body"], {"playlist_key": "playlist-1", "playlist_title": "Set One"})
+        self.assertEqual(payload["error"], "")
+        self.assertIn("Dry-run", payload["status"])
+        self.assertTrue(payload["dryRunSaysNoMutation"], payload["status"])
+        self.assertTrue(payload["dryRunSaysNoBackup"], payload["status"])
+        for text in ["add: 2", "remove: 1", "reorder: 3", "metadata: 4", "path: 5", "unresolved: 6"]:
+            self.assertIn(text, payload["status"])
+        self.assertNotIn("undefined", payload["status"])
+        self.assertNotRegex(payload["status"], r"added_content|added_to_playlist|result\.playlist|note")
+
+    def test_rekordbox_apply_requires_explicit_confirmation_token_and_reports_backup(self):
+        result = run_frontend_app_probe(
+            r"""
+const responses = [
+  {
+    dry_run: true,
+    applied: false,
+    reconciled: false,
+    unresolved: [],
+    backup_id: null,
+    error: null,
+    plan: {hash: 'b'.repeat(64), counts: {desired: 2, current: 1, resolved: 2, add: 1, remove: 0, reorder: 1, metadata: 0, path: 0, unresolved: 0}},
+  },
+  {
+    dry_run: false,
+    applied: true,
+    reconciled: true,
+    unresolved: [],
+    backup_id: 'backup-123',
+    error: null,
+    plan: {hash: 'c'.repeat(64), counts: {desired: 2, current: 1, resolved: 2, add: 1, remove: 0, reorder: 1, metadata: 0, path: 0, unresolved: 0}},
+  },
+];
+const fetchCalls = [];
+globalThis.fetch = async (url, request) => {
+  fetchCalls.push({url, body: JSON.parse(request.body)});
+  return {ok: true, json: async () => responses.shift()};
+};
+globalThis.confirm = () => true;
+const prompts = [];
+globalThis.prompt = message => { prompts.push(message); return 'APPLY_REKORDBOX_CHANGES'; };
+current = {kind: 'sc', id: 'source-7', title: 'SC Set'};
+await rbSync();
+console.log(JSON.stringify({fetchCalls, prompts, status: elements.get('#statusRegion').textContent}));
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        payload = __import__("json").loads(result.stdout)
+        self.assertEqual(len(payload["fetchCalls"]), 2)
+        self.assertRegex(payload["fetchCalls"][0]["url"], r"/api/rb/sync\?dry_run=true$")
+        self.assertRegex(payload["fetchCalls"][1]["url"], r"/api/rb/sync\?dry_run=false&confirmation_token=APPLY_REKORDBOX_CHANGES$")
+        self.assertEqual(payload["fetchCalls"][0]["body"], {"playlist_key": "sc:source-7", "playlist_title": "SC Set"})
+        self.assertEqual(payload["fetchCalls"][1]["body"], {"playlist_key": "sc:source-7", "playlist_title": "SC Set"})
+        self.assertEqual(len(payload["prompts"]), 1)
+        self.assertIn("APPLY_REKORDBOX_CHANGES", payload["prompts"][0])
+        self.assertIn("Apply", payload["status"])
+        self.assertIn("applied: yes", payload["status"])
+        self.assertIn("reconciled: yes", payload["status"])
+        self.assertIn("backup: backup-123", payload["status"])
+
+    def test_dynamic_add_download_and_search_actions_have_accessible_names(self):
+        result = run_frontend_app_probe(
+            r"""
+searchTarget = {key: 'dz1', title: 'Target', provider: 'deezer'};
+searchSel = {'deezer:0': {id: 't1', title: 'Track', artist: 'Artist', duration: 120, provider: 'deezer'}};
+const nodes = [
+  trackRow('deezer', 0, {id: 't1', title: 'Track', artist: 'Artist', duration: 120}),
+  ...albumRow('deezer', 0, {id: 'a1', title: 'Album', artist: 'Artist', count: 2}),
+];
+searchExpanded = {'deezer:0': {tracks: [{id: 'at1', title: 'Album Track', artist: 'Artist', duration: 90}]}};
+nodes.push(...albumRow('deezer', 0, {id: 'a1', title: 'Album', artist: 'Artist', count: 2}));
+_renderBasket();
+nodes.push(elements.get('#basket'));
+const actions = nodes.flatMap(node => collectActions(node)).filter(item =>
+  ['add-dz-track', 'dl-search-track', 'toggle-album', 'dl-album-track', 'dl-whole-album', 'dl-basket', 'clear-basket', 'track-checkbox'].includes(item.action));
+console.log(JSON.stringify(actions));
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        actions = __import__("json").loads(result.stdout)
+        self.assertTrue(actions, result.stdout)
+        labels = {item["action"]: item for item in actions}
+        for action in ["add-dz-track", "dl-search-track", "toggle-album", "dl-album-track", "dl-whole-album", "dl-basket", "clear-basket", "track-checkbox"]:
+            self.assertIn(action, labels)
+        for item in actions:
+            self.assertTrue((item.get("aria") or item.get("label") or item.get("title") or "").strip(), item)
 
 
 if __name__ == "__main__":

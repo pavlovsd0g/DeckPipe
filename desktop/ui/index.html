@@ -24,7 +24,7 @@
     <label class="sr-only" for="musicRoot">Корень библиотеки</label>
     <input id="musicRoot" placeholder="Корень библиотеки (общая папка, напр. E:\Music)" aria-label="Корень библиотеки">
     <button class="ghost" type="button" data-action="save-root">Сохранить</button>
-    <button class="ghost" type="button" data-action="send-report">🐞 Багрепорт</button>
+    <button class="ghost" type="button" data-action="send-report" aria-label="Отправить багрепорт">🐞 Багрепорт</button>
   </div>
 </header>
 <div id="statusRegion" class="live-region hidden" role="status" aria-live="polite"></div>
@@ -56,11 +56,11 @@
       </label>
       <button class="ghost" type="button" data-action="rescan">Пересканировать</button>
       <button class="ghost" type="button" data-action="bind-path">Папка плейлиста…</button>
-      <button type="button" data-action="download-selected">Скачать выбранные</button>
-      <button type="button" data-action="sync-playlist-order" title="Перенумеровать файлы по порядку в стриминге и докачать недостающие">Синк: по порядку</button>
-      <button type="button" data-action="sync-append" title="Не трогать текущие номера, новые треки — вниз списка">Синк: новые вниз</button>
-      <button class="ghost" type="button" data-action="rb-sync" title="Синхронизировать скачанные треки в Rekordbox (Rekordbox должен быть закрыт)">→ RB</button>
-      <button class="ghost" id="flipBtn" type="button" data-action="flip-wav" title="Конвертировать плейлист в WAV для CDJ с сохранением всех кью/сетки (Rekordbox закрыт)">⇄ WAV</button>
+      <button type="button" data-action="download-selected" aria-label="Скачать выбранные треки">Скачать выбранные</button>
+      <button type="button" data-action="sync-playlist-order" title="Перенумеровать файлы по порядку в стриминге и докачать недостающие" aria-label="Синхронизировать по порядку стриминга">Синк: по порядку</button>
+      <button type="button" data-action="sync-append" title="Не трогать текущие номера, новые треки — вниз списка" aria-label="Синхронизировать только новые треки вниз списка">Синк: новые вниз</button>
+      <button class="ghost" type="button" data-action="rb-sync" title="Синхронизировать скачанные треки в Rekordbox (Rekordbox должен быть закрыт)" aria-label="Проверить синхронизацию Rekordbox dry-run">→ RB</button>
+      <button class="ghost" id="flipBtn" type="button" data-action="flip-wav" title="Конвертировать плейлист в WAV для CDJ с сохранением всех кью/сетки (Rekordbox закрыт)" aria-label="Переключить WAV режим для Rekordbox">⇄ WAV</button>
     </div>
     <div id="searchbar" class="hidden" role="search">
       <label class="sr-only" for="searchInput">Трек, альбом или исполнитель</label>
@@ -71,7 +71,7 @@
         <option value="deezer">Deezer</option>
         <option value="sc">SoundCloud</option>
       </select>
-      <button type="button" data-action="run-search">Найти</button>
+      <button type="button" data-action="run-search" aria-label="Найти треки, альбомы или исполнителей">Найти</button>
     </div>
     <div id="searchFilters" role="toolbar" aria-label="Фильтры поиска">
       <button class="chip active" type="button" data-action="set-search-filter" data-filter="all" data-f="all">Все</button>

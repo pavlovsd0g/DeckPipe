@@ -91,6 +91,7 @@ var searchFilter = "all";
 var searchSel = {};
 var searchExpanded = {};
 var $ = (s) => document.querySelector(s);
+var RB_APPLY_CONFIRMATION_TOKEN = "APPLY_REKORDBOX_CHANGES";
 var FORMAT_CLASS_BY_VALUE = Object.freeze({
   aac: "fmt-aac",
   aiff: "fmt-aiff",
@@ -684,8 +685,8 @@ function _renderBasket() {
   const basket = oldBasket || create("div", { id: "basket" });
   replaceChildren(basket, [
     create("strong", { text: `${count} тр.` }),
-    button(`⬇ в цель: ${target}`, "dl-basket"),
-    button("✕ очистить", "clear-basket", { className: "ghost" })
+    button(`⬇ в цель: ${target}`, "dl-basket", { attrs: { "aria-label": `Скачать выбранные треки в цель: ${target}` } }),
+    button("✕ очистить", "clear-basket", { className: "ghost", attrs: { "aria-label": "Очистить выбранные треки" } })
   ]);
   if (!oldBasket) $("#tracks").append(basket);
 }
@@ -697,15 +698,25 @@ function trackRow(service, index, track) {
       className: "cb",
       checked: !!searchSel[_selKey(service, index)],
       action: "track-checkbox",
-      dataset: { service, index }
+      dataset: { service, index },
+      attrs: { "aria-label": `Выбрать ${track.title ?? "трек"}` }
     }),
     create("div", { className: "tt", title: `${track.title ?? ""} — ${track.artist ?? ""}` }, [
       text(track.title),
       create("span", { className: "meta", text: ` ${track.artist ?? ""} · ${fmtDur(track.duration)}` })
     ]),
     create("span", { className: `prov${service === "sc" ? " sc" : ""}`, text: service === "sc" ? "SC" : "DZ" }),
-    service === "deezer" ? button("＋", "add-dz-track", { className: "ghost", title: "Добавить в плейлист Deezer без скачивания", dataset: { index } }) : null,
-    button("⬇", "dl-search-track", { title: "Скачать в цель", dataset: { service, index } })
+    service === "deezer" ? button("＋", "add-dz-track", {
+      className: "ghost",
+      title: "Добавить в плейлист Deezer без скачивания",
+      dataset: { index },
+      attrs: { "aria-label": `Добавить ${track.title ?? "трек"} в плейлист Deezer без скачивания` }
+    }) : null,
+    button("⬇", "dl-search-track", {
+      title: "Скачать в цель",
+      dataset: { service, index },
+      attrs: { "aria-label": `Скачать ${track.title ?? "трек"} в выбранную цель` }
+    })
   ]);
 }
 function albumRow(service, index, album) {
@@ -714,7 +725,10 @@ function albumRow(service, index, album) {
   const toggle = button(`${expanded && expanded.tracks ? "▾" : "▸"} 💿 ${album.title}`, "toggle-album", {
     className: "srow exp",
     dataset: { service, index },
-    attrs: { "aria-expanded": expanded ? "true" : "false" }
+    attrs: {
+      "aria-expanded": expanded ? "true" : "false",
+      "aria-label": `${expanded ? "Свернуть" : "Раскрыть"} ${album.title}`
+    }
   });
   toggle.append(create("span", { className: "meta", text: ` ${album.artist ?? ""}${album.count ? ` · ${album.count} тр.` : ""}` }));
   toggle.append(create("span", { className: `prov${service === "sc" ? " sc" : ""}`, text: service === "sc" ? "SC" : "DZ" }));
@@ -732,12 +746,19 @@ function albumRow(service, index, album) {
           text(track.title),
           create("span", { className: "meta", text: ` ${track.artist ?? ""} · ${fmtDur(track.duration)}` })
         ]),
-        button("⬇", "dl-album-track", { title: "Скачать в цель", dataset: { service, index, trackIndex } })
+        button("⬇", "dl-album-track", {
+          title: "Скачать в цель",
+          dataset: { service, index, trackIndex },
+          attrs: { "aria-label": `Скачать ${track.title ?? "трек"} из альбома в выбранную цель` }
+        })
       ]));
     });
     expandedBox.append(create("div", { className: "srow" }, [
       create("div", { className: "tt dim", text: `${expanded.tracks.length} тр.` }),
-      button("⬇ все", "dl-whole-album", { dataset: { service, index } })
+      button("⬇ все", "dl-whole-album", {
+        dataset: { service, index },
+        attrs: { "aria-label": `Скачать весь альбом ${album.title}` }
+      })
     ]));
   }
   children.push(expandedBox);
@@ -1007,14 +1028,52 @@ async function syncAppend() {
 }
 async function rbSync() {
   const key = current.kind === "sc" ? `sc:${current.id}` : current.id;
-  if (!confirm(`Синхронизировать «${current.title}» в Rekordbox?
-Rekordbox должен быть ЗАКРЫТ. Бэкап master.db будет создан автоматически.`)) return;
+  const body = { playlist_key: key, playlist_title: current.title };
   try {
-    const result = await api("/api/rb/sync", { body: { playlist_key: key, playlist_title: current.title } });
-    showStatus(`Rekordbox: плейлист «${result.playlist}», новых треков: ${result.added_content}, добавлено в плейлист: ${result.added_to_playlist}. ${result.note}`);
+    const dryRun = await api("/api/rb/sync?dry_run=true", { body });
+    showStatus(formatRbSyncResult(dryRun));
+    if (dryRun.error) {
+      showError(new Error(`${dryRun.error.code}: ${dryRun.error.message}`), "rekordbox");
+      return;
+    }
+    if (!rbSyncHasChanges(dryRun)) return;
+    if (!confirm(`Dry-run для «${current.title}» готов. Применить экспериментальные изменения в Rekordbox?
+Rekordbox должен быть ЗАКРЫТ. Бэкап создается только после явного применения.`)) return;
+    const token = prompt(`Для применения введите точно: ${RB_APPLY_CONFIRMATION_TOKEN}`);
+    if (token !== RB_APPLY_CONFIRMATION_TOKEN) {
+      showStatus(`${formatRbSyncResult(dryRun)} Apply cancelled: изменения не применялись, бэкап не создавался.`);
+      return;
+    }
+    const applied = await api(`/api/rb/sync?dry_run=false&confirmation_token=${encodeURIComponent(RB_APPLY_CONFIRMATION_TOKEN)}`, { body });
+    showStatus(formatRbSyncResult(applied));
+    if (applied.error) showError(new Error(`${applied.error.code}: ${applied.error.message}`), "rekordbox");
   } catch (error) {
     showError(error, "rekordbox");
   }
+}
+function rbPlanCounts(result) {
+  return result && result.plan && result.plan.counts || {};
+}
+function rbCountValue(counts, name) {
+  return Number.isFinite(Number(counts[name])) ? Number(counts[name]) : 0;
+}
+function formatRbSyncCounts(result) {
+  const counts = rbPlanCounts(result);
+  return ["add", "remove", "reorder", "metadata", "path", "unresolved"].map((name) => `${name}: ${rbCountValue(counts, name)}`).join(", ");
+}
+function rbSyncHasChanges(result) {
+  const counts = rbPlanCounts(result);
+  return ["add", "remove", "reorder", "metadata", "path", "unresolved"].some((name) => rbCountValue(counts, name) > 0);
+}
+function formatRbSyncResult(result) {
+  const payload = result || {};
+  const mode = payload.dry_run === false ? "Apply" : "Dry-run";
+  const hash = payload.plan && payload.plan.hash ? `, hash: ${String(payload.plan.hash).slice(0, 12)}` : "";
+  const error = payload.error ? `, error: ${payload.error.code || "unknown"} ${payload.error.message || ""}` : "";
+  if (payload.dry_run === false) {
+    return `Rekordbox ${mode}: applied: ${payload.applied ? "yes" : "no"}, reconciled: ${payload.reconciled ? "yes" : "no"}, backup: ${payload.backup_id || "none"}, ${formatRbSyncCounts(payload)}${hash}${error}`;
+  }
+  return `Rekordbox ${mode}: изменения не применялись, бэкап не создавался, ${formatRbSyncCounts(payload)}${hash}${error}`;
 }
 async function flipWav() {
   const flipped = tracks.filter((track) => track.flipped).length;

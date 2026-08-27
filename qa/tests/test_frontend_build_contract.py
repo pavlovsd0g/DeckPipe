@@ -1,6 +1,7 @@
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -44,15 +45,102 @@ def run_frontend_transport_probe(probe_script):
     return result
 
 
-def extract_action_keys(source, table_name):
-    match = re.search(
-        rf"const\s+{re.escape(table_name)}\s*=\s*Object\.freeze\(\{{(?P<body>.*?)\n\}}\);",
+def run_frontend_action_probe(probe_script):
+    source = read_text(FRONTEND / "app.js")
+    source = re.sub(
+        r"import\s+\{\s*invoke\s*\}\s+from\s+['\"]@tauri-apps/api/core['\"]\s*;",
+        "const invoke = async () => ({baseUrl: 'http://127.0.0.1:24680', token: 'packaged-token'});",
         source,
-        re.DOTALL,
+        count=1,
     )
-    if not match:
-        return set()
-    return set(re.findall(r"^\s*'([^']+)'\s*:", match.group("body"), re.MULTILINE))
+    source = source.replace("\ninit();\n", "\n// init skipped by frontend action probe\n")
+    prelude = r"""
+class FakeClassList {
+  constructor(owner) { this.owner = owner; this.values = new Set(); }
+  add(...names) { names.forEach(name => this.values.add(name)); this.sync(); }
+  remove(...names) { names.forEach(name => this.values.delete(name)); this.sync(); }
+  contains(name) { return this.values.has(name); }
+  toggle(name, force) {
+    const enabled = force === undefined ? !this.values.has(name) : !!force;
+    if (enabled) this.values.add(name); else this.values.delete(name);
+    this.sync();
+    return enabled;
+  }
+  sync() { this.owner.className = [...this.values].join(' '); }
+}
+class FakeElement {
+  constructor(tag) {
+    this.tagName = tag.toUpperCase();
+    this.children = [];
+    this.dataset = {};
+    this.attributes = {};
+    this.className = '';
+    this.classList = new FakeClassList(this);
+    this.value = '';
+    this.checked = false;
+    this.disabled = false;
+    this._textContent = '';
+  }
+  set id(value) {
+    this._id = String(value);
+    if (globalThis.__elementMap) globalThis.__elementMap.set(`#${this._id}`, this);
+  }
+  get id() { return this._id || ''; }
+  set textContent(value) { this._textContent = String(value ?? ''); }
+  get textContent() {
+    return this._textContent + this.children.map(child => child && child.textContent !== undefined ? child.textContent : '').join('');
+  }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  getAttribute(name) { return this.attributes[name] || null; }
+  append(...items) { this.children.push(...items.flat().filter(item => item !== null && item !== undefined)); }
+  replaceChildren(...items) { this.children = []; this._textContent = ''; this.append(...items); }
+  querySelectorAll() { return []; }
+  closest() { return null; }
+  matches() { return false; }
+  addEventListener() {}
+  focus() {}
+  remove() { this.removed = true; }
+}
+const elements = new Map();
+globalThis.__elementMap = elements;
+function fixture(selector) {
+  const node = new FakeElement(selector.replace(/^[#.]/, '') || 'div');
+  if (selector === '#modalOverlay') node.classList.add('hidden');
+  elements.set(selector, node);
+  return node;
+}
+[
+  '#statusRegion', '#errorRegion', '#modalOverlay', '#modal', '#searchInput',
+  '#tracks', '#playlists', '#toolbar', '#pltitle', '#plpath', '#plstats',
+  '#flipBtn', '#searchFilters'
+].forEach(fixture);
+globalThis.window = {location: {protocol: 'tauri:', origin: 'http://tauri.localhost'}};
+globalThis.document = {
+  activeElement: null,
+  querySelector(selector) { return elements.get(selector) || fixture(selector); },
+  querySelectorAll() { return []; },
+  getElementById(id) { return elements.get(`#${id}`) || null; },
+  createElement(tag) { return new FakeElement(tag); },
+  createTextNode(value) { const node = new FakeElement('#text'); node.textContent = value; return node; },
+  addEventListener() {},
+};
+function collectActions(node, out = []) {
+  if (!node) return out;
+  if (node.dataset && node.dataset.action) out.push(node.dataset.action);
+  for (const child of node.children || []) collectActions(child, out);
+  return out;
+}
+"""
+    with tempfile.TemporaryDirectory() as td:
+        probe = Path(td) / "action-probe.mjs"
+        probe.write_text(prelude + "\n" + source + "\n" + probe_script, encoding="utf-8")
+        return subprocess.run(
+            ["node", str(probe)],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
 
 
 class FrontendBuildContractTests(unittest.TestCase):
@@ -161,6 +249,35 @@ class FrontendBuildContractTests(unittest.TestCase):
                     "styles.css",
                 ])
 
+    def test_installed_qa_validate_only_runs_under_windows_powershell_51_from_ascii_source(self):
+        powershell = shutil.which("powershell.exe")
+        if not powershell:
+            self.skipTest("Windows PowerShell is not available on this host")
+        runner = ROOT / "qa" / "run-installed-qa.ps1"
+        script_bytes = runner.read_bytes()
+        try:
+            script_bytes.decode("ascii")
+        except UnicodeDecodeError as error:
+            self.fail(f"run-installed-qa.ps1 must be ASCII-source safe for Windows PowerShell 5.1 UTF-8-without-BOM parsing: {error}")
+        result = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(runner),
+                "-ValidateOnly",
+                "-IsolatedUi",
+            ],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertRegex(result.stdout, r"VALID installed-runner mode=isolated-ui endpoints=9 samples=5")
+
     def test_emitted_assets_are_csp_safe(self):
         html = read_text(APP_STATIC / "index.html")
         js = read_text(APP_STATIC / "app.js")
@@ -238,15 +355,64 @@ console.log(JSON.stringify(outcomes));
         wrapper_start = js.rfind("async function api", 0, fetch_index)
         self.assertNotEqual(wrapper_start, -1, "fetch must live inside api transport wrapper")
 
-    def test_all_data_actions_are_fixed_and_represented_once(self):
+    def test_all_data_actions_are_created_by_real_dom_helpers_and_represented_once(self):
         source = read_text(FRONTEND / "app.js")
         html = read_text(FRONTEND / "index.html")
-        actions = set(re.findall(r"data-action=\"([a-z0-9-]+)\"", html + "\n" + source))
-        click_keys = extract_action_keys(source, "clickActions")
-        change_keys = extract_action_keys(source, "changeActions")
-        self.assertTrue(actions, "expected canonical UI actions")
+        static_actions = sorted(set(re.findall(r"data-action=\"([a-z0-9-]+)\"", html)))
+        result = run_frontend_action_probe(
+            "const documentHtmlActions = new Set(" + json.dumps(static_actions) + ");\n" + r"""
+globalThis.fetch = async url => {
+  const path = new URL(url).pathname;
+  const fixtures = {
+    '/api/errors': [{playlist_key: 'p1', playlist_title: 'Playlist', track: {title: 'Broken', artist: 'Artist'}, error: 'failed'}],
+    '/api/playlists': [{id: 'p1', title: 'Playlist', count: 1}],
+    '/api/sc/sources': [{id: 's1', title: 'Source', count: 1}],
+    '/api/local/playlists': [{key: 'local:one', title: 'Local', count: 1}],
+  };
+  return {ok: true, json: async () => fixtures[path] || []};
+};
+const emitted = new Set();
+for (const action of Array.from(documentHtmlActions)) emitted.add(action);
+for (const node of [
+  playlistControl('Playlist', create('img', {attrs: {alt: ''}}), [create('span', {text: 'Playlist'})], 'select-playlist', {id: 'p1', title: 'Playlist'}, false),
+  playlistControl('Source', create('img', {attrs: {alt: ''}}), [create('span', {text: 'Source'})], 'select-sc-source', {id: 's1', title: 'Source'}, false),
+  playlistControl('Target', create('img', {attrs: {alt: ''}}), [create('span', {text: 'Target'})], 'set-search-target', {index: 0}, false),
+  trackRow('deezer', 0, {id: 't1', title: 'Track', artist: 'Artist', duration: 10}),
+  ...albumRow('deezer', 0, {id: 'a1', title: 'Album', artist: 'Artist', count: 2}),
+]) {
+  collectActions(node).forEach(action => emitted.add(action));
+}
+searchExpanded = {'deezer:0': {tracks: [{id: 'a1t1', title: 'Album Track', artist: 'Artist', duration: 20}]}};
+albumRow('deezer', 0, {id: 'a1', title: 'Album', artist: 'Artist', count: 2}).forEach(node =>
+  collectActions(node).forEach(action => emitted.add(action)));
+searchTarget = {key: 'target', title: 'Target', provider: 'deezer'};
+searchSel = {'deezer:0': {id: 't1', title: 'Track', artist: 'Artist', duration: 10, provider: 'deezer'}};
+_renderBasket();
+collectActions(elements.get('#basket')).forEach(action => emitted.add(action));
+tracks = [{id: 't1', title: 'Track', artist: 'Artist', album: 'Album', duration: 10, status: 'missing'}];
+renderTracks();
+collectActions(elements.get('#tracks')).forEach(action => emitted.add(action));
+window._errors = [{playlist_key: 'p1', playlist_title: 'Playlist', track: {title: 'Broken', artist: 'Artist'}, error: 'failed'}];
+await loadErrors();
+collectActions(elements.get('#playlists')).forEach(action => emitted.add(action));
+await loadSearchTargets();
+collectActions(elements.get('#playlists')).forEach(action => emitted.add(action));
+console.log(JSON.stringify({
+  emitted: [...emitted].sort(),
+  click: Object.keys(clickActions).sort(),
+  change: Object.keys(changeActions).sort(),
+}));
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        payload = json.loads(result.stdout)
+        emitted = set(payload["emitted"])
+        click_keys = set(payload["click"])
+        change_keys = set(payload["change"])
+        self.assertNotIn("ACTION_MARKUP_CONTRACT", source)
+        self.assertTrue(emitted, "expected canonical UI actions")
         self.assertFalse(click_keys & change_keys, f"action keys must belong to exactly one handler map: {click_keys & change_keys}")
-        self.assertEqual(actions, click_keys | change_keys)
+        self.assertEqual(emitted, click_keys | change_keys)
 
     def test_external_values_are_not_raw_in_generated_attributes_or_classes(self):
         source = read_text(FRONTEND / "app.js")
