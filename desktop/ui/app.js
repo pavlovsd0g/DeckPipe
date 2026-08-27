@@ -207,9 +207,7 @@ function openLogin(service) {
   } else {
     setHidden($("#loginPasswordBlock"), true);
     $("#loginTitle").textContent = "Вход в SoundCloud";
-    $("#loginSteps").innerHTML = `<b>Способ 1 — расширение DeckPipe Helper</b> (папка extension/):<br>
-      opera://extensions → Режим разработчика → Загрузить распакованное → клик по иконке DeckPipe — вход подхватится из браузера сам.<br>
-      <b>Способ 2 — вручную:</b> F12 → Application → Cookies → <b>oauth_token</b> на soundcloud.com → вставить ниже`;
+    $("#loginSteps").innerHTML = `<b>Вручную:</b> F12 → Application → Cookies → <b>oauth_token</b> на soundcloud.com → вставить ниже`;
     $("#loginToken").placeholder = "oauth_token cookie";
   }
   setHidden($("#modalOverlay"), false);

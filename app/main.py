@@ -3,6 +3,7 @@
 import asyncio
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import requests
@@ -12,10 +13,31 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import jobs, library
-from .deezer_client import load_config, get_session
+from .deezer_client import (
+    CONFIG_PATH,
+    SECRET_STORE_PATH,
+    get_deezer_arl,
+    get_session,
+    load_config,
+    set_deezer_arl,
+    set_soundcloud_oauth,
+)
 from .security import LoopbackSecurityMiddleware, SecuritySettings
 
-app = FastAPI(title="DeckPipe", docs_url=None, redoc_url=None, openapi_url=None)
+
+async def run_startup_migrations() -> None:
+    from .secure_store import migrate_legacy_config
+
+    migrate_legacy_config(config_path=CONFIG_PATH, store_path=SECRET_STORE_PATH)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await run_startup_migrations()
+    yield
+
+
+app = FastAPI(title="DeckPipe", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 app.add_middleware(LoopbackSecurityMiddleware, settings=SecuritySettings.from_env())
 STATIC = Path(__file__).parent / "static"
 APP_VERSION = "0.5.0"
@@ -36,9 +58,7 @@ async def fetch_playlists():
     ts, data = _cache["playlists"]
     if data is not None and time.time() - ts < PLAYLISTS_TTL:
         return data
-    from deezer_python_gql import DeezerGQLClient
-    arl = load_config().get("arl")
-    client = DeezerGQLClient(arl=arl)
+    client = _deezer_gql_client()
     res = await client.get_user_playlists()
     out = []
     for e in res.playlists.edges:
@@ -50,6 +70,12 @@ async def fetch_playlists():
         })
     _cache["playlists"] = (time.time(), out)
     return out
+
+
+def _deezer_gql_client():
+    from deezer_python_gql import DeezerGQLClient
+
+    return DeezerGQLClient(arl=get_deezer_arl())
 
 
 def fetch_tracks(playlist_id: str):
@@ -90,8 +116,7 @@ def _fetch_tracks_public(playlist_id: str) -> list:
 
 
 async def _fetch_tracks_graphql(playlist_id: str) -> list:
-    from deezer_python_gql import DeezerGQLClient
-    client = DeezerGQLClient(arl=load_config().get("arl"))
+    client = _deezer_gql_client()
     tracks, after = [], None
     while True:
         pl = await client.get_playlist(playlist_id=playlist_id,
@@ -138,7 +163,7 @@ def api_config():
         user = {"id": ds.user["USER_ID"], "email": ds.user.get("EMAIL")}
     except Exception as e:
         user = {"error": str(e)}
-    return {"music_root": str(library.music_root()), "arl_set": bool(cfg.get("arl")),
+    return {"music_root": str(library.music_root()), "arl_set": bool(get_deezer_arl()),
             "wav_mode": cfg.get("wav_mode", "source"),
             "numbering": cfg.get("numbering", True),
             "sc_user": cfg.get("sc_username") or None,
@@ -415,41 +440,6 @@ class LoginScIn(BaseModel):
     oauth_token: str
 
 
-class LoginFromBrowserIn(BaseModel):
-    arl: str | None = None
-    oauth_token: str | None = None
-
-
-@app.post("/api/login/from-browser")
-def api_login_from_browser(body: LoginFromBrowserIn):
-    """Токены из браузерного расширения DeckPipe Helper."""
-    out = {}
-    if body.arl:
-        from .deezer_client import DeezerSession, _session_cache
-        try:
-            ds = DeezerSession(body.arl.strip())
-            cfg = load_config()
-            cfg["arl"] = body.arl.strip()
-            save_config(cfg)
-            _session_cache["session"] = None
-            out["deezer"] = ds.user.get("EMAIL")
-        except Exception as e:
-            out["deezer_error"] = str(e)
-    if body.oauth_token:
-        try:
-            user = soundcloud.sc_validate(body.oauth_token.strip())
-            cfg = load_config()
-            cfg["sc_oauth"] = body.oauth_token.strip()
-            cfg["sc_username"] = user.get("username", "")
-            save_config(cfg)
-            out["sc"] = user.get("username")
-        except Exception as e:
-            out["sc_error"] = str(e)
-    if not out:
-        raise HTTPException(400, "пустые токены")
-    return out
-
-
 @app.post("/api/login/deezer/password")
 def api_login_deezer_password(body: LoginPasswordIn):
     """Вход в Deezer по email+паролю (как в Saturn)."""
@@ -458,9 +448,7 @@ def api_login_deezer_password(body: LoginPasswordIn):
         ds, arl = login_with_password(body.email.strip(), body.password)
     except Exception as e:
         raise HTTPException(401, str(e))
-    cfg = load_config()
-    cfg["arl"] = arl
-    save_config(cfg)
+    set_deezer_arl(arl)
     _session_cache["session"] = ds
     _session_cache["arl"] = arl
     return {"id": ds.user["USER_ID"], "email": ds.user.get("EMAIL")}
@@ -468,14 +456,12 @@ def api_login_deezer_password(body: LoginPasswordIn):
 
 @app.post("/api/login/deezer")
 def api_login_deezer(body: LoginDeezerIn):
-    from .deezer_client import DeezerSession, save_config, _session_cache
+    from .deezer_client import DeezerSession, _session_cache
     try:
         ds = DeezerSession(body.arl.strip())
     except Exception as e:
         raise HTTPException(401, f"ARL не принят: {e}")
-    cfg = load_config()
-    cfg["arl"] = body.arl.strip()
-    save_config(cfg)
+    set_deezer_arl(body.arl.strip())
     _session_cache["session"] = None  # сброс кеша сессии
     return {"id": ds.user["USER_ID"], "email": ds.user.get("EMAIL")}
 
@@ -487,8 +473,8 @@ def api_login_sc(body: LoginScIn):
         user = soundcloud.sc_validate(token)
     except Exception as e:
         raise HTTPException(401, f"oauth_token не принят: {e}")
+    set_soundcloud_oauth(token)
     cfg = load_config()
-    cfg["sc_oauth"] = token
     cfg["sc_username"] = user.get("username", "")
     save_config(cfg)
     return {"id": user.get("id"), "username": user.get("username")}
@@ -638,8 +624,7 @@ async def api_search_download(body: SearchDownloadIn):
         dz_ids = [str(t["id"]) for t in body.tracks if t.get("provider", "deezer") == "deezer"]
         if dz_ids:
             try:
-                from deezer_python_gql import DeezerGQLClient
-                client = DeezerGQLClient(arl=load_config().get("arl"))
+                client = _deezer_gql_client()
                 await client.add_tracks_to_playlist(playlist_id=body.target_key, track_ids=dz_ids)
                 added_remote = len(dz_ids)
                 _cache["tracks"].pop(body.target_key, None)
@@ -662,8 +647,7 @@ class DzCreateIn(BaseModel):
 async def api_dz_add(body: DzAddIn):
     """Добавить треки в плейлист Deezer без скачивания."""
     try:
-        from deezer_python_gql import DeezerGQLClient
-        client = DeezerGQLClient(arl=load_config().get("arl"))
+        client = _deezer_gql_client()
         await client.add_tracks_to_playlist(playlist_id=body.playlist_id,
                                             track_ids=[str(i) for i in body.track_ids])
         _cache["playlists"] = (0, None)
@@ -677,8 +661,7 @@ async def api_dz_add(body: DzAddIn):
 async def api_dz_create(body: DzCreateIn):
     """Создать плейлист в Deezer (+ опционально сразу добавить треки)."""
     try:
-        from deezer_python_gql import DeezerGQLClient
-        client = DeezerGQLClient(arl=load_config().get("arl"))
+        client = _deezer_gql_client()
         pl = await client.create_playlist(title=body.title, is_private=False, is_collaborative=False)
         inner = getattr(pl, "playlist", pl)
         pid = str(getattr(inner, "id"))

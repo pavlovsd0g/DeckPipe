@@ -224,6 +224,7 @@ class DesktopContractTests(unittest.TestCase):
                 {
                     "APPDATA": appdata,
                     "LOCALAPPDATA": localappdata,
+                    "DECKPIPE_DATA_DIR": str(Path(appdata) / "DeckPipeTestData"),
                     "DECKPIPE_API_TOKEN": SENTINEL_TOKEN,
                     "DECKPIPE_PARENT_PID": str(os.getpid()),
                     "PYTHONPATH": str(ROOT),

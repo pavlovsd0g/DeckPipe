@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import requests
@@ -30,32 +31,80 @@ FILESIZE_KEY = {"FLAC": "FILESIZE_FLAC", "MP3_320": "FILESIZE_MP3_320", "MP3_128
 
 
 def _data_dir() -> Path:
-    """Конфиг/данные: рядом с проектом в dev, %APPDATA%\\DeckPipe в сборке."""
-    if getattr(sys, "frozen", False):
-        d = Path(os.environ.get("APPDATA", ".")) / "DeckPipe"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
-    return Path(__file__).parent.parent
+    """Per-user app data; tests may inject DECKPIPE_DATA_DIR."""
+    override = os.environ.get("DECKPIPE_DATA_DIR") if not getattr(sys, "frozen", False) else None
+    if override:
+        d = Path(override)
+    else:
+        base = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+        if base:
+            d = Path(base) / "DeckPipe"
+        else:
+            d = Path.home() / ".deckpipe"
+    return d
 
 
 ROOT = _data_dir()
 CONFIG_PATH = ROOT / "config.local.json"
+SECRET_STORE_PATH = ROOT / "secrets.dpapi"
+SECRET_CONFIG_FIELDS = ("arl", "sc_oauth")
 
 
 def load_config() -> dict:
     if CONFIG_PATH.exists():
         try:
-            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         except UnicodeDecodeError:
             # старый конфиг мог быть прочитан/переписан в cp1251 — чиним
-            return json.loads(CONFIG_PATH.read_text(encoding="cp1251"))
-    return {}
+            cfg = json.loads(CONFIG_PATH.read_text(encoding="cp1251"))
+    else:
+        cfg = {}
+    for field in SECRET_CONFIG_FIELDS:
+        cfg.pop(field, None)
+    return cfg
 
 
 def save_config(cfg: dict):
-    tmp = CONFIG_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(CONFIG_PATH)
+    cfg = dict(cfg)
+    reserved = sorted(field for field in SECRET_CONFIG_FIELDS if field in cfg)
+    if reserved:
+        raise ValueError("config.local.json cannot store credential fields")
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_PATH.with_name(f".{CONFIG_PATH.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(cfg, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, CONFIG_PATH)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _secure_store():
+    from .secure_store import SecureCredentialStore
+
+    return SecureCredentialStore(SECRET_STORE_PATH)
+
+
+def get_deezer_arl() -> str | None:
+    return _secure_store().get_deezer_arl()
+
+
+def set_deezer_arl(arl: str) -> None:
+    _secure_store().set_deezer_arl(arl)
+
+
+def get_soundcloud_oauth() -> str | None:
+    return _secure_store().get_soundcloud_oauth()
+
+
+def set_soundcloud_oauth(token: str) -> None:
+    _secure_store().set_soundcloud_oauth(token)
 
 
 def sanitize_filename(name: str) -> str:
@@ -203,10 +252,9 @@ _session_cache = {"session": None, "arl": None, "ts": 0}
 
 def get_session() -> DeezerSession:
     """Кешированная сессия (пересоздаём, если ARL сменился или прошло >10 мин)."""
-    cfg = load_config()
-    arl = cfg.get("arl")
+    arl = get_deezer_arl()
     if not arl:
-        raise RuntimeError("ARL не задан в config.local.json")
+        raise RuntimeError("Deezer login is not configured")
     now = time.time()
     if (_session_cache["session"] is None or _session_cache["arl"] != arl
             or now - _session_cache["ts"] > 600):

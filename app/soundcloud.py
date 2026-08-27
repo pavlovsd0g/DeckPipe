@@ -2,13 +2,14 @@
 """SoundCloud-провайдер через yt-dlp: резолв плейлистов/страниц и скачивание.
 Плюс авторизация по oauth_token (cookie) — плейлисты и лайки аккаунта."""
 import time
+from http.cookiejar import Cookie
 from pathlib import Path
 
 import requests
 import yt_dlp
 import imageio_ffmpeg
 
-from .deezer_client import sanitize_filename, load_config, save_config
+from .deezer_client import sanitize_filename, get_soundcloud_oauth
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 SC_API = "https://api-v2.soundcloud.com"
@@ -20,7 +21,7 @@ TTL = 600  # 10 мин: рейт-лимит SC делает повторные �
 # ---------- авторизация ----------
 
 def sc_oauth_token() -> str | None:
-    return load_config().get("sc_oauth")
+    return get_soundcloud_oauth()
 
 
 _CID_FALLBACK = "sUn5toeW5d8MC2jOLpE2yAibTG7RRYsA"
@@ -115,18 +116,43 @@ def sc_account_playlists(token: str) -> list:
     return out
 
 
-def _oauth_cookiefile() -> str | None:
-    """Netscape cookie-файл с oauth_token для yt-dlp (лайки, приватное)."""
-    token = sc_oauth_token()
+def _soundcloud_cookiejar(token: str):
+    jar = yt_dlp.cookies.YoutubeDLCookieJar()
+    jar.set_cookie(
+        Cookie(
+            version=0,
+            name="oauth_token",
+            value=token,
+            port=None,
+            port_specified=False,
+            domain=".soundcloud.com",
+            domain_specified=True,
+            domain_initial_dot=True,
+            path="/",
+            path_specified=True,
+            secure=True,
+            expires=None,
+            discard=True,
+            comment=None,
+            comment_url=None,
+            rest={"HttpOnly": None},
+            rfc2109=False,
+        )
+    )
+    return jar
+
+
+def _youtube_dl_opts_with_oauth(opts: dict, token: str | None) -> dict:
     if not token:
-        return None
-    from .deezer_client import ROOT
-    p = ROOT / ".sc_cookies.txt"
-    if not p.exists() or token not in p.read_text():
-        p.write_text(
-            "# Netscape HTTP Cookie File\n"
-            f".soundcloud.com\tTRUE\t/\tTRUE\t2000000000\toauth_token\t{token}\n")
-    return str(p)
+        return dict(opts)
+    jar = _soundcloud_cookiejar(token)
+    return {**opts, "cookiejar": jar}
+
+
+def _bind_cookiejar(ytdl, opts: dict) -> None:
+    jar = opts.get("cookiejar")
+    if jar is not None:
+        ytdl.__dict__["cookiejar"] = jar
 
 
 def _track_from_api(t: dict) -> dict:
@@ -226,12 +252,15 @@ def _resolve_api(url: str, token: str | None) -> dict:
 def _resolve_likes(url: str) -> dict:
     """Лайки — только yt-dlp с oauth-cookie (публичный API их закрыл).
     Затем добиваем artist/duration батчами через api-v2 /tracks?ids=."""
-    cookies = _oauth_cookiefile()
-    if not cookies:
+    token = sc_oauth_token()
+    if not token:
         raise RuntimeError("лайки доступны после входа (SC: вход)")
-    opts = {"quiet": True, "ignoreerrors": True, "extract_flat": True,
-            "cookiefile": cookies}
+    opts = _youtube_dl_opts_with_oauth(
+        {"quiet": True, "ignoreerrors": True, "extract_flat": True},
+        token,
+    )
     with yt_dlp.YoutubeDL(opts) as y:
+        _bind_cookiejar(y, opts)
         info = y.extract_info(url, download=False)
     if not info:
         raise RuntimeError("yt-dlp не смог прочитать лайки")
@@ -284,10 +313,9 @@ def download_track(track: dict, out_dir: Path):
         "ffmpeg_location": FFMPEG,
         "postprocessor_args": ["-movflags", "+faststart"],
     }
-    cookies = _oauth_cookiefile()
-    if cookies:
-        opts["cookiefile"] = cookies
+    opts = _youtube_dl_opts_with_oauth(opts, sc_oauth_token())
     with yt_dlp.YoutubeDL(opts) as y:
+        _bind_cookiejar(y, opts)
         info = y.extract_info(track["url"], download=True)
         fpath = Path(y.prepare_filename(info))
     # yt-dlp может поменять расширение после пост-обработки

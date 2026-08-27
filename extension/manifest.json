@@ -2,19 +2,10 @@
   "manifest_version": 3,
   "name": "DeckPipe Helper",
   "version": "0.5.0",
-  "description": "Вход в DeckPipe одним кликом: передаёт deezer.com / soundcloud.com cookie в локальное приложение DeckPipe.",
-  "permissions": ["cookies"],
-  "host_permissions": [
-    "https://www.deezer.com/*",
-    "https://soundcloud.com/*",
-    "http://127.0.0.1/*",
-    "http://localhost/*"
-  ],
+  "description": "Статичное уведомление: вход выполняется в DeckPipe Desktop.",
+  "permissions": [],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "DeckPipe: отправить вход"
-  },
-  "background": {
-    "service_worker": "background.js"
+    "default_title": "DeckPipe Desktop"
   }
 }
