@@ -24,7 +24,7 @@ class FakeRekordboxAdapter:
         shared: dict | None = None,
     ) -> None:
         self.root = Path(root)
-        self._shared = shared or {}
+        self._shared = {} if shared is None else shared
         self.db_path = self.root / "master.db"
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.db_path.exists():
@@ -42,9 +42,11 @@ class FakeRekordboxAdapter:
         self._shared.setdefault("restored", [dict(item) for item in (restored or snapshot)])
         self._shared.setdefault("events", [])
         self._shared.setdefault("handles", [])
+        self._shared.setdefault("open_handles", 0)
         self._shared.setdefault("reopen_snapshots", [])
         self._shared.setdefault("fail_fresh_verify", False)
         self._shared.setdefault("fail_restore", False)
+        self._shared.setdefault("playlist_exists", True)
         self._snapshot = self._shared["snapshot"]
         self._restored = self._shared["restored"]
         self._force_reopen_snapshot = restored is not None
@@ -60,12 +62,21 @@ class FakeRekordboxAdapter:
         self.hold_apply_event: threading.Event | None = None
         self.release_apply_event: threading.Event | None = None
         self._shared["handles"].append(self)
+        self._shared["open_handles"] += 1
 
     def mutation_lock_path(self) -> Path:
+        if self._shared.get("fail_lock_path"):
+            raise RuntimeError("lock path leaked C:\\Users\\secret\\master.db")
         return self.lock_path
 
     def is_rekordbox_running(self) -> bool:
+        if self._shared.get("fail_running_check"):
+            raise RuntimeError("status leaked D:\\private\\master.db")
         return False
+
+    def playlist_exists(self, _playlist_name: str) -> bool:
+        self.events.append("playlist_exists")
+        return bool(self._shared.get("playlist_exists", True))
 
     def external_files_for_playlist(self, _playlist_name: str, _desired: list[dict]) -> list[Path]:
         return [self.anlz_path, self.xml_path, self.external_write_target]
@@ -73,14 +84,25 @@ class FakeRekordboxAdapter:
     def snapshot_playlist(self, _playlist_name: str) -> list[dict]:
         if self.closed:
             raise RuntimeError("closed handle snapshot at C:\\Users\\secret\\master.db")
+        if self._shared.get("assert_lock_exists_on_snapshot") and not self.lock_path.exists():
+            raise RuntimeError("snapshot before lock at C:\\Users\\secret\\master.db")
         self.events.append("snapshot")
         if self._shared.get("fail_fresh_verify"):
             raise RuntimeError("verify failed at D:\\private\\master.db")
+        if (
+            self.db_path.exists()
+            and self._shared.get("committed")
+            and self.db_path.read_bytes() == b"db-before"
+            and self._shared.get("snapshot") != self._restored
+        ):
+            self._shared["snapshot"] = [dict(item) for item in self._restored]
         return [dict(item) for item in self._shared["snapshot"]]
 
     def begin(self) -> None:
         self.begin_count += 1
         self.events.append("begin")
+        if self.fail_at == "begin":
+            raise RuntimeError("begin failed at C:\\Users\\secret\\master.db")
 
     def apply_operations(self, operations: dict) -> None:
         self.events.append("apply")
@@ -90,6 +112,12 @@ class FakeRekordboxAdapter:
                 self.release_apply_event.wait(timeout=5)
         if self.fail_at == "apply":
             raise RuntimeError("C:\\Users\\secret\\apply failed")
+        if not self._shared.get("playlist_exists", True):
+            if operations.get("_create_missing"):
+                self.events.append("create_playlist")
+                self._shared["playlist_exists"] = True
+            else:
+                raise RuntimeError("playlist missing")
         self._shared["snapshot"] = [dict(item, rb_id=item.get("rb_id") or item["provider_id"]) for item in operations["desired_resolved"]]
 
     def save_external_files(self) -> None:
@@ -103,11 +131,16 @@ class FakeRekordboxAdapter:
         self.events.append("commit")
         if self.fail_at == "commit":
             raise RuntimeError("commit failed at E:\\music\\private")
+        self.db_path.write_bytes(b"db-mutated")
+        self._shared["committed"] = True
 
     def close(self) -> None:
+        if self.closed:
+            return
         self.close_count += 1
         self.events.append("close")
         self.closed = True
+        self._shared["open_handles"] -= 1
 
     def reopen(self):
         self.events.append("reopen")
@@ -349,6 +382,16 @@ class RekordboxSyncCoordinatorTests(unittest.TestCase):
         self.assertEqual([False, False, False, True], observed)
         os.environ["DECKPIPE_RB_EXPERIMENTAL"] = "1"
 
+    def test_apply_acquires_lock_before_authoritative_snapshot_and_status_backup(self) -> None:
+        desired, current = self.base_desired_current()
+        adapter = FakeRekordboxAdapter(self.root / "adapter-lock-order", current, shared={"assert_lock_exists_on_snapshot": True})
+
+        result = self.rb.sync_playlist("Playlist", desired, dry_run=False, adapter_factory=self.adapter_factory(adapter), confirmation_token=self.rb.APPLY_CONFIRMATION_TOKEN)
+
+        self.assertTrue(result["reconciled"])
+        self.assertEqual(["snapshot", "playlist_exists", "begin"], [event for event in adapter.events if event in {"snapshot", "playlist_exists", "begin"}][:3])
+        self.assertTrue(adapter.events.index("snapshot") < adapter.events.index("begin"))
+
     def test_apply_creates_unique_verified_backup_with_db_anlz_xml_and_missing_external_inventory(self) -> None:
         desired, current = self.base_desired_current()
         adapter = FakeRekordboxAdapter(self.root / "adapter", current)
@@ -402,7 +445,7 @@ class RekordboxSyncCoordinatorTests(unittest.TestCase):
         self.assertEqual(1, adapter.begin_count)
         self.assertEqual(1, adapter.commit_count)
         self.assertFalse(adapter.used_internal_commit_helper)
-        self.assertEqual(["snapshot", "begin", "apply", "external_save", "commit", "close", "reopen", "snapshot", "close"], adapter.events)
+        self.assertEqual(["snapshot", "playlist_exists", "begin", "apply", "external_save", "commit", "close", "reopen", "snapshot", "close"], adapter.events)
         self.assertEqual(1, len(callbacks))
         self.assertEqual("close", callbacks[0][0][-1])
 
@@ -432,7 +475,6 @@ class RekordboxSyncCoordinatorTests(unittest.TestCase):
                 self.assertEqual(code, result["error"]["code"])
                 self.assertNotRegex(json.dumps(result, ensure_ascii=False), r"[A-Z]:\\|secret|private")
                 self.assertEqual([], callbacks)
-                self.assertIn("restore", adapter.events)
                 self.assertGreaterEqual(adapter.events.count("close"), 2)
                 self.assertEqual(b"db-before", adapter.db_path.read_bytes())
                 self.assertFalse(adapter.external_write_target.exists())
@@ -447,19 +489,100 @@ class RekordboxSyncCoordinatorTests(unittest.TestCase):
         self.assertEqual("reconcile_failed", result["error"]["code"])
         self.assertFalse(result["applied"])
         self.assertFalse(result["reconciled"])
-        self.assertEqual(["snapshot", "begin", "apply", "external_save", "commit", "close", "reopen", "snapshot", "close", "restore", "reopen", "snapshot", "close"], adapter.events)
+        self.assertEqual(["snapshot", "playlist_exists", "begin", "apply", "external_save", "commit", "close", "reopen", "snapshot", "close", "reopen", "snapshot", "close"], adapter.events)
 
     def test_rollback_verification_failure_is_distinct_after_fresh_handle_restore_check(self) -> None:
         desired, current = self.base_desired_current()
-        shared = {"reopen_snapshots": [[dict(desired[0], title="Wrong")], [dict(current[0], title="Still Wrong")]]}
+        shared = {"reopen_snapshots": [[dict(desired[0], title="Wrong")]]}
         adapter = FakeRekordboxAdapter(self.root / "adapter-reconcile-bad-restore", current, shared=shared)
 
-        result = self.rb.sync_playlist("Playlist", desired, dry_run=False, adapter_factory=self.adapter_factory(adapter), confirmation_token=self.rb.APPLY_CONFIRMATION_TOKEN)
+        with patch.object(self.rb, "_restore_backup_files", side_effect=RuntimeError("restore failed at C:\\Users\\secret\\master.db")):
+            result = self.rb.sync_playlist("Playlist", desired, dry_run=False, adapter_factory=self.adapter_factory(adapter), confirmation_token=self.rb.APPLY_CONFIRMATION_TOKEN)
 
         self.assertEqual("rollback_verify_failed", result["error"]["code"])
         self.assertFalse(result["applied"])
         self.assertFalse(result["reconciled"])
         self.assertNotRegex(json.dumps(result, ensure_ascii=False), r"[A-Z]:\\|secret|private")
+
+    def test_rollback_restores_files_while_all_adapter_handles_are_closed_then_verifies_once(self) -> None:
+        desired, current = self.base_desired_current()
+        shared = {"open_handle_counts_during_restore": []}
+        adapter = FakeRekordboxAdapter(self.root / "adapter-handle-free-restore", current, fail_at="external", shared=shared)
+
+        def observed_restore(backup):
+            shared["open_handle_counts_during_restore"].append(shared["open_handles"])
+            Path(backup["files"]["database"]["path"]).write_bytes(Path(backup["files"]["database"]["backup"]).read_bytes())
+            for item in backup["files"]["external"]:
+                original = Path(item["path"])
+                if item["existed"]:
+                    original.write_bytes(Path(item["backup"]).read_bytes())
+                else:
+                    original.unlink(missing_ok=True)
+
+        with patch.object(self.rb, "_restore_backup_files", side_effect=observed_restore, create=True):
+            result = self.rb.sync_playlist("Playlist", desired, dry_run=False, adapter_factory=self.adapter_factory(adapter), confirmation_token=self.rb.APPLY_CONFIRMATION_TOKEN)
+
+        self.assertEqual("external_save_failed", result["error"]["code"])
+        self.assertEqual([0], shared["open_handle_counts_during_restore"])
+        self.assertTrue(all(handle.closed for handle in shared["handles"]))
+        self.assertEqual(2, shared["events"].count("snapshot"))
+        self.assertEqual(2, len(shared["handles"]))
+        self.assertEqual(b"db-before", adapter.db_path.read_bytes())
+        self.assertFalse(adapter.external_write_target.exists())
+
+    def test_rollback_verification_accepts_identical_snapshots_with_missing_paths(self) -> None:
+        missing = self.root / "missing-after-rollback.flac"
+        current = [track("deezer:missing", "Missing", "Artist", "Album", 12, 1, missing)]
+        desired = [track("deezer:missing", "Changed", "Artist", "Album", 12, 1, self.touch("present.flac"))]
+        adapter = FakeRekordboxAdapter(self.root / "adapter-missing-rollback", current, fail_at="external")
+
+        result = self.rb.sync_playlist("Playlist", desired, dry_run=False, adapter_factory=self.adapter_factory(adapter), confirmation_token=self.rb.APPLY_CONFIRMATION_TOKEN)
+
+        self.assertEqual("external_save_failed", result["error"]["code"])
+
+    def test_apply_structures_adapter_lifecycle_failures_and_closes_handles(self) -> None:
+        desired, current = self.base_desired_current()
+        cases = [
+            ({"fail_running_check": True}, None, "rekordbox_status_failed"),
+            ({"fail_lock_path": True}, None, "lock_failed"),
+            ({}, "begin", "begin_failed"),
+        ]
+        for shared_seed, fail_at, code in cases:
+            with self.subTest(code=code):
+                shared = dict(shared_seed)
+                adapter = FakeRekordboxAdapter(self.root / f"adapter-{code}", current, fail_at=fail_at, shared=shared)
+
+                try:
+                    result = self.rb.sync_playlist("Playlist", desired, dry_run=False, adapter_factory=self.adapter_factory(adapter), confirmation_token=self.rb.APPLY_CONFIRMATION_TOKEN)
+                except RuntimeError as exc:
+                    self.fail(f"sync_playlist leaked lifecycle exception: {exc}")
+
+                self.assertEqual(code, result["error"]["code"])
+                self.assertFalse(result["applied"])
+                self.assertFalse(result["reconciled"])
+                self.assertNotRegex(json.dumps(result, ensure_ascii=False), r"[A-Z]:\\|secret|private")
+                self.assertTrue(all(handle.closed for handle in shared["handles"]))
+
+    def test_missing_playlist_default_creates_inside_transaction_false_fails_without_mutation(self) -> None:
+        desired, _current = self.base_desired_current()
+        create_shared = {"playlist_exists": False}
+        create_adapter = FakeRekordboxAdapter(self.root / "adapter-create-playlist", [], shared=create_shared)
+
+        created = self.rb.sync_playlist("Missing Playlist", desired, dry_run=False, adapter_factory=self.adapter_factory(create_adapter), confirmation_token=self.rb.APPLY_CONFIRMATION_TOKEN)
+
+        self.assertTrue(created["reconciled"])
+        self.assertLess(create_adapter.events.index("begin"), create_adapter.events.index("create_playlist"))
+        self.assertLess(create_adapter.events.index("create_playlist"), create_adapter.events.index("commit"))
+
+        fail_shared = {"playlist_exists": False}
+        fail_adapter = FakeRekordboxAdapter(self.root / "adapter-no-create-playlist", [], shared=fail_shared)
+
+        failed = self.rb.sync_playlist("Missing Playlist", desired, create_missing=False, dry_run=False, adapter_factory=self.adapter_factory(fail_adapter), confirmation_token=self.rb.APPLY_CONFIRMATION_TOKEN)
+
+        self.assertEqual("playlist_not_found", failed["error"]["code"])
+        self.assertEqual(0, fail_adapter.begin_count)
+        self.assertNotIn("apply", fail_adapter.events)
+        self.assertFalse(fail_shared["playlist_exists"])
 
     def test_add_operation_preserves_non_empty_metadata_not_path_only(self) -> None:
         media = self.touch("new.flac")
@@ -619,13 +742,205 @@ class RekordboxAdapterMutationContractTests(unittest.TestCase):
         self.assertEqual(["rb-keep", "rb-add"], [item.ContentID for item in adapter.db.added])
         self.assertEqual([1, 2], [item.TrackNo for item in adapter.db.added])
         self.assertEqual("Keep New", keep.Title)
-        self.assertEqual("Artist New", keep.Artist.Name)
-        self.assertEqual("Album New", keep.Album.Name)
+        self.assertEqual("Old Artist", keep.Artist.Name)
+        self.assertEqual("Old Album", keep.Album.Name)
         self.assertEqual(222, keep.Length)
         self.assertEqual("deezer:keep", keep.Commnt)
         self.assertEqual(str(media_keep), keep.FolderPath)
         self.assertEqual("keep.wav", keep.FileNameL)
         self.assertEqual([Path("C:/anlz/rb-add.DAT"), Path("C:/anlz/rb-keep.DAT")], sorted(adapter._staged_anlz))
+
+    def test_snapshot_playlist_orders_real_playlist_songs_by_track_number(self) -> None:
+        playlist = SimpleNamespace(ID="pl1", Name="Playlist", Attribute=0)
+        one = SimpleNamespace(ID="rb-one", Commnt="deezer:1", Title="One", Artist=SimpleNamespace(Name="A"), Album=SimpleNamespace(Name="B"), Length=1, FolderPath="C:/one.flac")
+        two = SimpleNamespace(ID="rb-two", Commnt="deezer:2", Title="Two", Artist=SimpleNamespace(Name="A"), Album=SimpleNamespace(Name="B"), Length=2, FolderPath="C:/two.flac")
+        songs = [
+            SimpleNamespace(ContentID="rb-two", TrackNo=2),
+            SimpleNamespace(ContentID="rb-one", TrackNo=1),
+        ]
+
+        class FakeDb:
+            def get_content(self):
+                return [one, two]
+
+            def get_playlist(self):
+                return [playlist]
+
+            def get_playlist_songs(self, **_kwargs):
+                return list(songs)
+
+        adapter = self.rb._PyrekordboxAdapter.__new__(self.rb._PyrekordboxAdapter)
+        adapter.db = FakeDb()
+
+        snapshot = adapter.snapshot_playlist("Playlist")
+
+        self.assertEqual(["deezer:1", "deezer:2"], [item["provider_id"] for item in snapshot])
+        self.assertEqual([1, 2], [item["position"] for item in snapshot])
+
+    def test_apply_operations_resolves_artist_album_ids_and_uses_canonical_add_content_payload(self) -> None:
+        class RelationshipGuard:
+            def __setattr__(self, key, value):
+                if key in {"Artist", "Album"} and isinstance(value, str):
+                    raise AssertionError(f"assigned string to relationship {key}")
+                super().__setattr__(key, value)
+
+        playlist = SimpleNamespace(ID="pl1", Name="Playlist", Attribute=0)
+        old_artist = SimpleNamespace(ID="artist-old", Name="Old Artist")
+        old_album = SimpleNamespace(ID="album-old", Name="Old Album")
+        sibling = RelationshipGuard()
+        sibling.ID = "rb-sibling"
+        sibling.Commnt = "deezer:sibling"
+        sibling.Title = "Sibling"
+        sibling.Artist = old_artist
+        sibling.ArtistID = old_artist.ID
+        sibling.Album = old_album
+        sibling.AlbumID = old_album.ID
+        sibling.Length = 111
+        sibling.FolderPath = "C:/old/sibling.flac"
+        sibling.OrgFolderPath = "C:/old/sibling.flac"
+        sibling.FileNameL = "sibling.flac"
+        sibling.FileSize = 7
+        sibling.FileType = 5
+        keep = RelationshipGuard()
+        keep.ID = "rb-keep"
+        keep.Commnt = "deezer:keep"
+        keep.Title = "Keep Old"
+        keep.Artist = old_artist
+        keep.ArtistID = old_artist.ID
+        keep.Album = old_album
+        keep.AlbumID = old_album.ID
+        keep.Length = 222
+        keep.FolderPath = "C:/old/keep.flac"
+        keep.OrgFolderPath = "C:/old/keep.flac"
+        keep.FileNameL = "keep.flac"
+        keep.FileNameS = "keep.flac"
+        keep.FileSize = 4
+        keep.FileType = 5
+        songs = [SimpleNamespace(ID="song-keep", PlaylistID="pl1", ContentID="rb-keep", TrackNo=1, Content=keep)]
+
+        class Query(list):
+            def filter_by(self, **kwargs):
+                return Query([item for item in self if all(getattr(item, key) == value for key, value in kwargs.items())])
+
+            def one_or_none(self):
+                if len(self) > 1:
+                    raise AssertionError("expected one or none")
+                return self[0] if self else None
+
+            def count(self):
+                return len(self)
+
+        class FakeDb:
+            def __init__(self):
+                self.artists = [old_artist]
+                self.albums = [old_album]
+                self.contents = [sibling, keep]
+                self.add_content_calls = []
+                self.commits = 0
+
+            def get_playlist(self):
+                return [playlist]
+
+            def get_playlist_songs(self, **_kwargs):
+                return list(songs)
+
+            def get_content(self):
+                return list(self.contents)
+
+            def get_artist(self, **kwargs):
+                return Query(self.artists).filter_by(**kwargs)
+
+            def get_album(self, **kwargs):
+                return Query(self.albums).filter_by(**kwargs)
+
+            def add_artist(self, name, **_kwargs):
+                artist = SimpleNamespace(ID=f"artist-{len(self.artists) + 1}", Name=name)
+                self.artists.append(artist)
+                return artist
+
+            def add_album(self, name, **_kwargs):
+                album = SimpleNamespace(ID=f"album-{len(self.albums) + 1}", Name=name)
+                self.albums.append(album)
+                return album
+
+            def add_content(self, path, **kwargs):
+                self.add_content_calls.append((Path(path), dict(kwargs)))
+                content = RelationshipGuard()
+                content.ID = "rb-added"
+                content.FolderPath = str(path)
+                content.OrgFolderPath = str(path)
+                content.FileNameL = Path(path).name
+                content.FileNameS = Path(path).name
+                content.FileSize = Path(path).stat().st_size
+                content.FileType = 11
+                content.Artist = next(item for item in self.artists if item.ID == kwargs["ArtistID"])
+                content.ArtistID = kwargs["ArtistID"]
+                content.Album = next(item for item in self.albums if item.ID == kwargs["AlbumID"])
+                content.AlbumID = kwargs["AlbumID"]
+                content.Title = kwargs["Title"]
+                content.Commnt = kwargs["Commnt"]
+                content.Length = kwargs["Length"]
+                self.contents.append(content)
+                return content
+
+            def generate_unused_id(self, *_args, **_kwargs):
+                return "legacy-created"
+
+            def read_anlz_files(self, content):
+                return {Path(f"C:/anlz/{content.ID}.DAT"): SimpleNamespace(set_path=lambda value: setattr(content, "staged_path", value), save=lambda _path: None)}
+
+            def add(self, _instance):
+                pass
+
+            def delete(self, _instance):
+                pass
+
+            def commit(self):
+                self.commits += 1
+
+            def remove_from_playlist(self, *_args, **_kwargs):
+                raise AssertionError("remove_from_playlist commits internally")
+
+            def update_content_path(self, *_args, **_kwargs):
+                raise AssertionError("update_content_path must not be used")
+
+        adapter = self.rb._PyrekordboxAdapter.__new__(self.rb._PyrekordboxAdapter)
+        adapter.db = FakeDb()
+        adapter.db_path = Path("C:/fake/master.db")
+        adapter._staged_anlz = {}
+        keep_media = self.root / "keep.wav"
+        keep_media.write_bytes(b"keep-new")
+        add_media = self.root / "add.wav"
+        add_media.write_bytes(b"added")
+        plan = {
+            "_playlist_name": "Playlist",
+            "_create_missing": True,
+            "desired_resolved": [
+                track("deezer:keep", "Keep New", "Artist New", "Album New", 333, 1, keep_media),
+                track("deezer:add", "Add New", "Artist Add", "Album Add", 444, 2, add_media),
+            ],
+        }
+
+        adapter.apply_operations(plan)
+
+        self.assertEqual("Old Artist", old_artist.Name)
+        self.assertEqual("Old Album", old_album.Name)
+        self.assertEqual("artist-2", keep.ArtistID)
+        self.assertEqual("album-2", keep.AlbumID)
+        self.assertEqual("artist-old", sibling.ArtistID)
+        self.assertEqual("album-old", sibling.AlbumID)
+        self.assertEqual("Old Artist", sibling.Artist.Name)
+        self.assertEqual("Old Album", sibling.Album.Name)
+        self.assertEqual(str(keep_media), keep.FolderPath)
+        self.assertEqual("keep.wav", keep.FileNameL)
+        self.assertEqual("keep.wav", keep.FileNameS)
+        self.assertEqual(keep_media.stat().st_size, keep.FileSize)
+        self.assertEqual(11, keep.FileType)
+        self.assertEqual("deezer:keep", keep.Commnt)
+        self.assertEqual(333, keep.Length)
+        self.assertEqual([(add_media, {"Title": "Add New", "ArtistID": "artist-3", "AlbumID": "album-3", "Commnt": "deezer:add", "Length": 444})], adapter.db.add_content_calls)
+        self.assertEqual([Path("C:/anlz/rb-keep.DAT")], sorted(adapter._staged_anlz))
+        self.assertEqual(0, adapter.db.commits)
 
 
 class RekordboxApiAndFlipGateTests(unittest.TestCase):
@@ -763,6 +1078,49 @@ class RekordboxApiAndFlipGateTests(unittest.TestCase):
         self.assertEqual("succeeded", job["outcome"])
         self.assertEqual(1, len(callbacks))
         self.assertLessEqual(job["workers"], jobs.MAX_REKORDBOX_FLIP_WORKERS)
+
+    def test_flip_worker_fails_terminally_when_rekordbox_callback_failed_after_db_reconcile(self) -> None:
+        from app import jobs, library
+
+        jobs.initialize(self.root / "data-callback-fail", start_worker=False)
+        playlist = self.root / "playlist-callback-fail"
+        playlist.mkdir()
+        source = playlist / "source.flac"
+        source.write_bytes(b"source")
+        wav = playlist / "source.wav"
+        wav.write_bytes(b"wav")
+        library.save_sidecar(
+            playlist,
+            {"tracks": {"1": {"provider": "deezer", "title": "Source", "artist": "Artist", "album": "Album", "duration_expected": 12, "position": 1, "file": source.name, "status": "ok"}}},
+        )
+
+        def fake_sync(_playlist_title, _desired, **_kwargs):
+            return {
+                "dry_run": False,
+                "applied": True,
+                "reconciled": True,
+                "unresolved": [],
+                "backup_id": "b-callback",
+                "error": {"code": "callback_failed", "message": "Rekordbox sync callback failed"},
+                "plan": {"counts": {"resolved": 1}},
+            }
+
+        with (
+            patch.object(jobs, "playlist_dir", return_value=playlist),
+            patch.object(jobs, "_wav_mode", return_value="source"),
+            patch.object(jobs, "verify_file", return_value=(True, "", 12.0)),
+            patch("app.jobs.convert_to_wav", create=True, return_value=wav),
+            patch.object(jobs.rb, "sync_playlist", side_effect=fake_sync),
+        ):
+            job_id = jobs.enqueue_flip("local:fixture", "Fixture", to_wav=True, start_worker=False, allow_rekordbox_apply=True)
+            jobs._flip_worker(job_id, True, 64)
+
+        sidecar = library.load_sidecar(playlist)
+        self.assertNotIn("flipped_to", sidecar["tracks"]["1"])
+        job = jobs.get_job(job_id)
+        self.assertEqual("failed", job["outcome"])
+        self.assertEqual("callback_failed", job["terminal_error"]["code"])
+        self.assertEqual(1, job["rb_updated"])
 
     def test_powershell_unicode_runner_requires_explicit_database_path_and_has_no_live_default(self) -> None:
         runner = Path("qa/run-rekordbox-unicode-audit.ps1")

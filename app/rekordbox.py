@@ -180,13 +180,16 @@ def plan_playlist_sync(desired: list[dict], current: list[dict] | None = None) -
 
 
 @contextmanager
-def _exclusive_create_lock(lock_path: Path) -> Iterator[bool]:
+def _exclusive_create_lock(lock_path: Path) -> Iterator[bool | None]:
     path = Path(lock_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
     except FileExistsError:
         yield False
+        return
+    except Exception:
+        yield None
         return
     try:
         os.write(fd, str(os.getpid()).encode("ascii", errors="ignore"))
@@ -289,6 +292,14 @@ def _rollback_quietly(handle: object | None) -> None:
         pass
 
 
+def _canonical_snapshot(items: list[dict]) -> list[dict]:
+    return [_canonical_track(dict(item), validate_path=False)[0] for item in items]
+
+
+def _is_exact_snapshot_match(expected_snapshot: list[dict], reopened_snapshot: list[dict]) -> bool:
+    return _canonical_snapshot(expected_snapshot) == _canonical_snapshot(reopened_snapshot)
+
+
 def _is_exact_reconciled(desired_resolved: list[dict], reopened_snapshot: list[dict]) -> bool:
     reopened_plan = plan_playlist_sync(desired_resolved, reopened_snapshot)
     return (
@@ -301,6 +312,27 @@ def _is_exact_reconciled(desired_resolved: list[dict], reopened_snapshot: list[d
     )
 
 
+def _restore_backup_files(backup: dict) -> None:
+    database = backup["files"]["database"]
+    db_original = Path(database["path"])
+    db_backup = Path(database["backup"])
+    shutil.copy2(db_backup, db_original)
+    if db_backup.read_bytes() != db_original.read_bytes():
+        raise RuntimeError("database restore verification failed")
+    for item in backup["files"]["external"]:
+        original = Path(item["path"])
+        backup_path = Path(item["backup"])
+        if item["existed"]:
+            original.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(backup_path, original)
+            if backup_path.read_bytes() != original.read_bytes():
+                raise RuntimeError("external restore verification failed")
+        else:
+            original.unlink(missing_ok=True)
+            if original.exists():
+                raise RuntimeError("external absence verification failed")
+
+
 def sync_playlist(
     pl_name: str,
     ordered_files: list,
@@ -311,112 +343,159 @@ def sync_playlist(
     confirmation_token: str | None = None,
     on_reconciled: Callable[[dict], None] | None = None,
 ) -> dict:
-    del create_missing
     adapter_factory = adapter_factory or _PyrekordboxAdapter
     adapter = adapter_factory()
     reopened = None
-    closed_adapter = None
     backup = None
+    current: list[dict] = []
+    plan: dict = plan_playlist_sync(ordered_files, [])
     try:
-        current = adapter.snapshot_playlist(pl_name)
-    except Exception:
-        _close_quietly(adapter)
-        return _failure("snapshot_failed", plan=plan_playlist_sync(ordered_files, []))
-    plan = plan_playlist_sync(ordered_files, current)
-    if dry_run:
-        _close_quietly(adapter)
-        return {"dry_run": True, "applied": False, "reconciled": False, "unresolved": plan["unresolved"], "backup_id": None, "backup": None, "plan": plan, "error": None}
-    if not _apply_authorized(confirmation_token):
-        _close_quietly(adapter)
-        return _failure("apply_not_confirmed", plan=plan)
-    if plan["unresolved"]:
-        _close_quietly(adapter)
-        return _failure("unresolved_items", plan=plan)
-    if adapter.is_rekordbox_running():
-        _close_quietly(adapter)
-        return _failure("rekordbox_running", plan=plan)
-
-    with _exclusive_create_lock(adapter.mutation_lock_path()) as acquired:
-        if not acquired:
-            _close_quietly(adapter)
-            return _failure("concurrent_apply", plan=plan)
-        try:
+        if dry_run:
             try:
-                backup = _create_backup(adapter, pl_name, plan["desired_resolved"])
+                current = adapter.snapshot_playlist(pl_name)
+            except Exception:
+                _close_quietly(adapter)
+                return _failure("snapshot_failed", plan=plan)
+            plan = plan_playlist_sync(ordered_files, current)
+            _close_quietly(adapter)
+            return {"dry_run": True, "applied": False, "reconciled": False, "unresolved": plan["unresolved"], "backup_id": None, "backup": None, "plan": plan, "error": None}
+        if not _apply_authorized(confirmation_token):
+            _close_quietly(adapter)
+            return _failure("apply_not_confirmed", plan=plan)
+        try:
+            lock_path = adapter.mutation_lock_path()
+        except Exception:
+            _close_quietly(adapter)
+            return _failure("lock_failed", plan=plan)
+        with _exclusive_create_lock(lock_path) as acquired:
+            if acquired is None:
+                _close_quietly(adapter)
+                return _failure("lock_failed", plan=plan)
+            if not acquired:
+                _close_quietly(adapter)
+                return _failure("concurrent_apply", plan=plan)
+            try:
+                current = adapter.snapshot_playlist(pl_name)
             except Exception:
                 _close_quietly(adapter)
                 adapter = None
-                return _failure("backup_failed", plan=plan)
-            adapter.begin()
+                return _failure("snapshot_failed", plan=plan)
+            plan = plan_playlist_sync(ordered_files, current)
+            if plan["unresolved"]:
+                _close_quietly(adapter)
+                adapter = None
+                return _failure("unresolved_items", plan=plan)
             try:
-                adapter.apply_operations({**plan, "_playlist_name": pl_name})
+                if adapter.is_rekordbox_running():
+                    _close_quietly(adapter)
+                    adapter = None
+                    return _failure("rekordbox_running", plan=plan)
             except Exception:
-                raise _SyncFailure("adapter_apply_failed") from None
-            try:
-                adapter.save_external_files()
-            except Exception:
-                raise _SyncFailure("external_save_failed") from None
-            try:
-                adapter.commit()
-            except Exception:
-                raise _SyncFailure("commit_failed") from None
-            adapter.close()
-            closed_adapter = adapter
-            adapter = None
-            try:
-                reopened = closed_adapter.reopen()
-                reopened_snapshot = reopened.snapshot_playlist(pl_name)
-            except Exception:
-                raise _SyncFailure("reopen_failed") from None
-            if not _is_exact_reconciled(plan["desired_resolved"], reopened_snapshot):
-                raise _SyncFailure("reconcile_failed") from None
-            _close_quietly(reopened)
-            reopened = None
-            result = {
-                "dry_run": False,
-                "applied": True,
-                "reconciled": True,
-                "unresolved": [],
-                "backup_id": backup["id"],
-                "backup": backup["summary"],
-                "plan": plan,
-                "plan_hash": plan["hash"],
-                "error": None,
-            }
-            if on_reconciled:
+                _close_quietly(adapter)
+                adapter = None
+                return _failure("rekordbox_status_failed", plan=plan)
+            playlist_exists = None
+            if hasattr(adapter, "playlist_exists"):
                 try:
-                    on_reconciled(result)
+                    playlist_exists = adapter.playlist_exists(pl_name)
                 except Exception:
-                    return _callback_failure(result)
-            return result
-        except _SyncFailure as exc:
-            original_code = exc.code
-            _close_quietly(reopened)
-            reopened = None
-            _rollback_quietly(adapter)
-            _close_quietly(adapter)
-            adapter = None
-            if backup is not None:
+                    _close_quietly(adapter)
+                    adapter = None
+                    return _failure("playlist_lookup_failed", plan=plan)
+            if not create_missing and playlist_exists is False:
+                _close_quietly(adapter)
+                adapter = None
+                return _failure("playlist_not_found", plan=plan)
+            operations = {**plan, "_playlist_name": pl_name, "_create_missing": bool(create_missing)}
+            transaction_open = False
+            committed = False
+            try:
                 try:
-                    restore_handle = closed_adapter or adapter_factory()
-                    restore_handle.restore_from_backup(backup)
+                    backup = _create_backup(adapter, pl_name, plan["desired_resolved"])
+                except Exception:
+                    _close_quietly(adapter)
+                    adapter = None
+                    return _failure("backup_failed", plan=plan)
+                try:
+                    adapter.begin()
+                    transaction_open = True
+                except Exception:
+                    _close_quietly(adapter)
+                    adapter = None
+                    return _failure("begin_failed", plan=plan, backup=backup)
+                try:
+                    adapter.apply_operations(operations)
+                except Exception:
+                    raise _SyncFailure("adapter_apply_failed") from None
+                try:
+                    adapter.save_external_files()
+                except Exception:
+                    raise _SyncFailure("external_save_failed") from None
+                try:
+                    adapter.commit()
+                    transaction_open = False
+                    committed = True
+                except Exception:
+                    raise _SyncFailure("commit_failed") from None
+                adapter.close()
+                adapter = None
+                try:
+                    reopened = adapter_factory()
+                    reopened_snapshot = reopened.snapshot_playlist(pl_name)
+                except Exception:
+                    raise _SyncFailure("reopen_failed") from None
+                if not _is_exact_reconciled(plan["desired_resolved"], reopened_snapshot):
+                    raise _SyncFailure("reconcile_failed") from None
+                _close_quietly(reopened)
+                reopened = None
+                result = {
+                    "dry_run": False,
+                    "applied": True,
+                    "reconciled": True,
+                    "unresolved": [],
+                    "backup_id": backup["id"],
+                    "backup": backup["summary"],
+                    "plan": plan,
+                    "plan_hash": plan["hash"],
+                    "error": None,
+                }
+                if on_reconciled:
+                    try:
+                        on_reconciled(result)
+                    except Exception:
+                        return _callback_failure(result)
+                return result
+            except _SyncFailure as exc:
+                original_code = exc.code
+                _close_quietly(reopened)
+                reopened = None
+                if transaction_open and not committed:
+                    _rollback_quietly(adapter)
+                _close_quietly(adapter)
+                adapter = None
+                if backup is not None:
+                    try:
+                        _restore_backup_files(backup)
+                    except Exception:
+                        return _failure("rollback_verify_failed", plan=plan, backup=backup)
+                try:
+                    verifier = adapter_factory()
+                    try:
+                        restored = verifier.snapshot_playlist(pl_name)
+                    finally:
+                        _close_quietly(verifier)
+                    if not _is_exact_snapshot_match(current, restored):
+                        return _failure("rollback_verify_failed", plan=plan, backup=backup)
                 except Exception:
                     return _failure("rollback_verify_failed", plan=plan, backup=backup)
-            try:
-                verifier_source = closed_adapter or adapter_factory()
-                verifier = verifier_source.reopen()
-                try:
-                    restored = verifier.snapshot_playlist(pl_name)
-                finally:
-                    _close_quietly(verifier)
-                if not _is_exact_reconciled(current, restored):
-                    return _failure("rollback_verify_failed", plan=plan, backup=backup)
-            except Exception:
-                return _failure("rollback_verify_failed", plan=plan, backup=backup)
-            return _failure(original_code, plan=plan, backup=backup)
-        finally:
-            _close_quietly(reopened)
-            _close_quietly(adapter)
+                return _failure(original_code, plan=plan, backup=backup)
+            finally:
+                _close_quietly(reopened)
+                _close_quietly(adapter)
+    except Exception:
+        _close_quietly(reopened)
+        _close_quietly(adapter)
+        raise
 
 
 class _SyncFailure(RuntimeError):
@@ -473,12 +552,16 @@ class _PyrekordboxAdapter:
         if target is None:
             return []
         out = []
-        for position, song in enumerate(self.db.get_playlist_songs(PlaylistID=target.ID), start=1):
+        songs = sorted(self.db.get_playlist_songs(PlaylistID=target.ID), key=lambda item: int(getattr(item, "TrackNo", 0) or 0))
+        for position, song in enumerate(songs, start=1):
             item = dict(contents.get(str(song.ContentID), {}))
             if item:
                 item["position"] = position
                 out.append(item)
         return out
+
+    def playlist_exists(self, playlist_name: str) -> bool:
+        return self._playlist_by_name(playlist_name) is not None
 
     def external_files_for_playlist(self, _playlist_name: str, desired: list[dict]) -> list[Path]:
         root = self.db_path.parent
@@ -500,7 +583,10 @@ class _PyrekordboxAdapter:
     def apply_operations(self, plan: dict) -> None:
         playlist = self._playlist_by_name(plan.get("_playlist_name"))
         if playlist is None:
-            raise RuntimeError("playlist not found")
+            if plan.get("_create_missing"):
+                playlist = self._create_playlist(str(plan.get("_playlist_name") or "DeckPipe"))
+            else:
+                raise RuntimeError("playlist not found")
         contents = self._content_by_provider_id()
         desired_contents = []
         for desired in plan["desired_resolved"]:
@@ -536,20 +622,14 @@ class _PyrekordboxAdapter:
     def reopen(self):
         return _PyrekordboxAdapter()
 
-    def restore_from_backup(self, backup: dict) -> None:
-        shutil.copy2(backup["files"]["database"]["backup"], backup["files"]["database"]["path"])
-        for item in backup["files"]["external"]:
-            original = Path(item["path"])
-            if item["existed"]:
-                shutil.copy2(item["backup"], original)
-            else:
-                original.unlink(missing_ok=True)
-
     def _playlist_by_name(self, playlist_name: str | None):
         for playlist in self.db.get_playlist():
             if playlist.Attribute == 0 and (playlist_name is None or str(playlist.Name) == playlist_name):
                 return playlist
         return None
+
+    def _create_playlist(self, playlist_name: str):
+        return self.db.create_playlist(playlist_name)
 
     def _content_provider_id(self, content) -> str:
         return str(getattr(content, "Commnt", "") or getattr(content, "Comments", "") or getattr(content, "ID", ""))
@@ -564,47 +644,84 @@ class _PyrekordboxAdapter:
                 return content
         return None
 
-    def _create_content(self, desired: dict):
-        from pyrekordbox.db6 import tables
+    def _one_or_none(self, query):
+        if hasattr(query, "one_or_none"):
+            return query.one_or_none()
+        values = list(query)
+        if len(values) > 1:
+            raise RuntimeError("ambiguous rekordbox metadata row")
+        return values[0] if values else None
 
-        content = tables.DjmdContent.create(
-            ID=str(self.db.generate_unused_id(tables.DjmdContent, is_28_bit=True)),
+    def _artist_by_name(self, name: str):
+        return self._one_or_none(self.db.get_artist(Name=name))
+
+    def _album_by_name(self, name: str):
+        return self._one_or_none(self.db.get_album(Name=name))
+
+    def _resolve_artist_id(self, name: str) -> str | None:
+        if not name:
+            return None
+        artist = self._artist_by_name(name)
+        if artist is None:
+            artist = self.db.add_artist(name=name)
+        return str(artist.ID)
+
+    def _resolve_album_id(self, name: str) -> str | None:
+        if not name:
+            return None
+        album = self._album_by_name(name)
+        if album is None:
+            album = self.db.add_album(name=name)
+        return str(album.ID)
+
+    def _file_type_value(self, path: Path) -> int | None:
+        from pyrekordbox.db6.tables import FileType
+
+        suffix = path.suffix.lstrip(".").upper()
+        if not suffix:
+            return None
+        return getattr(FileType, suffix).value
+
+    def _create_content(self, desired: dict):
+        path = Path(desired["path"])
+        artist_id = self._resolve_artist_id(str(desired["artist"]))
+        album_id = self._resolve_album_id(str(desired["album"]))
+        return self.db.add_content(
+            path,
             Title=desired["title"],
+            ArtistID=artist_id,
+            AlbumID=album_id,
             Commnt=desired["provider_id"],
             Length=int(desired["duration"] or 0),
-            FolderPath=str(desired["path"]),
-            OrgFolderPath=str(desired["path"]),
-            FileNameL=Path(desired["path"]).name,
-            FileNameS=Path(desired["path"]).name,
         )
-        self.db.add(content)
-        return content
 
     def _apply_content_fields(self, content, desired: dict) -> None:
         old_path = str(getattr(content, "FolderPath", "") or "")
         new_path = str(desired["path"])
+        new_path_obj = Path(new_path)
         content.Title = desired["title"]
         content.Length = int(desired["duration"] or 0)
         if hasattr(content, "Commnt"):
             content.Commnt = desired["provider_id"]
         elif hasattr(content, "Comments"):
             content.Comments = desired["provider_id"]
-        artist = getattr(content, "Artist", None)
-        if artist is not None and hasattr(artist, "Name"):
-            artist.Name = desired["artist"]
-        elif hasattr(content, "Artist"):
-            content.Artist = desired["artist"]
-        album = getattr(content, "Album", None)
-        if album is not None and hasattr(album, "Name"):
-            album.Name = desired["album"]
-        elif hasattr(content, "Album"):
-            content.Album = desired["album"]
+        if hasattr(content, "ArtistID"):
+            content.ArtistID = self._resolve_artist_id(str(desired["artist"]))
+        if hasattr(content, "AlbumID"):
+            content.AlbumID = self._resolve_album_id(str(desired["album"]))
         if old_path != new_path:
             self._stage_anlz_path_updates(content, new_path)
             content.FolderPath = new_path
             if str(getattr(content, "OrgFolderPath", "") or "") == old_path:
                 content.OrgFolderPath = new_path
-            content.FileNameL = Path(new_path).name
+            if hasattr(content, "FileNameL"):
+                content.FileNameL = new_path_obj.name
+            if hasattr(content, "FileNameS"):
+                content.FileNameS = new_path_obj.name
+            if hasattr(content, "FileSize"):
+                content.FileSize = new_path_obj.stat().st_size
+            if hasattr(content, "FileType"):
+                content.FileType = self._file_type_value(new_path_obj)
 
     def _stage_anlz_path_updates(self, content, new_path: str) -> None:
         rb_path = new_path.replace("\\", "/")

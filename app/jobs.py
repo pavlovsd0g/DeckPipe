@@ -1044,17 +1044,31 @@ def _flip_worker(job_id: str, to_wav: bool, workers: int):
             on_reconciled=_advance_sidecar,
         )
         with _lock:
-            job["backup_id"] = sync_result.get("backup_id")
-            job["rb_updated"] = sync_result.get("plan", {}).get("counts", {}).get("resolved", 0) if sync_result.get("reconciled") else 0
+            current_job = _jobs[job_id]
+            current_job["backup_id"] = sync_result.get("backup_id")
+            current_job["rb_updated"] = sync_result.get("plan", {}).get("counts", {}).get("resolved", 0) if sync_result.get("reconciled") else 0
             _persist_locked()
-        if not sync_result.get("reconciled"):
+        if sync_result.get("error"):
             with _lock:
-                for result in job["results"]:
+                current_job = _jobs[job_id]
+                for result in current_job["results"]:
                     result["ok"] = False
                     result["error"] = "Rekordbox sync failed"
                     result["quality"] = ""
-                job["failed"] = len(job["results"])
-                job["done"] = len(job["results"])
+                current_job["failed"] = len(current_job["results"])
+                current_job["done"] = len(current_job["results"])
+                _persist_locked()
+            mark_terminal(job_id, outcome="failed", error=sync_result.get("error"))
+            return
+        if not sync_result.get("reconciled"):
+            with _lock:
+                current_job = _jobs[job_id]
+                for result in current_job["results"]:
+                    result["ok"] = False
+                    result["error"] = "Rekordbox sync failed"
+                    result["quality"] = ""
+                current_job["failed"] = len(current_job["results"])
+                current_job["done"] = len(current_job["results"])
                 _persist_locked()
             mark_terminal(job_id, outcome="failed", error=sync_result.get("error") or {"code": "rekordbox_sync_failed", "message": "Rekordbox sync failed"})
             return
