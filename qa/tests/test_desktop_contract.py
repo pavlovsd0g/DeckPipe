@@ -21,6 +21,16 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 TAURI = ROOT / "desktop" / "src-tauri"
 SENTINEL_TOKEN = "desktop-contract-token-DO-NOT-LEAK"
+CHILD_ENV_ALLOWLIST = [
+    "APPDATA",
+    "LOCALAPPDATA",
+    "USERPROFILE",
+    "TEMP",
+    "TMP",
+    "SYSTEMROOT",
+    "COMSPEC",
+    "PATH",
+]
 
 
 def read_text(path: Path) -> str:
@@ -205,7 +215,11 @@ class DesktopContractTests(unittest.TestCase):
 
     def test_entry_process_serves_with_synthetic_token_and_exits_cleanly(self) -> None:
         with tempfile.TemporaryDirectory() as appdata, tempfile.TemporaryDirectory() as localappdata:
-            env = os.environ.copy()
+            env = {
+                name: value
+                for name in CHILD_ENV_ALLOWLIST
+                if (value := os.environ.get(name))
+            }
             env.update(
                 {
                     "APPDATA": appdata,
