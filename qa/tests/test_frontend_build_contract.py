@@ -1,4 +1,5 @@
 import hashlib
+import json
 import re
 import subprocess
 import tempfile
@@ -19,6 +20,39 @@ def read_text(path):
 
 def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def run_frontend_transport_probe(probe_script):
+    source = read_text(FRONTEND / "app.js")
+    transport_only = source.split("async function loadConfig", 1)[0]
+    transport_only = re.sub(
+        r"import\s+\{\s*invoke\s*\}\s+from\s+['\"]@tauri-apps/api/core['\"]\s*;",
+        "const invoke = async name => { globalThis.__invokeCalls.push(name); return globalThis.__invokeResult; };",
+        transport_only,
+        count=1,
+    )
+    with tempfile.TemporaryDirectory() as td:
+        probe = Path(td) / "transport-probe.mjs"
+        probe.write_text(transport_only + "\n" + probe_script, encoding="utf-8")
+        result = subprocess.run(
+            ["node", str(probe)],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    return result
+
+
+def extract_action_keys(source, table_name):
+    match = re.search(
+        rf"const\s+{re.escape(table_name)}\s*=\s*Object\.freeze\(\{{(?P<body>.*?)\n\}}\);",
+        source,
+        re.DOTALL,
+    )
+    if not match:
+        return set()
+    return set(re.findall(r"^\s*'([^']+)'\s*:", match.group("body"), re.MULTILINE))
 
 
 class FrontendBuildContractTests(unittest.TestCase):
@@ -105,6 +139,28 @@ class FrontendBuildContractTests(unittest.TestCase):
             }
             self.assertEqual(first_hashes, second_hashes)
 
+    def test_build_replaces_only_declared_asset_triple(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sentinels = [
+                root / "app" / "static" / "runtime-sentinel.json",
+                root / "desktop" / "ui" / "runtime-sentinel.json",
+            ]
+            for sentinel in sentinels:
+                sentinel.parent.mkdir(parents=True, exist_ok=True)
+                sentinel.write_text('{"keep":true}', encoding="utf-8")
+            app_out, desktop_out, _ = self.run_temp_build(root)
+            for sentinel in sentinels:
+                self.assertTrue(sentinel.is_file(), f"build removed unrelated output file {sentinel}")
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), '{"keep":true}')
+            for output in (app_out, desktop_out):
+                self.assertEqual(sorted(p.name for p in output.iterdir()), [
+                    "app.js",
+                    "index.html",
+                    "runtime-sentinel.json",
+                    "styles.css",
+                ])
+
     def test_emitted_assets_are_csp_safe(self):
         html = read_text(APP_STATIC / "index.html")
         js = read_text(APP_STATIC / "app.js")
@@ -128,12 +184,87 @@ class FrontendBuildContractTests(unittest.TestCase):
         self.assertNotRegex(js, r"[?&#]token=|[?&#][^'\"`\s]*\$\{connection\.token\}", "token must not be placed in URLs")
         self.assertRegex(js, r"function\s+isValidLoopbackBaseUrl")
 
+    def test_non_packaged_transport_requires_explicit_validated_dev_connection(self):
+        result = run_frontend_transport_probe(
+            r"""
+globalThis.__invokeCalls = [];
+globalThis.__invokeResult = {baseUrl: 'http://127.0.0.1:7100', token: 'packaged-token'};
+globalThis.window = {location: {protocol: 'http:', origin: 'http://localhost:5173'}};
+const outcomes = [];
+let fetchCalls = [];
+globalThis.fetch = async (url, request) => {
+  fetchCalls.push({url, request});
+  return {ok: true, json: async () => ({ok: true})};
+};
+
+async function attempt(name, setup) {
+  cachedConnection = null;
+  fetchCalls = [];
+  delete globalThis.__DECKPIPE_DEV_CONNECTION__;
+  if (setup) setup();
+  try {
+    await api('/api/config');
+    outcomes.push({name, ok: true, fetches: fetchCalls.length, auth: fetchCalls[0]?.request?.headers?.Authorization || null});
+  } catch (error) {
+    outcomes.push({name, ok: false, message: error.message, fetches: fetchCalls.length});
+  }
+}
+
+await attempt('missing-dev-connection');
+await attempt('empty-token', () => { globalThis.__DECKPIPE_DEV_CONNECTION__ = {baseUrl: 'http://127.0.0.1:7100', token: ''}; });
+await attempt('non-loopback', () => { globalThis.__DECKPIPE_DEV_CONNECTION__ = {baseUrl: 'https://example.test', token: 'dev-token'}; });
+await attempt('valid', () => { globalThis.__DECKPIPE_DEV_CONNECTION__ = {baseUrl: 'http://127.0.0.1:7100', token: 'dev-token'}; });
+console.log(JSON.stringify(outcomes));
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        outcomes = json.loads(result.stdout)
+        self.assertEqual(outcomes[:3], [
+            {"name": "missing-dev-connection", "ok": False, "message": "backend connection unavailable", "fetches": 0},
+            {"name": "empty-token", "ok": False, "message": "backend connection unavailable", "fetches": 0},
+            {"name": "non-loopback", "ok": False, "message": "backend connection unavailable", "fetches": 0},
+        ])
+        self.assertEqual(outcomes[3], {
+            "name": "valid",
+            "ok": True,
+            "fetches": 1,
+            "auth": "Bearer dev-token",
+        })
+
     def test_one_fetch_call_inside_api_transport(self):
         js = read_text(APP_STATIC / "app.js")
         self.assertEqual(len(re.findall(r"\bfetch\s*\(", js)), 1)
         fetch_index = js.index("fetch(")
         wrapper_start = js.rfind("async function api", 0, fetch_index)
         self.assertNotEqual(wrapper_start, -1, "fetch must live inside api transport wrapper")
+
+    def test_all_data_actions_are_fixed_and_represented_once(self):
+        source = read_text(FRONTEND / "app.js")
+        html = read_text(FRONTEND / "index.html")
+        actions = set(re.findall(r"data-action=\"([a-z0-9-]+)\"", html + "\n" + source))
+        click_keys = extract_action_keys(source, "clickActions")
+        change_keys = extract_action_keys(source, "changeActions")
+        self.assertTrue(actions, "expected canonical UI actions")
+        self.assertFalse(click_keys & change_keys, f"action keys must belong to exactly one handler map: {click_keys & change_keys}")
+        self.assertEqual(actions, click_keys | change_keys)
+
+    def test_external_values_are_not_raw_in_generated_attributes_or_classes(self):
+        source = read_text(FRONTEND / "app.js")
+        raw_attribute_patterns = {
+            r'data-id="\$\{p\.id\}"': "SoundCloud account ids must be attribute-escaped",
+            r'data-id="\$\{s\.id\}"': "SoundCloud source ids must be attribute-escaped",
+            r'data-title="\$\{esc\(': "data-title values must use the attribute escaping boundary",
+            r'title="\$\{esc\(': "title attributes must use the attribute escaping boundary",
+            r'data-url="\$\{esc\(': "URL data attributes must use the attribute escaping boundary",
+            r'<img src="\$\{p\.cover\}"': "cover image URLs must be constrained before interpolation",
+            r'class="fmt\s+\$\{t\.format\}"': "format class tokens must come from a fixed mapping",
+            r'>\$\{t\.format\}</span>': "format label text must be escaped",
+        }
+        for pattern, message in raw_attribute_patterns.items():
+            self.assertNotRegex(source, pattern, message)
+        self.assertRegex(source, r"function\s+safeCoverUrl")
+        self.assertRegex(source, r"url\.protocol\s*===\s*['\"]https:['\"]")
+        self.assertRegex(source, r"FORMAT_CLASS_BY_VALUE\s*=\s*Object\.freeze")
 
     def test_required_labels_and_routes_remain_represented(self):
         combined = read_text(APP_STATIC / "index.html") + "\n" + read_text(APP_STATIC / "app.js")

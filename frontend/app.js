@@ -8,7 +8,19 @@ let cachedConnection = null;
 
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const attr = esc;
 const fmtDur = s => s ? `${Math.floor(s/60)}:${String(Math.round(s%60)).padStart(2,'0')}` : '—';
+const FORMAT_CLASS_BY_VALUE = Object.freeze({
+  aac: 'fmt-aac',
+  aiff: 'fmt-aiff',
+  alac: 'fmt-alac',
+  flac: 'fmt-flac',
+  m4a: 'fmt-m4a',
+  mp3: 'fmt-mp3',
+  ogg: 'fmt-ogg',
+  opus: 'fmt-opus',
+  wav: 'fmt-wav',
+});
 
 function isPackagedAppOrigin() {
   return window.location.protocol === 'tauri:' || window.location.origin === 'http://tauri.localhost';
@@ -30,6 +42,31 @@ function validateConnection(raw) {
   return {baseUrl: raw.baseUrl.replace(/\/+$/, ''), token: raw.token};
 }
 
+function safeCoverUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol === 'https:') return url.href;
+  } catch {
+    // invalid or absent cover URLs render as the placeholder image
+  }
+  return '';
+}
+
+function formatBadge(format) {
+  const label = String(format ?? '').trim();
+  if (!label) return '';
+  const key = label.toLowerCase();
+  const className = FORMAT_CLASS_BY_VALUE[key] || 'fmt-other';
+  return `<span class="fmt ${className}">${esc(label)}</span>`;
+}
+
+function progressValue(done, total) {
+  const numericDone = Number(done) || 0;
+  const numericTotal = Number(total) || 0;
+  if (numericTotal <= 0) return '0';
+  return String(Math.max(0, Math.min(100, 100 * numericDone / numericTotal)));
+}
+
 async function getConnection() {
   if (cachedConnection) return cachedConnection;
   const devConnection = globalThis.__DECKPIPE_DEV_CONNECTION__;
@@ -41,8 +78,7 @@ async function getConnection() {
     cachedConnection = validateConnection(await invoke('backend_connection'));
     return cachedConnection;
   }
-  cachedConnection = {baseUrl: window.location.origin, token: ''};
-  return cachedConnection;
+  throw new Error('backend connection unavailable');
 }
 
 async function api(path, opts = {}) {
@@ -51,7 +87,7 @@ async function api(path, opts = {}) {
   const method = opts.method || (opts.body !== undefined ? 'POST' : 'GET');
   const headers = {Accept: 'application/json'};
   if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
-  if (connection.token) headers.Authorization = `Bearer ${connection.token}`;
+  headers.Authorization = `Bearer ${connection.token}`;
   const request = {method, headers};
   if (opts.body !== undefined) request.body = JSON.stringify(opts.body || {});
   const r = await fetch(url.href, request);
@@ -178,7 +214,7 @@ async function loadScAccount() {
     const items = [d.likes, ...d.playlists];
     $('#scAccountList').innerHTML = items.map(p => `
       <label class="scacc"><input type="checkbox" class="scacc-cb"
-        data-id="${p.id}" data-title="${esc(p.title)}" data-url="${esc(p.url)}" data-count="${p.count||0}">
+        data-id="${attr(p.id)}" data-title="${attr(p.title)}" data-url="${attr(p.url)}" data-count="${attr(p.count || 0)}">
         ${esc(p.title)} <span class="dim">(${p.count ?? '?'})</span></label>`).join('');
     setHidden($('#scImport'), false);
   } catch (e) {
@@ -228,8 +264,8 @@ async function loadPlaylists() {
   if (tab === 'search') return loadSearchTargets();
   const pls = await api('/api/playlists');
   $('#playlists').innerHTML = pls.map(p => `
-    <div class="pl ${current && current.id===p.id?'active':''}" data-action="select-playlist" data-id="${esc(p.id)}" data-title="${esc(p.title)}">
-      ${p.cover ? `<img src="${p.cover}">` : '<img alt="">'}
+    <div class="pl ${current && current.id===p.id?'active':''}" data-action="select-playlist" data-id="${attr(p.id)}" data-title="${attr(p.title)}">
+      ${safeCoverUrl(p.cover) ? `<img src="${attr(safeCoverUrl(p.cover))}" alt="">` : '<img alt="">'}
       <div class="pl-body">
         <div class="t">${esc(p.title)}</div>
         <div class="c">${p.ok||0}/${p.count} ${p.errors?`<span class="badge-err">⚠ ${p.errors}</span>`:''}</div>
@@ -309,12 +345,12 @@ async function loadSearchTargets() {
   if (!searchTarget && rows.length) searchTarget = rows[0];
   window._targets = rows;
   const cur = searchTarget
-    ? `${provLabel(searchTarget.provider)} · ${esc(searchTarget.title)}`
+    ? `${provLabel(searchTarget.provider)} · ${searchTarget.title}`
     : 'не выбрана';
   $('#playlists').innerHTML = `
     <div id="targetBox">
       <div class="cap">Цель загрузки / добавления</div>
-      <div class="cur" title="${cur}">${cur}</div>
+      <div class="cur" title="${attr(cur)}">${esc(cur)}</div>
       <div class="acts">
         <button class="ghost" data-action="create-target-playlist" data-kind="deezer" title="Новый плейлист в Deezer">＋Deezer</button>
         <button class="ghost" data-action="create-target-playlist" data-kind="local" title="Новый локальный плейлист (SoundCloud не даёт создавать плейлисты через API — создаётся локальная папка-плейлист, URL можно привязать позже)">＋Локальный (SC)</button>
@@ -396,9 +432,9 @@ function _renderBasket() {
     b.id = 'basket';
     $('#tracks').appendChild(b);
   }
-  const tgt = searchTarget ? `${provLabel(searchTarget.provider)} · ${esc(searchTarget.title)}` : '—';
+  const tgt = searchTarget ? `${provLabel(searchTarget.provider)} · ${searchTarget.title}` : '—';
   b.innerHTML = `<b>${n} тр.</b>
-    <button data-action="dl-basket">⬇ в цель: ${tgt}</button>
+    <button data-action="dl-basket">⬇ в цель: ${esc(tgt)}</button>
     <button class="ghost" data-action="clear-basket">✕ очистить</button>`;
 }
 
@@ -406,7 +442,7 @@ function _trackRow(svc, i, t, indent) {
   const checked = searchSel[_selKey(svc,i)] ? 'checked' : '';
   return `<div class="srow">
     <input type="checkbox" class="cb" id="cb-${svc}-${i}" ${checked} data-action="track-checkbox" data-service="${svc}" data-index="${i}">
-    <div class="tt" title="${esc(t.title)} — ${esc(t.artist)}">${esc(t.title)} <span class="meta">${esc(t.artist)} · ${fmtDur(t.duration)}</span></div>
+    <div class="tt" title="${attr(`${t.title ?? ''} — ${t.artist ?? ''}`)}">${esc(t.title)} <span class="meta">${esc(t.artist)} · ${fmtDur(t.duration)}</span></div>
     <span class="prov ${svc==='sc'?'sc':''}">${svc==='sc'?'SC':'DZ'}</span>
     ${svc==='deezer' ? `<button class="ghost" title="Добавить в плейлист Deezer без скачивания" data-action="add-dz-track" data-index="${i}">＋</button>` : ''}
     <button title="Скачать в цель" data-action="dl-search-track" data-service="${svc}" data-index="${i}">⬇</button>
@@ -427,7 +463,7 @@ function _albumRow(svc, i, a) {
     else if (exp.tracks) {
       html += `<div class="stracks">` + exp.tracks.map((t,j) => `
         <div class="srow">
-          <div class="tt" title="${esc(t.title)} — ${esc(t.artist)}">${esc(t.title)} <span class="meta">${esc(t.artist)} · ${fmtDur(t.duration)}</span></div>
+          <div class="tt" title="${attr(`${t.title ?? ''} — ${t.artist ?? ''}`)}">${esc(t.title)} <span class="meta">${esc(t.artist)} · ${fmtDur(t.duration)}</span></div>
           <button title="Скачать в цель" data-action="dl-album-track" data-service="${svc}" data-index="${i}" data-track-index="${j}">⬇</button>
         </div>`).join('') +
         `<div class="srow"><div class="tt dim">${exp.tracks.length} тр.</div>
@@ -538,7 +574,7 @@ async function loadScSources() {
   try { await api('/api/sc/sync-account', {body:{}}); } catch (e) { /* не вошли — ок */ }
   const srcs = await api('/api/sc/sources');
   $('#playlists').innerHTML = (srcs.map(s => `
-    <div class="pl ${current && current.id===s.id?'active':''}" data-action="select-sc-source" data-id="${esc(s.id)}" data-title="${esc(s.title)}">
+    <div class="pl ${current && current.id===s.id?'active':''}" data-action="select-sc-source" data-id="${attr(s.id)}" data-title="${attr(s.title)}">
       <img alt="">
       <div class="pl-body">
         <div class="t">${esc(s.title)}</div>
@@ -612,7 +648,7 @@ function renderTracks() {
       <td>${esc(t.title)}${t.error?`<div class="errtext">${esc(t.error)}</div>`:''}</td>
       <td>${esc(t.artist)}</td><td class="dim">${esc(t.album)}</td>
       <td class="dim">${fmtDur(t.duration)}</td>
-      <td>${t.format?`<span class="fmt ${t.format}">${t.format}</span>`:''}${t.flipped?'<span class="fmt fmt-wav">→wav</span>':''}${t.mp3_source?'<span class="fmt fmt-mp3src" title="mp3-источник: после конвертации в WAV кью могут сместиться на ~26 мс">mp3</span>':''}</td>
+      <td>${formatBadge(t.format)}${t.flipped?'<span class="fmt fmt-wav">→wav</span>':''}${t.mp3_source?'<span class="fmt fmt-mp3src" title="mp3-источник: после конвертации в WAV кью могут сместиться на ~26 мс">mp3</span>':''}</td>
     </tr>`).join('')}
   </table>`;
 }
@@ -725,7 +761,7 @@ function startPolling() {
       <div class="job"><b>${esc(j.title)}</b>: ${j.done}/${j.total}
         ${j.failed?`<span class="err">(ошибок: ${j.failed})</span>`:''}
         ${j.current?`<span class="dim"> — ${esc(j.current)}</span>`:''}
-        <progress class="bar" max="100" value="${j.total?100*j.done/j.total:0}"></progress>
+        <progress class="bar" max="100" value="${attr(progressValue(j.done, j.total))}"></progress>
       </div>`).join('');
     if (!active.length) {
       clearInterval(pollTimer); pollTimer = null;

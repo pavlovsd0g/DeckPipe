@@ -1,5 +1,5 @@
 import { build } from 'esbuild';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -42,7 +42,6 @@ outputs.set('index.html', await readFile(path.join(frontend, 'index.html')));
 outputs.set('styles.css', await readFile(path.join(frontend, 'styles.css')));
 
 for (const target of targets) {
-  await rm(target, {recursive: true, force: true});
   await mkdir(target, {recursive: true});
   for (const [name, bytes] of outputs) {
     await writeFile(path.join(target, name), bytes);
