@@ -132,6 +132,30 @@ function Compare-DeckPipeMetric {
     }
 }
 
+function Get-DeckPipeSha256Hex {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $stream = $null
+    $sha256 = $null
+    try {
+        $stream = [IO.File]::OpenRead($Path)
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        $hashBytes = $sha256.ComputeHash($stream)
+        return (($hashBytes | ForEach-Object { $_.ToString('X2') }) -join '')
+    } finally {
+        if ($null -ne $sha256) {
+            $sha256.Dispose()
+        }
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
 function Get-DeckPipeFileSnapshot {
     [CmdletBinding()]
     param(
@@ -149,11 +173,11 @@ function Get-DeckPipeFileSnapshot {
     }
 
     $item = Get-Item -LiteralPath $Path
-    $hash = Get-FileHash -LiteralPath $Path -Algorithm SHA256
+    $hash = Get-DeckPipeSha256Hex -Path $Path
     [pscustomobject]@{
         Exists       = $true
         Bytes        = [long]$item.Length
-        Sha256       = $hash.Hash.ToUpperInvariant()
+        Sha256       = $hash
         LastWriteUtc = $item.LastWriteTimeUtc.ToString('o')
     }
 }

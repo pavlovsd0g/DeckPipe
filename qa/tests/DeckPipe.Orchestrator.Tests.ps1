@@ -25,6 +25,11 @@ function Assert-Equal {
     }
 }
 
+function ConvertFrom-Utf8Base64 {
+    param([string]$Value)
+    return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Value))
+}
+
 function It {
     param([string]$Name, [scriptblock]$Body)
     try {
@@ -56,12 +61,13 @@ It 'recognizes install-owned executables without accepting a prefix collision' {
 }
 
 It 'summarizes configuration state without retaining identity or filesystem values' {
+    $secretUser = ConvertFrom-Utf8Base64 '0YHQtdC60YDQtdGC0L3Ri9C5LdC/0L7Qu9GM0LfQvtCy0LDRgtC10LvRjA=='
     $payload = [pscustomobject]@{
         music_root = 'C:\Sensitive\Music'
         arl_set = $true
         wav_mode = 'wav'
         numbering = $true
-        sc_user = 'секретный-пользователь'
+        sc_user = $secretUser
         user = [pscustomobject]@{ id = '123'; email = 'private@example.invalid' }
     }
     $summary = Get-DeckPipePayloadSummary -Endpoint '/api/config' -Payload $payload
@@ -70,12 +76,13 @@ It 'summarizes configuration state without retaining identity or filesystem valu
     Assert-True $summary.music_root_configured
     Assert-Equal $summary.wav_mode 'wav'
     $serialized = $summary | ConvertTo-Json -Compress
-    Assert-False ($serialized -match 'Sensitive|секретный|private@example|123')
+    Assert-False ($serialized.Contains('Sensitive') -or $serialized.Contains($secretUser.Split('-')[0]) -or $serialized.Contains('private@example') -or $serialized.Contains('123'))
 }
 
 It 'counts Unicode and replacement glyphs without retaining playlist titles' {
+    $cyrillicTitle = ConvertFrom-Utf8Base64 '0KHQvtCy0LXRgtGB0LrQuNC5INGB0LjQvdGC0LXQt9Cw0YLQvtGA'
     $payload = @(
-        [pscustomobject]@{ id = '1'; title = 'Советский синтезатор'; count = 3; ok = 2; errors = 0; path = 'C:\Private\One' },
+        [pscustomobject]@{ id = '1'; title = $cyrillicTitle; count = 3; ok = 2; errors = 0; path = 'C:\Private\One' },
         [pscustomobject]@{ id = '2'; title = ('Broken ' + [char]0xFFFD); count = 4; ok = 1; errors = 1; path = 'C:\Private\Two' }
     )
     $summary = Get-DeckPipePayloadSummary -Endpoint '/api/playlists' -Payload $payload
@@ -86,7 +93,7 @@ It 'counts Unicode and replacement glyphs without retaining playlist titles' {
     Assert-Equal $summary.ok_track_count 3
     Assert-Equal $summary.error_track_count 1
     $serialized = $summary | ConvertTo-Json -Compress
-    Assert-False ($serialized -match 'Советский|Broken|Private')
+    Assert-False ($serialized.Contains($cyrillicTitle.Split(' ')[0]) -or $serialized.Contains('Broken') -or $serialized.Contains('Private'))
 }
 
 It 'treats an empty JSON collection as zero aggregate counts' {
@@ -98,11 +105,12 @@ It 'treats an empty JSON collection as zero aggregate counts' {
 }
 
 It 'summarizes Rekordbox and jobs responses as aggregate state only' {
+    $playlistName = ConvertFrom-Utf8Base64 '0KDRg9GB0YHQutC40Lkg0L/Qu9C10LnQu9C40YHRgg=='
     $rb = Get-DeckPipePayloadSummary -Endpoint '/api/rb/status' -Payload ([pscustomobject]@{
         db_exists = $true
         running = $false
         playlists = @(
-            [pscustomobject]@{ id = 'a'; name = 'Русский плейлист'; count = 8 },
+            [pscustomobject]@{ id = 'a'; name = $playlistName; count = 8 },
             [pscustomobject]@{ id = 'b'; name = 'Second'; count = 4 }
         )
     })

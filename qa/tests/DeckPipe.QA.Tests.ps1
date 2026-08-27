@@ -37,6 +37,11 @@ function Assert-Throws {
     throw "Expected an exception matching '$MessagePattern'"
 }
 
+function ConvertFrom-Utf8Base64 {
+    param([string]$Value)
+    return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Value))
+}
+
 function It {
     param([string]$Name, [scriptblock]$Body)
     try {
@@ -77,7 +82,7 @@ It 'rejects mutation and track-scan paths before a request is made' {
 }
 
 It 'detects Cyrillic and replacement glyphs without returning source text' {
-    $clean = Get-DeckPipeStringFlags -Value 'Советский синтезатор — ёжик'
+    $clean = Get-DeckPipeStringFlags -Value (ConvertFrom-Utf8Base64 '0KHQvtCy0LXRgtGB0LrQuNC5INGB0LjQvdGC0LXQt9Cw0YLQvtGAIOKAlCDRkdC20LjQug==')
     Assert-True $clean.HasCyrillic
     Assert-False $clean.HasBadGlyph
     Assert-False ($clean.PSObject.Properties.Name -contains 'Value')
