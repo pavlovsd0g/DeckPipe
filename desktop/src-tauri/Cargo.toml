@@ -1,6 +1,6 @@
 [package]
 name = "deckpipe"
-version = "0.5.0"
+version = "0.6.0"
 description = "DeckPipe — синк Deezer/SoundCloud с локальной DJ-библиотекой и Rekordbox"
 authors = ["pavlovsd0g"]
 edition = "2021"

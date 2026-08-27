@@ -1,10 +1,12 @@
 {
   "name": "deckpipe",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.6.0",
   "scripts": {
     "dev": "node dev.js",
-    "build:frontend": "node frontend/build.mjs"
+    "build:frontend": "node frontend/build.mjs",
+    "release:build": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File release/build.ps1",
+    "release:verify": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File release/verify.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1"

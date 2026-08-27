@@ -1,0 +1,13 @@
+# DeckPipe build dependency lock for 0.6.0.
+# LOCK-STATUS: BLOCKED
+# BLOCKER: offline wheel cache does not contain all required distributions
+# Evidence: project venv has the pinned versions below, but local pip cache only had pyaes and spotipy_anon wheel artifacts during Task 7.
+# Do not publish or build a release candidate from this file until every package below is regenerated with pip --require-hashes using real distribution hashes.
+altgraph==0.17.5
+packaging==26.2
+pefile==2024.8.26
+pip==26.2
+pyinstaller==6.21.0
+pyinstaller-hooks-contrib==2026.6
+pywin32-ctypes==0.2.3
+setuptools==83.0.0

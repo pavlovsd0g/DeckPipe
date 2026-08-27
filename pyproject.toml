@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools==83.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deckpipe"
+version = "0.6.0"
+description = "DeckPipe Windows desktop and local API"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "deezer-python-gql==0.17.1",
+  "fastapi==0.141.1",
+  "imageio-ffmpeg==0.6.0",
+  "mutagen==1.48.1",
+  "pycryptodome==3.23.0",
+  "pydantic==2.13.4",
+  "pyrekordbox==0.4.4",
+  "requests==2.34.2",
+  "uvicorn==0.52.0",
+  "yt-dlp==2026.7.4",
+]
+
+[tool.deckpipe.release]
+version_file = "release/version.json"
+runtime_lock = "requirements.lock"
+build_lock = "requirements-build.lock"

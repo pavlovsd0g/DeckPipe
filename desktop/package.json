@@ -1,12 +1,12 @@
 {
   "name": "deckpipe-desktop",
   "private": true,
-  "version": "0.5.0",
+  "version": "0.6.0",
   "scripts": {
     "tauri": "tauri",
     "build": "npm --prefix .. run build:frontend && tauri build"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2"
+    "@tauri-apps/cli": "2.11.4"
   }
 }

@@ -1,12 +1,22 @@
 # -*- coding: utf-8 -*-
 """Багрепорты в Telegram-бота (Bot API sendMessage)."""
+import json
 import platform
+from pathlib import Path
 
 import requests
 
 from .deezer_client import load_config
 
-APP_VERSION = "0.3.0"
+def _load_release_info() -> dict:
+    version_path = Path(__file__).resolve().parent.parent / "release" / "version.json"
+    with version_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+_RELEASE_INFO = _load_release_info()
+APP_VERSION = _RELEASE_INFO["version"]
+APP_BUILD_ID = _RELEASE_INFO["build_id"]
 
 
 def send_report(text: str, context: dict | None = None) -> dict:
@@ -18,7 +28,7 @@ def send_report(text: str, context: dict | None = None) -> dict:
         return {"ok": False, "error": "Telegram не настроен (нет bot_token/chat_id)"}
 
     lines = [
-        f"🐞 DeckPipe bug report v{APP_VERSION}",
+        f"DeckPipe bug report v{APP_VERSION} ({APP_BUILD_ID})",
         f"OS: {platform.system()} {platform.release()} ({platform.machine()})",
         f"wav_mode: {cfg.get('wav_mode', 'source')}",
     ]

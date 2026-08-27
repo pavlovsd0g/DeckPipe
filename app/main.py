@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """DeckPipe MVP — FastAPI бэкенд."""
 import asyncio
+import json
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -42,7 +43,17 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="DeckPipe", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 app.add_middleware(LoopbackSecurityMiddleware, settings=SecuritySettings.from_env())
 STATIC = Path(__file__).parent / "static"
-APP_VERSION = "0.5.0"
+
+
+def _load_release_info() -> dict:
+    version_path = Path(__file__).resolve().parent.parent / "release" / "version.json"
+    with version_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+_RELEASE_INFO = _load_release_info()
+APP_VERSION = _RELEASE_INFO["version"]
+APP_BUILD_ID = _RELEASE_INFO["build_id"]
 
 
 def _public_api_error(service: str) -> str:
@@ -51,7 +62,7 @@ def _public_api_error(service: str) -> str:
 
 @app.get("/api/version")
 def api_version():
-    return {"version": APP_VERSION}
+    return {"version": APP_VERSION, "build_id": APP_BUILD_ID}
 
 # ---------- кеши ----------
 _cache = {"playlists": (0, None), "tracks": {}}

@@ -1,0 +1,62 @@
+# DeckPipe runtime dependency lock for 0.6.0.
+# LOCK-STATUS: BLOCKED
+# BLOCKER: offline wheel cache does not contain all required distributions
+# Evidence: project venv has the pinned versions below, but local pip cache only had pyaes and spotipy_anon wheel artifacts during Task 7.
+# Do not publish or build a release candidate from this file until every package below is regenerated with pip --require-hashes using real distribution hashes.
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.3
+aiosignal==1.4.0
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.14.2
+attrs==26.1.0
+certifi==2026.7.22
+charset-normalizer==3.4.9
+click==8.4.2
+colorama==0.4.6
+construct==2.10.70
+deezer-py==1.3.7
+deezer-python-gql==0.17.1
+deezspot==1.6
+fastapi==0.141.1
+frozenlist==1.8.0
+h11==0.16.0
+httptools==0.8.0
+idna==3.18
+ifaddr==0.2.0
+imageio-ffmpeg==0.6.0
+librespot==0.0.10
+multidict==6.7.1
+mutagen==1.48.1
+numpy==2.5.1
+packaging==26.2
+propcache==0.5.2
+protobuf==3.20.1
+pycryptodome==3.23.0
+pycryptodomex==3.23.0
+pydantic==2.13.4
+pydantic-core==2.46.4
+PyOgg==0.6.14a1
+pyrekordbox==0.4.4
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.2
+PyYAML==6.0.3
+redis==8.1.0
+requests==2.34.2
+six==1.17.0
+spotipy==2.26.0
+spotipy-anon==1.5.7
+SQLAlchemy==2.0.51
+sqlcipher3-wheels==0.5.7
+starlette==1.3.1
+tqdm==4.70.0
+typing-extensions==4.16.0
+typing-inspection==0.4.2
+urllib3==2.7.0
+uvicorn==0.52.0
+watchfiles==1.2.0
+websocket-client==1.9.0
+websockets==17.0.1
+yarl==1.24.5
+yt-dlp==2026.7.4
+zeroconf==0.150.0

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "target_version": "0.5.0",
+  "target_version": "0.6.0",
   "samples": 5,
   "window_ready_ms": 5000,
   "port_ready_ms": 5000,
