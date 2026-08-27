@@ -441,12 +441,18 @@ function Invoke-DeckPipeUiTab {
 function Get-DeckPipeProcessMetrics {
     param([Parameter(Mandatory)][int]$RootProcessId)
 
+    function Get-DeckPipeProcessCpuSeconds {
+        param([AllowNull()]$Process)
+        if ($null -eq $Process -or $null -eq $Process.CPU) { return 0.0 }
+        return [double]$Process.CPU
+    }
+
     $inventory = Get-DeckPipeProcessInventory
     $ids = @(Get-DeckPipeDescendantProcessIds -RootProcessId $RootProcessId -Processes $inventory)
     $beforeCpu = @{}
     foreach ($id in $ids) {
         $process = Get-Process -Id $id -ErrorAction SilentlyContinue
-        if ($null -ne $process) { $beforeCpu[$id] = [double]($process.CPU ?? 0) }
+        if ($null -ne $process) { $beforeCpu[$id] = Get-DeckPipeProcessCpuSeconds -Process $process }
     }
     Start-Sleep -Seconds 2
 
@@ -460,8 +466,9 @@ function Get-DeckPipeProcessMetrics {
         $alive++
         $workingSet += [long]$process.WorkingSet64
         $privateMemory += [long]$process.PrivateMemorySize64
-        $prior = if ($beforeCpu.ContainsKey($id)) { [double]$beforeCpu[$id] } else { [double]($process.CPU ?? 0) }
-        $cpuDeltaSeconds += [math]::Max(0, [double]($process.CPU ?? 0) - $prior)
+        $currentCpu = Get-DeckPipeProcessCpuSeconds -Process $process
+        $prior = if ($beforeCpu.ContainsKey($id)) { [double]$beforeCpu[$id] } else { $currentCpu }
+        $cpuDeltaSeconds += [math]::Max(0, $currentCpu - $prior)
     }
 
     [pscustomobject][ordered]@{
@@ -731,6 +738,14 @@ try {
     Add-RunCheck -Id 'C2' -Status $(if ($minimumPass) { 'pass' } else { 'fail' }) `
         -Message $(if ($minimumPass) { 'main controls remain visible at minimum size' } else { 'minimum-size window clips or hides required controls' }) `
         -Data ([ordered]@{ client_size = $minimumSize; ui = $uiMinimum })
+
+    $minimumA11yPass = $minimumSize.width -ge 990 -and $minimumSize.height -ge 630 -and
+        $uiMinimum.required_focusable_count -eq $uiMinimum.required_control_count -and
+        @($uiMinimum.missing_control_ids).Count -eq 0
+    $minimumA11yStatus = if (-not $IsolatedUi) { 'warn' } elseif ($minimumA11yPass) { 'pass' } else { 'fail' }
+    Add-RunCheck -Id 'C2A' -Status $minimumA11yStatus `
+        -Message $(if (-not $IsolatedUi) { 'minimum-size accessibility check requires the synthetic isolated UI fixture' } elseif ($minimumA11yPass) { 'minimum-size synthetic required controls remain visible and keyboard-focusable' } else { 'minimum-size synthetic UI is missing required focusable controls' }) `
+        -Data ([ordered]@{ synthetic_isolated_ui = [bool]$IsolatedUi; client_size = $minimumSize; required_focusable_count = $uiMinimum.required_focusable_count; required_control_count = $uiMinimum.required_control_count; empty_focusable_name_count = $uiMinimum.empty_focusable_name_count; missing_control_ids = $uiMinimum.missing_control_ids })
 
     Set-DeckPipeClientSize -Handle $windowHandle -Width 1320 -Height 840 | Out-Null
     $tabsReady = $uiNormal.required_visible_count -ge 4 -and $uiNormal.required_focusable_count -ge 4

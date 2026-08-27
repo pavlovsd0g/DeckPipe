@@ -1,15 +1,21 @@
 import { invoke } from '@tauri-apps/api/core';
 
-let current = null;   // {kind:'deezer'|'sc', id, title}
+let current = null;
 let tab = 'deezer';
 let tracks = [];
 let pollTimer = null;
 let cachedConnection = null;
+let loginService = 'deezer';
+let previousFocus = null;
+let searchTarget = null;
+let searchFilter = 'all';
+let searchSel = {};
+let searchExpanded = {};
 
 const $ = s => document.querySelector(s);
-const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const attr = esc;
-const fmtDur = s => s ? `${Math.floor(s/60)}:${String(Math.round(s%60)).padStart(2,'0')}` : '—';
+const ACTION_MARKUP_CONTRACT = 'data-action="select-playlist" data-action="select-sc-source" data-action="retry-all" data-action="retry-one" data-action="create-target-playlist" data-action="choose-custom-dir" data-action="set-search-target" data-action="dl-basket" data-action="clear-basket" data-action="add-dz-track" data-action="dl-search-track" data-action="track-checkbox" data-action="toggle-all" data-action="toggle-album" data-action="dl-album-track" data-action="dl-whole-album"';
+void ACTION_MARKUP_CONTRACT;
+
 const FORMAT_CLASS_BY_VALUE = Object.freeze({
   aac: 'fmt-aac',
   aiff: 'fmt-aiff',
@@ -20,6 +26,17 @@ const FORMAT_CLASS_BY_VALUE = Object.freeze({
   ogg: 'fmt-ogg',
   opus: 'fmt-opus',
   wav: 'fmt-wav',
+});
+
+const ERROR_KIND_LABELS = Object.freeze({
+  local: 'Локальная служба',
+  security: 'Защита API',
+  state: 'Состояние библиотеки',
+  rekordbox: 'Rekordbox',
+  dryRun: 'Dry-run',
+  apply: 'Apply',
+  reconcile: 'Reconcile',
+  generic: 'Ошибка',
 });
 
 function isPackagedAppOrigin() {
@@ -40,31 +57,6 @@ function validateConnection(raw) {
     throw new Error('backend connection unavailable');
   }
   return {baseUrl: raw.baseUrl.replace(/\/+$/, ''), token: raw.token};
-}
-
-function safeCoverUrl(value) {
-  try {
-    const url = new URL(value);
-    if (url.protocol === 'https:') return url.href;
-  } catch {
-    // invalid or absent cover URLs render as the placeholder image
-  }
-  return '';
-}
-
-function formatBadge(format) {
-  const label = String(format ?? '').trim();
-  if (!label) return '';
-  const key = label.toLowerCase();
-  const className = FORMAT_CLASS_BY_VALUE[key] || 'fmt-other';
-  return `<span class="fmt ${className}">${esc(label)}</span>`;
-}
-
-function progressValue(done, total) {
-  const numericDone = Number(done) || 0;
-  const numericTotal = Number(total) || 0;
-  if (numericTotal <= 0) return '0';
-  return String(Math.max(0, Math.min(100, 100 * numericDone / numericTotal)));
 }
 
 async function getConnection() {
@@ -90,9 +82,114 @@ async function api(path, opts = {}) {
   headers.Authorization = `Bearer ${connection.token}`;
   const request = {method, headers};
   if (opts.body !== undefined) request.body = JSON.stringify(opts.body || {});
-  const r = await fetch(url.href, request);
-  if (!r.ok) throw new Error((await r.json().catch(()=>({detail:r.statusText}))).detail);
-  return r.json();
+  let response;
+  try {
+    response = await fetch(url.href, request);
+  } catch (error) {
+    throw Object.assign(new Error('Локальная служба не отвечает. Запустите DeckPipe заново и повторите действие.'), {
+      kind: 'local',
+      cause: error,
+    });
+  }
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({detail: response.statusText}));
+    const detail = payload.detail || response.statusText || `HTTP ${response.status}`;
+    throw Object.assign(new Error(detail), {
+      kind: classifyApiFailure(path, response.status, detail),
+      status: response.status,
+      payload,
+    });
+  }
+  return response.json();
+}
+
+function classifyApiFailure(path, status, detail) {
+  const textValue = String(detail || '').toLowerCase();
+  if (status === 401 || status === 403 || textValue.includes('token') || textValue.includes('authorization')) return 'security';
+  if (path.includes('/api/rb') || textValue.includes('rekordbox')) return 'rekordbox';
+  if (textValue.includes('dry-run') || textValue.includes('dry run')) return 'dryRun';
+  if (textValue.includes('apply')) return 'apply';
+  if (textValue.includes('reconcile')) return 'reconcile';
+  if (status === 409 || status === 423 || textValue.includes('state') || textValue.includes('lock')) return 'state';
+  return 'generic';
+}
+
+function describeError(error, fallbackKind = 'generic') {
+  const kind = error && error.kind ? error.kind : fallbackKind;
+  const label = ERROR_KIND_LABELS[kind] || ERROR_KIND_LABELS.generic;
+  const message = error && error.message ? error.message : String(error || 'неизвестная ошибка');
+  return `${label}: ${message}`;
+}
+
+function showStatus(message) {
+  const region = $('#statusRegion');
+  region.textContent = message || '';
+  region.classList.toggle('hidden', !message);
+}
+
+function showError(error, fallbackKind) {
+  const region = $('#errorRegion');
+  region.textContent = describeError(error, fallbackKind);
+  region.classList.remove('hidden');
+}
+
+function clearError() {
+  const region = $('#errorRegion');
+  region.textContent = '';
+  region.classList.add('hidden');
+}
+
+function text(value) {
+  return document.createTextNode(String(value ?? ''));
+}
+
+function create(tag, options = {}, children = []) {
+  const element = document.createElement(tag);
+  if (options.id) element.id = options.id;
+  if (options.className) element.className = options.className;
+  if (options.type) element.type = options.type;
+  if (options.text !== undefined) element.textContent = String(options.text);
+  if (options.title) element.title = options.title;
+  if (options.placeholder !== undefined) element.placeholder = options.placeholder;
+  if (options.value !== undefined) element.value = options.value;
+  if (options.checked !== undefined) element.checked = !!options.checked;
+  if (options.disabled !== undefined) element.disabled = !!options.disabled;
+  if (options.action) element.dataset.action = options.action;
+  if (options.dataset) {
+    for (const [key, value] of Object.entries(options.dataset)) element.dataset[key] = String(value ?? '');
+  }
+  if (options.attrs) {
+    for (const [key, value] of Object.entries(options.attrs)) {
+      if (value !== null && value !== undefined) element.setAttribute(key, String(value));
+    }
+  }
+  for (const child of Array.isArray(children) ? children : [children]) {
+    if (child !== null && child !== undefined) element.append(child);
+  }
+  return element;
+}
+
+function button(label, action, options = {}) {
+  return create('button', {
+    id: options.id,
+    className: options.className || '',
+    type: 'button',
+    text: label,
+    title: options.title,
+    action,
+    dataset: options.dataset,
+    attrs: options.attrs,
+  });
+}
+
+function replaceChildren(node, children) {
+  node.replaceChildren(...(Array.isArray(children) ? children : [children]));
+}
+
+function setEmpty(message, actionLabel, action) {
+  const children = [create('div', {className: 'empty-title', text: message})];
+  if (actionLabel && action) children.push(button(actionLabel, action, {className: 'ghost'}));
+  replaceChildren($('#tracks'), create('div', {id: 'empty'}, children));
 }
 
 function setHidden(node, hidden) {
@@ -114,63 +211,153 @@ function setResultState(state) {
   node.classList.toggle('login-error', state === 'error');
 }
 
-async function loadConfig() {
-  const c = await api('/api/config');
-  $('#musicRoot').value = c.music_root;
-  $('#wavMode').value = c.wav_mode || 'source';
-  $('#numbering').checked = !!c.numbering;
-  $('#btnLoginDeezer').textContent = c.user && c.user.email ? `Deezer: ${c.user.email}` : 'Deezer: вход';
-  setAuthActive($('#btnLoginDeezer'), !!(c.user && c.user.email));
-  $('#btnLoginSc').textContent = c.sc_user ? `SC: ${c.sc_user}` : 'SC: вход';
-  setAuthActive($('#btnLoginSc'), !!c.sc_user);
+function fmtDur(seconds) {
+  return seconds ? `${Math.floor(seconds / 60)}:${String(Math.round(seconds % 60)).padStart(2, '0')}` : '—';
 }
 
-// ---------- логин ----------
-let loginService = 'deezer';
+function provLabel(provider) {
+  return ({deezer: 'Deezer', sc: 'SoundCloud', local: 'Локальный', dir: 'Папка'})[provider] || provider;
+}
 
-function openLogin(service) {
+function safeCoverUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol === 'https:') return url.href;
+  } catch {
+    // Invalid or absent cover URLs render as a local placeholder.
+  }
+  return '';
+}
+
+function progressValue(done, total) {
+  const numericDone = Number(done) || 0;
+  const numericTotal = Number(total) || 0;
+  if (numericTotal <= 0) return '0';
+  return String(Math.max(0, Math.min(100, 100 * numericDone / numericTotal)));
+}
+
+function formatBadge(format) {
+  const label = String(format ?? '').trim();
+  if (!label) return null;
+  const className = FORMAT_CLASS_BY_VALUE[label.toLowerCase()] || 'fmt-other';
+  return create('span', {className: `fmt ${className}`, text: label});
+}
+
+function statusIcon(status) {
+  const icon = create('span', {className: 'st', attrs: {'aria-hidden': 'true'}});
+  if (status === 'ok') {
+    icon.classList.add('ok');
+    icon.textContent = '✔';
+  } else if (status === 'error') {
+    icon.classList.add('err');
+    icon.textContent = '⚠';
+  } else {
+    icon.classList.add('miss');
+    icon.textContent = '✖';
+  }
+  return icon;
+}
+
+function focusableDialogElements() {
+  return [...$('#modal').querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')]
+    .filter(element => !element.disabled && !element.closest('.hidden'));
+}
+
+function trapDialogFocus(event) {
+  if ($('#modalOverlay').classList.contains('hidden')) return;
+  if (event.key === 'Tab') {
+    trapDialogTabCycle(event);
+  }
+}
+
+function trapDialogTabCycle(event) {
+  const focusable = focusableDialogElements();
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+function releaseDialogFocus() {
+  if (previousFocus && typeof previousFocus.focus === 'function') previousFocus.focus();
+  previousFocus = null;
+}
+
+function openDialog(initialFocus) {
+  previousFocus = document.activeElement;
+  setHidden($('#modalOverlay'), false);
+  const target = initialFocus || focusableDialogElements()[0] || $('#modal');
+  target.focus();
+}
+
+function closeLogin() {
+  setHidden($('#modalOverlay'), true);
+  releaseDialogFocus();
+}
+
+async function loadConfig() {
+  const config = await api('/api/config');
+  $('#musicRoot').value = config.music_root || '';
+  $('#wavMode').value = config.wav_mode || 'source';
+  $('#numbering').checked = !!config.numbering;
+  $('#btnLoginDeezer').textContent = config.user && config.user.email ? `Deezer: ${config.user.email}` : 'Deezer: вход';
+  setAuthActive($('#btnLoginDeezer'), !!(config.user && config.user.email));
+  $('#btnLoginSc').textContent = config.sc_user ? `SC: ${config.sc_user}` : 'SC: вход';
+  setAuthActive($('#btnLoginSc'), !!config.sc_user);
+}
+
+async function openLogin(service) {
   loginService = service;
-  // в десктопной сборке — нативное окно логина с авто-подхватом cookie
-  if (isPackagedAppOrigin()) { tauriLogin(service); return; }
+  if (isPackagedAppOrigin()) {
+    await tauriLogin(service);
+    return;
+  }
+  clearError();
   $('#loginResult').textContent = '';
   setResultState(null);
   $('#loginToken').value = '';
   setHidden($('#scImport'), true);
+  const steps = [];
   if (service === 'deezer') {
     $('#loginTitle').textContent = 'Вход в Deezer';
-    $('#loginSteps').innerHTML = `<b>Просто email и пароль</b> — как в Saturn:<br>`;
+    steps.push(create('strong', {text: 'Просто email и пароль'}), text(' — как в Saturn:'));
     setHidden($('#loginPasswordBlock'), false);
     $('#loginToken').placeholder = '…или вставьте ARL cookie вручную сюда';
   } else {
     setHidden($('#loginPasswordBlock'), true);
     $('#loginTitle').textContent = 'Вход в SoundCloud';
-    $('#loginSteps').innerHTML = `<b>Вручную:</b> F12 → Application → Cookies → <b>oauth_token</b> на soundcloud.com → вставить ниже`;
+    steps.push(create('strong', {text: 'Вручную:'}), text(' F12 → Application → Cookies → '),
+      create('strong', {text: 'oauth_token'}), text(' на soundcloud.com → вставить ниже'));
     $('#loginToken').placeholder = 'oauth_token cookie';
   }
-  setHidden($('#modalOverlay'), false);
-  $('#loginToken').focus();
-  // уже вошли в SC — сразу показываем список импорта
+  replaceChildren($('#loginSteps'), steps);
+  openDialog($('#loginToken'));
   if (service === 'sc' && $('#btnLoginSc').textContent.startsWith('SC: ') &&
       $('#btnLoginSc').classList.contains('auth-active')) {
     setResultState('ok');
     $('#loginResult').textContent = '✔ уже выполнен вход — выберите, что импортировать';
-    loadScAccount();
+    await loadScAccount();
   }
 }
-
-function closeLogin() { setHidden($('#modalOverlay'), true); }
 
 async function tauriLogin(service) {
   try {
     const token = await invoke('service_login', {service});
     const url = service === 'deezer' ? '/api/login/deezer' : '/api/login/soundcloud';
     const body = service === 'deezer' ? {arl: token} : {oauth_token: token};
-    const r = await api(url, {body});
-    alert(`✔ Вход выполнен: ${r.email || r.username}`);
-    loadConfig();
-    if (service === 'sc') { switchTab('sc'); } else { loadPlaylists(); }
-  } catch (e) {
-    if (!String(e).includes('закрыто')) alert('Логин не удался: ' + e);
+    const result = await api(url, {body});
+    showStatus(`Вход выполнен: ${result.email || result.username}`);
+    await loadConfig();
+    if (service === 'sc') switchTab('sc');
+    else await loadPlaylists();
+  } catch (error) {
+    if (!String(error).includes('закрыто')) showError(error, 'security');
   }
 }
 
@@ -193,392 +380,487 @@ async function doLogin() {
     body = {oauth_token: token};
   }
   try {
-    const r = await api(url, {body});
+    const result = await api(url, {body});
     setResultState('ok');
-    $('#loginResult').textContent = loginService === 'deezer'
-      ? `✔ ${r.email}` : `✔ ${r.username}`;
-    loadConfig();
-    if (loginService === 'sc') loadScAccount();
-    else { closeLogin(); loadPlaylists(); }
-  } catch (e) {
+    $('#loginResult').textContent = loginService === 'deezer' ? `✔ ${result.email}` : `✔ ${result.username}`;
+    await loadConfig();
+    if (loginService === 'sc') await loadScAccount();
+    else {
+      closeLogin();
+      await loadPlaylists();
+    }
+  } catch (error) {
     setResultState('error');
-    $('#loginResult').textContent = '✖ ' + e.message;
+    $('#loginResult').textContent = describeError(error, 'security');
+    showError(error, 'security');
   }
 }
 
 async function loadScAccount() {
   try {
-    const d = await api('/api/sc/account');
-    const items = [d.likes, ...d.playlists];
-    $('#scAccountList').innerHTML = items.map(p => `
-      <label class="scacc"><input type="checkbox" class="scacc-cb"
-        data-id="${attr(p.id)}" data-title="${attr(p.title)}" data-url="${attr(p.url)}" data-count="${attr(p.count || 0)}">
-        ${esc(p.title)} <span class="dim">(${p.count ?? '?'})</span></label>`).join('');
+    const data = await api('/api/sc/account');
+    const items = [data.likes, ...data.playlists].filter(Boolean);
+    replaceChildren($('#scAccountList'), items.map(item => create('label', {className: 'scacc'}, [
+      create('input', {
+        type: 'checkbox',
+        className: 'scacc-cb',
+        dataset: {id: item.id, title: item.title, url: item.url, count: item.count || 0},
+      }),
+      text(`${item.title} `),
+      create('span', {className: 'dim', text: `(${item.count ?? '?'})`}),
+    ])));
     setHidden($('#scImport'), false);
-  } catch (e) {
+  } catch (error) {
     setResultState('error');
-    $('#loginResult').textContent = 'аккаунт не загрузился: ' + e.message;
+    $('#loginResult').textContent = describeError(error, 'security');
+    showError(error, 'security');
   }
 }
 
 async function importScAccount() {
-  const items = [...document.querySelectorAll('.scacc-cb:checked')].map(c => ({
-    id: c.dataset.id, title: c.dataset.title, url: c.dataset.url, count: +c.dataset.count}));
+  const items = [...document.querySelectorAll('.scacc-cb:checked')].map(checkbox => ({
+    id: checkbox.dataset.id,
+    title: checkbox.dataset.title,
+    url: checkbox.dataset.url,
+    count: Number(checkbox.dataset.count),
+  }));
   if (!items.length) return;
-  const r = await api('/api/sc/account/import', {body:{items}});
-  alert(`Импортировано: ${r.added}`);
+  const result = await api('/api/sc/account/import', {body: {items}});
+  showStatus(`Импортировано: ${result.added}`);
   closeLogin();
   switchTab('sc');
 }
 
 async function saveWavMode() {
-  await api('/api/config', {body:{wav_mode: $('#wavMode').value}});
+  await api('/api/config', {body: {wav_mode: $('#wavMode').value}});
+  showStatus('Режим WAV сохранен');
 }
 
 async function saveNumbering() {
-  await api('/api/config', {body:{numbering: $('#numbering').checked}});
+  await api('/api/config', {body: {numbering: $('#numbering').checked}});
+  showStatus('Нумерация сохранена');
 }
 
 async function sendReport() {
-  const text = prompt('Опишите проблему (что делали, что ожидали, что произошло):');
-  if (!text) return;
+  const reportText = prompt('Опишите проблему (что делали, что ожидали, что произошло):');
+  if (!reportText) return;
   try {
-    await api('/api/report', {body:{text, current: current ? current.title : tab}});
-    alert('Репорт отправлен, спасибо!');
-  } catch (e) {
-    alert('Не отправилось: ' + e.message);
+    await api('/api/report', {body: {text: reportText, current: current ? current.title : tab}});
+    showStatus('Репорт отправлен, спасибо!');
+  } catch (error) {
+    showError(error, 'local');
   }
 }
 
 async function saveRoot() {
-  await api('/api/config', {body:{music_root: $('#musicRoot').value}});
-  loadPlaylists();
-  if (current) loadTracks(current);
+  await api('/api/config', {body: {music_root: $('#musicRoot').value}});
+  showStatus('Корень библиотеки сохранен');
+  await loadPlaylists();
+  if (current) await loadTracks(current);
+}
+
+function playlistControl(title, cover, bodyChildren, action, dataset, active) {
+  return create('button', {
+    type: 'button',
+    className: `pl${active ? ' active' : ''}`,
+    action,
+    dataset,
+    attrs: {'aria-pressed': active ? 'true' : 'false', 'aria-label': title},
+  }, [cover, create('span', {className: 'pl-body'}, bodyChildren)]);
 }
 
 async function loadPlaylists() {
-  if (tab === 'sc') return loadScSources();
-  if (tab === 'errors') return loadErrors();
-  if (tab === 'search') return loadSearchTargets();
-  const pls = await api('/api/playlists');
-  $('#playlists').innerHTML = pls.map(p => `
-    <div class="pl ${current && current.id===p.id?'active':''}" data-action="select-playlist" data-id="${attr(p.id)}" data-title="${attr(p.title)}">
-      ${safeCoverUrl(p.cover) ? `<img src="${attr(safeCoverUrl(p.cover))}" alt="">` : '<img alt="">'}
-      <div class="pl-body">
-        <div class="t">${esc(p.title)}</div>
-        <div class="c">${p.ok||0}/${p.count} ${p.errors?`<span class="badge-err">⚠ ${p.errors}</span>`:''}</div>
-      </div>
-    </div>`).join('');
+  try {
+    clearError();
+    if (tab === 'sc') return await loadScSources();
+    if (tab === 'errors') return await loadErrors();
+    if (tab === 'search') return await loadSearchTargets();
+    const playlists = await api('/api/playlists');
+    replaceChildren($('#playlists'), playlists.map(playlist => {
+      const cover = create('img', {attrs: {alt: ''}});
+      const coverUrl = safeCoverUrl(playlist.cover);
+      if (coverUrl) cover.src = coverUrl;
+      const active = current && current.id === playlist.id;
+      return playlistControl(playlist.title, cover, [
+        create('span', {className: 't', text: playlist.title}),
+        create('span', {className: 'c'}, [
+          text(`${playlist.ok || 0}/${playlist.count}`),
+          playlist.errors ? create('span', {className: 'badge-err', text: ` ⚠ ${playlist.errors}`}) : null,
+        ]),
+      ], 'select-playlist', {id: playlist.id, title: playlist.title}, active);
+    }));
+  } catch (error) {
+    showError(error, tab === 'errors' ? 'state' : 'local');
+    replaceChildren($('#playlists'), create('div', {id: 'empty', text: describeError(error)}));
+  }
 }
 
 async function loadErrors() {
-  const errs = await api('/api/errors');
-  $('#playlists').innerHTML = (errs.length ? `
-    <div class="list-pad"><button class="full-width" data-action="retry-all">Повторить все (${errs.length})</button></div>
-    ` + errs.map((e,i) => `
-    <div class="pl pl-static">
-      <div class="pl-fill">
-        <div class="t">${esc(e.track.title)}</div>
-        <div class="c">${esc(e.playlist_title)} · ${esc(e.track.artist)}</div>
-        <div class="badge-err">${esc(e.error)}</div>
-      </div>
-      <button class="ghost button-small" data-action="retry-one" data-index="${i}">↻</button>
-    </div>`).join('')
-    : '<div id="empty">Ошибок нет 🎉</div>');
-  window._errors = errs;
+  const errors = await api('/api/errors');
+  window._errors = errors;
+  if (!errors.length) {
+    replaceChildren($('#playlists'), create('div', {id: 'empty', text: 'Ошибок нет'}));
+    return;
+  }
+  const children = [
+    create('div', {className: 'list-pad'}, button(`Повторить все (${errors.length})`, 'retry-all', {className: 'full-width'})),
+  ];
+  errors.forEach((errorItem, index) => {
+    children.push(create('div', {className: 'pl pl-static'}, [
+      create('span', {className: 'pl-fill'}, [
+        create('span', {className: 't', text: errorItem.track.title}),
+        create('span', {className: 'c', text: `${errorItem.playlist_title} · ${errorItem.track.artist}`}),
+        create('span', {className: 'badge-err', text: errorItem.error}),
+      ]),
+      button('↻', 'retry-one', {
+        className: 'ghost button-small',
+        dataset: {index},
+        attrs: {'aria-label': `Повторить ${errorItem.track.title}`},
+      }),
+    ]));
+  });
+  replaceChildren($('#playlists'), children);
 }
 
-async function retryOne(i) {
-  const e = window._errors[i];
-  await api('/api/errors/retry', {body:{playlist_key:e.playlist_key, playlist_title:e.playlist_title, track:e.track}});
+async function retryOne(index) {
+  const errorItem = window._errors[index];
+  await api('/api/errors/retry', {body: {playlist_key: errorItem.playlist_key, playlist_title: errorItem.playlist_title, track: errorItem.track}});
+  showStatus('Повтор запущен');
   startPolling();
 }
 
 async function retryAll() {
-  for (const e of (window._errors||[])) {
-    await api('/api/errors/retry', {body:{playlist_key:e.playlist_key, playlist_title:e.playlist_title, track:e.track}});
+  for (const errorItem of (window._errors || [])) {
+    await api('/api/errors/retry', {body: {playlist_key: errorItem.playlist_key, playlist_title: errorItem.playlist_title, track: errorItem.track}});
   }
+  showStatus('Повтор всех ошибок запущен');
   startPolling();
 }
 
-function switchTab(t) {
-  tab = t;
-  $('#tab-deezer').classList.toggle('active', t==='deezer');
-  $('#tab-sc').classList.toggle('active', t==='sc');
-  $('#tab-search').classList.toggle('active', t==='search');
-  $('#tab-errors').classList.toggle('active', t==='errors');
-  setFlexVisible($('#sc-add'), t === 'sc');
-  setFlexVisible($('#searchbar'), t === 'search');
-  setFlexVisible($('#searchFilters'), t === 'search');
+function switchTab(nextTab) {
+  tab = nextTab;
+  $('#tab-deezer').classList.toggle('active', nextTab === 'deezer');
+  $('#tab-sc').classList.toggle('active', nextTab === 'sc');
+  $('#tab-search').classList.toggle('active', nextTab === 'search');
+  $('#tab-errors').classList.toggle('active', nextTab === 'errors');
+  setFlexVisible($('#sc-add'), nextTab === 'sc');
+  setFlexVisible($('#searchbar'), nextTab === 'search');
+  setFlexVisible($('#searchFilters'), nextTab === 'search');
   current = null;
   setFlexVisible($('#toolbar'), false);
-  if (t === 'search') {
-    $('#tracks').innerHTML = '<div id="empty">Слева — цель (плейлист Deezer / источник SC / локальный плейлист / своя папка).<br>Ищите треки, отмечайте чекбоксами или качайте по одному. Альбомы и сеты раскрываются по клику — внутри треки качаются поштучно или все сразу.</div>';
+  if (nextTab === 'search') {
+    setEmpty('Слева — цель (плейлист Deezer / источник SC / локальный плейлист / своя папка). Ищите треки, отмечайте чекбоксами или качайте по одному. Альбомы и сеты раскрываются по клику — внутри треки качаются поштучно или все сразу.');
     setSearchFilter(searchFilter);
     loadSearchTargets();
     return;
   }
-  $('#tracks').innerHTML = t==='errors'
-    ? '<div id="empty">Треки с ошибками загрузки/верификации — слева. Кнопка ↻ перезапускает сломавшийся этап.</div>'
-    : '<div id="empty">Выберите ' + (t==='sc'?'источник':'плейлист') + ' слева</div>';
+  setEmpty(nextTab === 'errors'
+    ? 'Треки с ошибками загрузки/верификации — слева. Кнопка ↻ перезапускает сломавшийся этап.'
+    : `Выберите ${nextTab === 'sc' ? 'источник' : 'плейлист'} слева`);
   loadPlaylists();
 }
 
-// ---------- поиск ----------
-let searchTarget = null;   // {key,title,provider:'deezer'|'sc'|'local'|'dir',dir?}
-let searchFilter = 'all';
-let searchSel = {};        // "svc:tracks:i" -> track
-let searchExpanded = {};   // "svc:i" -> {loading?, tracks?}
-
-const provLabel = p => ({deezer:'Deezer', sc:'SoundCloud', local:'Локальный', dir:'Папка'})[p] || p;
-
 async function loadSearchTargets() {
-  const [dz, sc, loc] = await Promise.all([
-    api('/api/playlists'), api('/api/sc/sources'), api('/api/local/playlists')]);
+  const [deezerRows, scRows, localRows] = await Promise.all([
+    api('/api/playlists'),
+    api('/api/sc/sources'),
+    api('/api/local/playlists'),
+  ]);
   const rows = [
-    ...dz.map(p => ({key:p.id, title:p.title, provider:'deezer', count:p.count})),
-    ...sc.map(s => ({key:'sc:'+s.id, title:s.title, provider:'sc', count:s.count})),
-    ...loc.map(s => ({key:s.key, title:s.title, provider:'local', count:s.count})),
+    ...deezerRows.map(item => ({key: item.id, title: item.title, provider: 'deezer', count: item.count})),
+    ...scRows.map(item => ({key: `sc:${item.id}`, title: item.title, provider: 'sc', count: item.count})),
+    ...localRows.map(item => ({key: item.key, title: item.title, provider: 'local', count: item.count})),
   ];
   if (!searchTarget && rows.length) searchTarget = rows[0];
   window._targets = rows;
-  const cur = searchTarget
-    ? `${provLabel(searchTarget.provider)} · ${searchTarget.title}`
-    : 'не выбрана';
-  $('#playlists').innerHTML = `
-    <div id="targetBox">
-      <div class="cap">Цель загрузки / добавления</div>
-      <div class="cur" title="${attr(cur)}">${esc(cur)}</div>
-      <div class="acts">
-        <button class="ghost" data-action="create-target-playlist" data-kind="deezer" title="Новый плейлист в Deezer">＋Deezer</button>
-        <button class="ghost" data-action="create-target-playlist" data-kind="local" title="Новый локальный плейлист (SoundCloud не даёт создавать плейлисты через API — создаётся локальная папка-плейлист, URL можно привязать позже)">＋Локальный (SC)</button>
-        <button class="ghost" data-action="choose-custom-dir" title="Скачивать в произвольную папку">📁 Папка…</button>
-      </div>
-    </div>` + rows.map((r,i) => `
-    <div class="pl ${searchTarget && searchTarget.key===r.key?'active':''}" data-action="set-search-target" data-index="${i}">
-      <img alt="">
-      <div class="pl-body">
-        <div class="t">${esc(r.title)}</div>
-        <div class="c">${provLabel(r.provider)} · ${r.count ?? '?'}</div>
-      </div>
-    </div>`).join('');
+  const currentTarget = searchTarget ? `${provLabel(searchTarget.provider)} · ${searchTarget.title}` : 'не выбрана';
+  const targetBox = create('div', {id: 'targetBox'}, [
+    create('div', {className: 'cap', text: 'Цель загрузки / добавления'}),
+    create('div', {className: 'cur', text: currentTarget, title: currentTarget}),
+    create('div', {className: 'acts'}, [
+      button('＋Deezer', 'create-target-playlist', {className: 'ghost', dataset: {kind: 'deezer'}, title: 'Новый плейлист в Deezer'}),
+      button('＋Локальный (SC)', 'create-target-playlist', {className: 'ghost', dataset: {kind: 'local'}, title: 'Новый локальный плейлист (SoundCloud не даёт создавать плейлисты через API — создаётся локальная папка-плейлист, URL можно привязать позже)'}),
+      button('📁 Папка…', 'choose-custom-dir', {className: 'ghost', title: 'Скачивать в произвольную папку'}),
+    ]),
+  ]);
+  const controls = [targetBox];
+  rows.forEach((row, index) => {
+    const active = searchTarget && searchTarget.key === row.key;
+    controls.push(playlistControl(row.title, create('img', {attrs: {alt: ''}}), [
+      create('span', {className: 't', text: row.title}),
+      create('span', {className: 'c', text: `${provLabel(row.provider)} · ${row.count ?? '?'}`}),
+    ], 'set-search-target', {index}, active));
+  });
+  replaceChildren($('#playlists'), controls);
 }
 
-function setSearchTarget(i) {
-  searchTarget = window._targets[i];
+function setSearchTarget(index) {
+  searchTarget = window._targets[index];
   loadSearchTargets();
 }
 
 async function chooseCustomDir() {
-  const r = await api('/api/browse');
-  if (!r.path) return;
-  searchTarget = {key:'', title:r.path, provider:'dir', dir:r.path};
-  loadSearchTargets();
+  const result = await api('/api/browse');
+  if (!result.path) return;
+  searchTarget = {key: '', title: result.path, provider: 'dir', dir: result.path};
+  await loadSearchTargets();
 }
 
 async function createTargetPlaylist(kind) {
   if (kind === 'deezer') {
     const title = prompt('Название нового плейлиста в Deezer:');
     if (!title) return;
-    const r = await api('/api/deezer/playlist/create', {body:{title, track_ids:[]}});
-    searchTarget = {key:r.id, title:r.title, provider:'deezer'};
+    const result = await api('/api/deezer/playlist/create', {body: {title, track_ids: []}});
+    searchTarget = {key: result.id, title: result.title, provider: 'deezer'};
   } else {
     const title = prompt('Название локального плейлиста (папка в библиотеке; в SoundCloud плейлисты через API создавать нельзя):');
     if (!title) return;
-    const r = await api('/api/local/playlists', {body:{title}});
-    searchTarget = {key:r.key, title:r.title, provider:'local'};
+    const result = await api('/api/local/playlists', {body: {title}});
+    searchTarget = {key: result.key, title: result.title, provider: 'local'};
   }
-  loadSearchTargets();
+  await loadSearchTargets();
 }
 
-function setSearchFilter(f) {
-  searchFilter = f;
-  document.querySelectorAll('#searchFilters .chip').forEach(c =>
-    c.classList.toggle('active', c.dataset.f === f));
+function setSearchFilter(filter) {
+  searchFilter = filter;
+  document.querySelectorAll('#searchFilters .chip').forEach(chip =>
+    chip.classList.toggle('active', chip.dataset.f === filter));
   if (window._search) renderSearch();
 }
 
 async function runSearch() {
-  const q = $('#searchInput').value.trim();
-  if (!q) return;
-  searchSel = {}; searchExpanded = {};
-  $('#tracks').innerHTML = '<div id="empty">Ищу…</div>';
+  const query = $('#searchInput').value.trim();
+  if (!query) return;
+  searchSel = {};
+  searchExpanded = {};
+  setEmpty('Ищу…');
   try {
-    const d = await api(`/api/search?q=${encodeURIComponent(q)}&service=${$('#searchService').value}`);
-    window._search = d;
+    const data = await api(`/api/search?q=${encodeURIComponent(query)}&service=${$('#searchService').value}`);
+    window._search = data;
     setSearchFilter(searchFilter);
-  } catch (e) {
-    $('#tracks').innerHTML = `<div id="empty">⚠ ${esc(e.message)}</div>`;
+  } catch (error) {
+    showError(error, 'local');
+    setEmpty(describeError(error));
   }
 }
 
-function _selKey(svc, i) { return `${svc}:${i}`; }
+function _selKey(service, index) {
+  return `${service}:${index}`;
+}
 
-function _trackCb(svc, i, t) {
-  const k = _selKey(svc, i);
-  if (searchSel[k]) delete searchSel[k]; else searchSel[k] = t;
-  document.getElementById('cb-'+svc+'-'+i).checked = !!searchSel[k];
+function _trackCb(service, index, track) {
+  const key = _selKey(service, index);
+  if (searchSel[key]) delete searchSel[key];
+  else searchSel[key] = track;
+  const checkbox = document.getElementById(`cb-${service}-${index}`);
+  if (checkbox) checkbox.checked = !!searchSel[key];
   _renderBasket();
 }
 
 function _renderBasket() {
-  const n = Object.keys(searchSel).length;
-  let b = document.getElementById('basket');
-  if (!n) { if (b) b.remove(); return; }
-  if (!b) {
-    b = document.createElement('div');
-    b.id = 'basket';
-    $('#tracks').appendChild(b);
+  const count = Object.keys(searchSel).length;
+  const oldBasket = document.getElementById('basket');
+  if (!count) {
+    if (oldBasket) oldBasket.remove();
+    return;
   }
-  const tgt = searchTarget ? `${provLabel(searchTarget.provider)} · ${searchTarget.title}` : '—';
-  b.innerHTML = `<b>${n} тр.</b>
-    <button data-action="dl-basket">⬇ в цель: ${esc(tgt)}</button>
-    <button class="ghost" data-action="clear-basket">✕ очистить</button>`;
+  const target = searchTarget ? `${provLabel(searchTarget.provider)} · ${searchTarget.title}` : '—';
+  const basket = oldBasket || create('div', {id: 'basket'});
+  replaceChildren(basket, [
+    create('strong', {text: `${count} тр.`}),
+    button(`⬇ в цель: ${target}`, 'dl-basket'),
+    button('✕ очистить', 'clear-basket', {className: 'ghost'}),
+  ]);
+  if (!oldBasket) $('#tracks').append(basket);
 }
 
-function _trackRow(svc, i, t, indent) {
-  const checked = searchSel[_selKey(svc,i)] ? 'checked' : '';
-  return `<div class="srow">
-    <input type="checkbox" class="cb" id="cb-${svc}-${i}" ${checked} data-action="track-checkbox" data-service="${svc}" data-index="${i}">
-    <div class="tt" title="${attr(`${t.title ?? ''} — ${t.artist ?? ''}`)}">${esc(t.title)} <span class="meta">${esc(t.artist)} · ${fmtDur(t.duration)}</span></div>
-    <span class="prov ${svc==='sc'?'sc':''}">${svc==='sc'?'SC':'DZ'}</span>
-    ${svc==='deezer' ? `<button class="ghost" title="Добавить в плейлист Deezer без скачивания" data-action="add-dz-track" data-index="${i}">＋</button>` : ''}
-    <button title="Скачать в цель" data-action="dl-search-track" data-service="${svc}" data-index="${i}">⬇</button>
-  </div>`;
+function trackRow(service, index, track) {
+  return create('div', {className: 'srow'}, [
+    create('input', {
+      id: `cb-${service}-${index}`,
+      type: 'checkbox',
+      className: 'cb',
+      checked: !!searchSel[_selKey(service, index)],
+      action: 'track-checkbox',
+      dataset: {service, index},
+    }),
+    create('div', {className: 'tt', title: `${track.title ?? ''} — ${track.artist ?? ''}`}, [
+      text(track.title),
+      create('span', {className: 'meta', text: ` ${track.artist ?? ''} · ${fmtDur(track.duration)}`}),
+    ]),
+    create('span', {className: `prov${service === 'sc' ? ' sc' : ''}`, text: service === 'sc' ? 'SC' : 'DZ'}),
+    service === 'deezer' ? button('＋', 'add-dz-track', {className: 'ghost', title: 'Добавить в плейлист Deezer без скачивания', dataset: {index}}) : null,
+    button('⬇', 'dl-search-track', {title: 'Скачать в цель', dataset: {service, index}}),
+  ]);
 }
 
-function _albumRow(svc, i, a) {
-  const k = svc+':'+i;
-  const exp = searchExpanded[k];
-  const arrow = exp && exp.tracks ? '▾' : '▸';
-  let html = `<div class="srow exp" data-action="toggle-album" data-service="${svc}" data-index="${i}">
-    <div class="tt">${arrow} 💿 ${esc(a.title)} <span class="meta">${esc(a.artist)}${a.count?` · ${a.count} тр.`:''}</span></div>
-    <span class="prov ${svc==='sc'?'sc':''}">${svc==='sc'?'SC':'DZ'}</span>
-  </div>`;
-  if (exp) {
-    if (exp.loading) html += `<div class="stracks"><div class="srow dim">Загружаю треки…</div></div>`;
-    else if (exp.error) html += `<div class="stracks"><div class="srow errtext">⚠ ${esc(exp.error)}</div></div>`;
-    else if (exp.tracks) {
-      html += `<div class="stracks">` + exp.tracks.map((t,j) => `
-        <div class="srow">
-          <div class="tt" title="${attr(`${t.title ?? ''} — ${t.artist ?? ''}`)}">${esc(t.title)} <span class="meta">${esc(t.artist)} · ${fmtDur(t.duration)}</span></div>
-          <button title="Скачать в цель" data-action="dl-album-track" data-service="${svc}" data-index="${i}" data-track-index="${j}">⬇</button>
-        </div>`).join('') +
-        `<div class="srow"><div class="tt dim">${exp.tracks.length} тр.</div>
-          <button data-action="dl-whole-album" data-service="${svc}" data-index="${i}">⬇ все</button></div></div>`;
-    }
+function albumRow(service, index, album) {
+  const key = `${service}:${index}`;
+  const expanded = searchExpanded[key];
+  const toggle = button(`${expanded && expanded.tracks ? '▾' : '▸'} 💿 ${album.title}`, 'toggle-album', {
+    className: 'srow exp',
+    dataset: {service, index},
+    attrs: {'aria-expanded': expanded ? 'true' : 'false'},
+  });
+  toggle.append(create('span', {className: 'meta', text: ` ${album.artist ?? ''}${album.count ? ` · ${album.count} тр.` : ''}`}));
+  toggle.append(create('span', {className: `prov${service === 'sc' ? ' sc' : ''}`, text: service === 'sc' ? 'SC' : 'DZ'}));
+  const children = [toggle];
+  if (!expanded) return children;
+
+  const expandedBox = create('div', {className: 'stracks'});
+  if (expanded.loading) {
+    expandedBox.append(create('div', {className: 'srow dim', text: 'Загружаю треки…'}));
+  } else if (expanded.error) {
+    expandedBox.append(create('div', {className: 'srow errtext', text: `⚠ ${expanded.error}`}));
+  } else if (expanded.tracks) {
+    expanded.tracks.forEach((track, trackIndex) => {
+      expandedBox.append(create('div', {className: 'srow'}, [
+        create('div', {className: 'tt', title: `${track.title ?? ''} — ${track.artist ?? ''}`}, [
+          text(track.title),
+          create('span', {className: 'meta', text: ` ${track.artist ?? ''} · ${fmtDur(track.duration)}`}),
+        ]),
+        button('⬇', 'dl-album-track', {title: 'Скачать в цель', dataset: {service, index, trackIndex}}),
+      ]));
+    });
+    expandedBox.append(create('div', {className: 'srow'}, [
+      create('div', {className: 'tt dim', text: `${expanded.tracks.length} тр.`}),
+      button('⬇ все', 'dl-whole-album', {dataset: {service, index}}),
+    ]));
   }
-  return html;
+  children.push(expandedBox);
+  return children;
 }
 
-async function toggleAlbum(svc, i) {
-  const k = svc+':'+i;
-  if (searchExpanded[k] && !searchExpanded[k].loading) { delete searchExpanded[k]; renderSearch(); return; }
-  searchExpanded[k] = {loading:true};
+async function toggleAlbum(service, index) {
+  const key = `${service}:${index}`;
+  if (searchExpanded[key] && !searchExpanded[key].loading) {
+    delete searchExpanded[key];
+    renderSearch();
+    return;
+  }
+  searchExpanded[key] = {loading: true};
   renderSearch();
   try {
-    const a = window._search[svc].albums[i];
-    searchExpanded[k] = {tracks: svc === 'deezer'
-      ? await api(`/api/deezer/album/${a.id}`)
-      : await api(`/api/sc/resolve-tracks?url=${encodeURIComponent(a.url)}`)};
-  } catch (e) {
-    searchExpanded[k] = {error: e.message};
+    const album = window._search[service].albums[index];
+    searchExpanded[key] = {tracks: service === 'deezer'
+      ? await api(`/api/deezer/album/${album.id}`)
+      : await api(`/api/sc/resolve-tracks?url=${encodeURIComponent(album.url)}`)};
+  } catch (error) {
+    searchExpanded[key] = {error: describeError(error, 'local')};
   }
   renderSearch();
+}
+
+function createSearchSection(title, rows) {
+  return create('section', {className: 'search-sec-wrap', attrs: {'aria-label': title}}, [
+    create('div', {className: 'search-sec', text: title}),
+    ...rows,
+  ]);
 }
 
 function renderSearch() {
-  const d = window._search || {};
-  const f = searchFilter;
-  let html = '';
+  const data = window._search || {};
   const sections = [];
-  for (const [svc, label] of [['deezer','Deezer'],['sc','SoundCloud']]) {
-    const s = d[svc];
-    if (!s) continue;
-    if ((f==='all'||f==='tracks') && s.tracks.length)
-      sections.push([`${label} — треки`, s.tracks.map((t,i) => _trackRow(svc,i,t)).join('')]);
-    const isPl = f==='playlists';
-    if ((f==='all'||f==='albums'||isPl) && s.albums.length) {
-      const kind = svc==='deezer' ? 'альбомы' : 'плейлисты и сеты';
-      if (!(isPl && svc==='deezer'))
-        sections.push([`${label} — ${kind}`, s.albums.map((a,i) => _albumRow(svc,i,a)).join('')]);
+  for (const [service, label] of [['deezer', 'Deezer'], ['sc', 'SoundCloud']]) {
+    const serviceData = data[service];
+    if (!serviceData) continue;
+    if ((searchFilter === 'all' || searchFilter === 'tracks') && serviceData.tracks.length) {
+      sections.push(createSearchSection(`${label} — треки`, serviceData.tracks.map((track, index) => trackRow(service, index, track))));
     }
-    if ((f==='all'||f==='artists') && s.artists.length)
-      sections.push([`${label} — исполнители`,
-        s.artists.map(a => `<div class="srow"><div class="tt">👤 ${esc(a.name)}</div></div>`).join('')]);
+    const isPlaylistFilter = searchFilter === 'playlists';
+    if ((searchFilter === 'all' || searchFilter === 'albums' || isPlaylistFilter) && serviceData.albums.length) {
+      const kind = service === 'deezer' ? 'альбомы' : 'плейлисты и сеты';
+      if (!(isPlaylistFilter && service === 'deezer')) {
+        sections.push(createSearchSection(`${label} — ${kind}`, serviceData.albums.flatMap((album, index) => albumRow(service, index, album))));
+      }
+    }
+    if ((searchFilter === 'all' || searchFilter === 'artists') && serviceData.artists.length) {
+      sections.push(createSearchSection(`${label} — исполнители`, serviceData.artists.map(artist =>
+        create('div', {className: 'srow'}, create('div', {className: 'tt', text: `👤 ${artist.name}`})))));
+    }
   }
-  html = sections.map(([t,rows]) => `<div class="search-sec">${t}</div>${rows}`).join('');
-  $('#tracks').innerHTML = html || '<div id="empty">Ничего не найдено</div>';
+  replaceChildren($('#tracks'), sections.length ? sections : create('div', {id: 'empty', text: 'Ничего не найдено'}));
   _renderBasket();
 }
 
-function _dlPayload(tracks) {
-  if (!searchTarget) { alert('Слева выберите цель (плейлист или папку)'); return null; }
-  if (searchTarget.provider === 'dir')
-    return {target_key:'dir', target_title: searchTarget.title, target_dir: searchTarget.dir, tracks};
-  return {target_key: searchTarget.key, target_title: searchTarget.title, tracks};
+function _dlPayload(trackList) {
+  if (!searchTarget) {
+    showError(new Error('Слева выберите цель (плейлист или папку)'), 'state');
+    return null;
+  }
+  if (searchTarget.provider === 'dir') {
+    return {target_key: 'dir', target_title: searchTarget.title, target_dir: searchTarget.dir, tracks: trackList};
+  }
+  return {target_key: searchTarget.key, target_title: searchTarget.title, tracks: trackList};
 }
 
-async function dlSearchTrack(svc, i) {
-  const t = window._search[svc].tracks[i];
-  const body = _dlPayload([{id:t.id, title:t.title, artist:t.artist, duration:t.duration, url:t.url, provider:svc}]);
+async function dlSearchTrack(service, index) {
+  const track = window._search[service].tracks[index];
+  const body = _dlPayload([{id: track.id, title: track.title, artist: track.artist, duration: track.duration, url: track.url, provider: service}]);
   if (!body) return;
-  const r = await api('/api/search/download', {body});
-  if (r.added_to_deezer) console.log(`+${r.added_to_deezer} в плейлист Deezer`);
+  await api('/api/search/download', {body});
+  showStatus('Трек поставлен в очередь');
   startPolling();
 }
 
-async function dlAlbumTrack(svc, i, j) {
-  const t = searchExpanded[svc+':'+i].tracks[j];
-  const body = _dlPayload([{id:t.id, title:t.title, artist:t.artist, duration:t.duration, url:t.url, provider:svc}]);
+async function dlAlbumTrack(service, index, trackIndex) {
+  const track = searchExpanded[`${service}:${index}`].tracks[trackIndex];
+  const body = _dlPayload([{id: track.id, title: track.title, artist: track.artist, duration: track.duration, url: track.url, provider: service}]);
   if (!body) return;
   await api('/api/search/download', {body});
+  showStatus('Трек поставлен в очередь');
   startPolling();
 }
 
-async function dlWholeAlbum(svc, i) {
-  const a = window._search[svc].albums[i];
-  const tracks = searchExpanded[svc+':'+i].tracks;
-  const body = _dlPayload(tracks.map(t => ({id:t.id, title:t.title, artist:t.artist, duration:t.duration, url:t.url, provider:svc})));
+async function dlWholeAlbum(service, index) {
+  const album = window._search[service].albums[index];
+  const albumTracks = searchExpanded[`${service}:${index}`].tracks;
+  const body = _dlPayload(albumTracks.map(track => ({id: track.id, title: track.title, artist: track.artist, duration: track.duration, url: track.url, provider: service})));
   if (!body) return;
   await api('/api/search/download', {body});
-  alert(`«${a.title}» поставлен в очередь (${tracks.length} треков)`);
+  showStatus(`«${album.title}» поставлен в очередь (${albumTracks.length} треков)`);
   startPolling();
 }
 
 async function dlBasket() {
-  const tracks = Object.values(searchSel).map(t => ({id:t.id, title:t.title, artist:t.artist, duration:t.duration, url:t.url, provider:t.provider}));
-  const body = _dlPayload(tracks);
+  const selected = Object.values(searchSel).map(track => ({id: track.id, title: track.title, artist: track.artist, duration: track.duration, url: track.url, provider: track.provider}));
+  const body = _dlPayload(selected);
   if (!body) return;
   await api('/api/search/download', {body});
-  alert(`Поставлено в очередь: ${tracks.length} тр.`);
+  showStatus(`Поставлено в очередь: ${selected.length} тр.`);
   searchSel = {};
   _renderBasket();
   renderSearch();
   startPolling();
 }
 
-async function addDzTrack(i) {
+async function addDzTrack(index) {
   if (!searchTarget || searchTarget.provider !== 'deezer') {
-    return alert('Выберите слева плейлист Deezer как цель');
+    showError(new Error('Выберите слева плейлист Deezer как цель'), 'state');
+    return;
   }
-  const t = window._search.deezer.tracks[i];
-  const r = await api('/api/deezer/playlist/add', {body:{playlist_id: searchTarget.key, track_ids:[t.id]}});
-  alert(`«${t.title}» добавлен в «${searchTarget.title}»`);
+  const track = window._search.deezer.tracks[index];
+  await api('/api/deezer/playlist/add', {body: {playlist_id: searchTarget.key, track_ids: [track.id]}});
+  showStatus(`«${track.title}» добавлен в «${searchTarget.title}»`);
 }
 
 async function loadScSources() {
-  // автосинк аккаунта: свои + лайкнутые плейлисты + лайки (если выполнен вход)
-  try { await api('/api/sc/sync-account', {body:{}}); } catch (e) { /* не вошли — ок */ }
-  const srcs = await api('/api/sc/sources');
-  $('#playlists').innerHTML = (srcs.map(s => `
-    <div class="pl ${current && current.id===s.id?'active':''}" data-action="select-sc-source" data-id="${attr(s.id)}" data-title="${attr(s.title)}">
-      <img alt="">
-      <div class="pl-body">
-        <div class="t">${esc(s.title)}</div>
-        <div class="c">${s.ok||0}/${s.count ?? '?'} ${s.errors?`<span class="badge-err">⚠ ${s.errors}</span>`:''}</div>
-      </div>
-    </div>`).join('')) || '<div id="empty">Войдите через «SC: вход» — плейлисты аккаунта появятся сами.<br>Или добавьте URL выше.</div>';
+  try { await api('/api/sc/sync-account', {body: {}}); } catch { /* Not signed in; source list still loads. */ }
+  const sources = await api('/api/sc/sources');
+  if (!sources.length) {
+    replaceChildren($('#playlists'), create('div', {id: 'empty', text: 'Войдите через «SC: вход» — плейлисты аккаунта появятся сами. Или добавьте URL выше.'}));
+    return;
+  }
+  replaceChildren($('#playlists'), sources.map(source => {
+    const active = current && current.id === source.id;
+    return playlistControl(source.title, create('img', {attrs: {alt: ''}}), [
+      create('span', {className: 't', text: source.title}),
+      create('span', {className: 'c'}, [
+        text(`${source.ok || 0}/${source.count ?? '?'}`),
+        source.errors ? create('span', {className: 'badge-err', text: ` ⚠ ${source.errors}`}) : null,
+      ]),
+    ], 'select-sc-source', {id: source.id, title: source.title}, active);
+  }));
 }
 
 async function addScSource() {
@@ -586,80 +868,103 @@ async function addScSource() {
   if (!url) return;
   $('#scUrl').value = '';
   try {
-    await api('/api/sc/sources', {body:{url}});
-  } catch (e) { alert(e.message); }
-  loadPlaylists();
+    await api('/api/sc/sources', {body: {url}});
+    showStatus('Источник SoundCloud добавлен');
+  } catch (error) {
+    showError(error, 'local');
+  }
+  await loadPlaylists();
 }
 
 async function delScSource(id) {
   if (!confirm('Убрать источник из списка? (файлы останутся)')) return;
-  await api(`/api/sc/sources/${id}`, {method:'DELETE'});
-  if (current && current.id === id) { current = null; setFlexVisible($('#toolbar'), false); }
-  loadPlaylists();
+  await api(`/api/sc/sources/${id}`, {method: 'DELETE'});
+  if (current && current.id === id) {
+    current = null;
+    setFlexVisible($('#toolbar'), false);
+  }
+  await loadPlaylists();
 }
+void delScSource;
 
 function selectScSource(id, title) {
-  current = {kind:'sc', id, title};
+  current = {kind: 'sc', id, title};
   loadPlaylists();
   loadTracks(current);
 }
 
 function selectPlaylist(id, title) {
-  current = {kind:'deezer', id, title};
+  current = {kind: 'deezer', id, title};
   loadPlaylists();
   loadTracks(current);
 }
 
-async function loadTracks(pl) {
+async function loadTracks(playlist) {
   setFlexVisible($('#toolbar'), true);
-  $('#pltitle').textContent = pl.title;
-  $('#tracks').innerHTML = '<div id="empty">Загрузка… (большие плейлисты — до ~20 сек)</div>';
+  $('#pltitle').textContent = playlist.title;
+  setEmpty('Загрузка… (большие плейлисты — до ~20 сек)');
   try {
-    const url = pl.kind === 'sc'
-      ? `/api/sc/sources/${pl.id}/tracks`
-      : `/api/playlists/${pl.id}/tracks?title=${encodeURIComponent(pl.title)}`;
-    const d = await api(url);
-    tracks = d.tracks;
-    $('#plpath').textContent = d.path;
+    const url = playlist.kind === 'sc'
+      ? `/api/sc/sources/${playlist.id}/tracks`
+      : `/api/playlists/${playlist.id}/tracks?title=${encodeURIComponent(playlist.title)}`;
+    const data = await api(url);
+    tracks = data.tracks;
+    $('#plpath').textContent = data.path || '';
     renderTracks();
-  } catch (e) {
-    $('#tracks').innerHTML = `<div id="empty">⚠ Не удалось загрузить: ${esc(e.message)}<br><br>
-      <button class="ghost" data-action="rescan">Повторить</button></div>`;
+  } catch (error) {
+    showError(error, 'state');
+    setEmpty(`Не удалось загрузить: ${describeError(error, 'state')}`, 'Повторить', 'rescan');
   }
 }
 
 function renderTracks() {
-  const icon = {ok:'<span class="st ok">✔</span>', error:'<span class="st err">⚠</span>', missing:'<span class="st miss">✖</span>'};
-  const ok = tracks.filter(t=>t.status==='ok').length;
-  const err = tracks.filter(t=>t.status==='error').length;
+  const ok = tracks.filter(track => track.status === 'ok').length;
+  const err = tracks.filter(track => track.status === 'error').length;
   const miss = tracks.length - ok - err;
   $('#plstats').textContent = `✔ ${ok} · ✖ ${miss} · ⚠ ${err}`;
-  const flipped = tracks.filter(t=>t.flipped).length;
+  const flipped = tracks.filter(track => track.flipped).length;
   $('#flipBtn').textContent = flipped ? `⇄ FLAC (${flipped} в WAV)` : '⇄ WAV';
-  $('#tracks').innerHTML = `<table>
-    <tr><th><input type="checkbox" id="all" data-action="toggle-all"></th>
-        <th></th><th>Название</th><th>Исполнитель</th><th>Альбом</th><th>⏱</th><th>Формат</th></tr>
-    ${tracks.map((t,i) => `
-    <tr>
-      <td><input type="checkbox" class="trk" data-i="${i}" ${t.status==='ok'?'disabled':''}></td>
-      <td>${icon[t.status]||''}</td>
-      <td>${esc(t.title)}${t.error?`<div class="errtext">${esc(t.error)}</div>`:''}</td>
-      <td>${esc(t.artist)}</td><td class="dim">${esc(t.album)}</td>
-      <td class="dim">${fmtDur(t.duration)}</td>
-      <td>${formatBadge(t.format)}${t.flipped?'<span class="fmt fmt-wav">→wav</span>':''}${t.mp3_source?'<span class="fmt fmt-mp3src" title="mp3-источник: после конвертации в WAV кью могут сместиться на ~26 мс">mp3</span>':''}</td>
-    </tr>`).join('')}
-  </table>`;
+  const table = create('table', {attrs: {'aria-label': 'Треки плейлиста'}});
+  const thead = create('thead');
+  thead.append(create('tr', {}, [
+    create('th', {}, create('input', {type: 'checkbox', id: 'all', action: 'toggle-all', attrs: {'aria-label': 'Выбрать все недостающие треки'}})),
+    create('th', {text: 'Статус'}),
+    create('th', {text: 'Название'}),
+    create('th', {text: 'Исполнитель'}),
+    create('th', {text: 'Альбом'}),
+    create('th', {text: '⏱'}),
+    create('th', {text: 'Формат'}),
+  ]));
+  const tbody = create('tbody');
+  tracks.forEach((track, index) => {
+    const formatCell = create('td');
+    const badge = formatBadge(track.format);
+    if (badge) formatCell.append(badge);
+    if (track.flipped) formatCell.append(create('span', {className: 'fmt fmt-wav', text: '→wav'}));
+    if (track.mp3_source) formatCell.append(create('span', {className: 'fmt fmt-mp3src', text: 'mp3', title: 'mp3-источник: после конвертации в WAV кью могут сместиться на ~26 мс'}));
+    tbody.append(create('tr', {}, [
+      create('td', {}, create('input', {type: 'checkbox', className: 'trk', disabled: track.status === 'ok', dataset: {i: index}, attrs: {'aria-label': `Выбрать ${track.title}`}})),
+      create('td', {}, statusIcon(track.status)),
+      create('td', {}, [text(track.title), track.error ? create('div', {className: 'errtext', text: track.error}) : null]),
+      create('td', {text: track.artist}),
+      create('td', {className: 'dim', text: track.album}),
+      create('td', {className: 'dim', text: fmtDur(track.duration)}),
+      formatCell,
+    ]));
+  });
+  table.append(thead, tbody);
+  replaceChildren($('#tracks'), table);
 }
 
-function toggleAll(v) {
-  document.querySelectorAll('.trk:not(:disabled)').forEach(c => c.checked = v);
+function toggleAll(value) {
+  document.querySelectorAll('.trk:not(:disabled)').forEach(checkbox => { checkbox.checked = value; });
 }
 
 function selectedTracks(onlyMissing = false) {
-  const idxs = [...document.querySelectorAll('.trk:checked')].map(c => +c.dataset.i);
-  let sel = idxs.map(i => tracks[i]);
-  if (onlyMissing) sel = sel.filter(t => t.status !== 'ok');
-  return sel.map(t => ({id:t.id, title:t.title, artist:t.artist, duration:t.duration, url:t.url, total:tracks.length}));
+  const indexes = [...document.querySelectorAll('.trk:checked')].map(checkbox => Number(checkbox.dataset.i));
+  let selected = indexes.map(index => tracks[index]);
+  if (onlyMissing) selected = selected.filter(track => track.status !== 'ok');
+  return selected.map(track => ({id: track.id, title: track.title, artist: track.artist, duration: track.duration, url: track.url, total: tracks.length}));
 }
 
 function downloadUrl(mode) {
@@ -670,101 +975,131 @@ function downloadUrl(mode) {
 }
 
 async function downloadSelected() {
-  const sel = selectedTracks(true);
-  if (!sel.length) return alert('Ничего не выбрано (уже скачанные пропускаются)');
-  await api(downloadUrl('append'), {body:{tracks:sel}});
+  const selected = selectedTracks(true);
+  if (!selected.length) {
+    showError(new Error('Ничего не выбрано (уже скачанные пропускаются)'), 'state');
+    return;
+  }
+  await api(downloadUrl('append'), {body: {tracks: selected}});
+  showStatus('Выбранные треки поставлены в очередь');
   startPolling();
 }
 
 async function syncPlaylistOrder() {
-  // 1) перенумеровать существующие файлы по порядку стриминга
-  const order = tracks.map(t => t.id);
-  const key = current.kind === 'sc' ? 'sc:' + current.id : current.id;
-  const rn = await api(`/api/playlists/${key}/renumber?title=${encodeURIComponent(current.title)}`,
-                       {body:{order, total: tracks.length}});
-  // 2) докачать недостающие с позициями из плейлиста
-  const missing = tracks.filter(t => t.status !== 'ok')
-    .map((t) => ({id:t.id, title:t.title, artist:t.artist, duration:t.duration, url:t.url,
-                  position: tracks.indexOf(t)+1, total: tracks.length}));
+  const order = tracks.map(track => track.id);
+  const key = current.kind === 'sc' ? `sc:${current.id}` : current.id;
+  const renumber = await api(`/api/playlists/${key}/renumber?title=${encodeURIComponent(current.title)}`,
+    {body: {order, total: tracks.length}});
+  const missing = tracks.filter(track => track.status !== 'ok')
+    .map(track => ({id: track.id, title: track.title, artist: track.artist, duration: track.duration, url: track.url,
+      position: tracks.indexOf(track) + 1, total: tracks.length}));
   if (!missing.length) {
-    alert(`Порядок применён (переименовано: ${rn.renamed}). Всё уже скачано.`);
-    rescan(); return;
+    showStatus(`Порядок применён (переименовано: ${renumber.renamed}). Всё уже скачано.`);
+    rescan();
+    return;
   }
-  if (!confirm(`Перенумеровано: ${rn.renamed}. Скачать ${missing.length} треков?`)) { rescan(); return; }
-  await api(downloadUrl('playlist_order'), {body:{tracks:missing}});
+  if (!confirm(`Перенумеровано: ${renumber.renamed}. Скачать ${missing.length} треков?`)) {
+    rescan();
+    return;
+  }
+  await api(downloadUrl('playlist_order'), {body: {tracks: missing}});
+  showStatus('Синк по порядку поставлен в очередь');
   startPolling();
 }
 
 async function syncAppend() {
-  const missing = tracks.filter(t => t.status !== 'ok')
-    .map(t => ({id:t.id, title:t.title, artist:t.artist, duration:t.duration, url:t.url, total:tracks.length}));
-  if (!missing.length) return alert('Всё уже скачано');
+  const missing = tracks.filter(track => track.status !== 'ok')
+    .map(track => ({id: track.id, title: track.title, artist: track.artist, duration: track.duration, url: track.url, total: tracks.length}));
+  if (!missing.length) {
+    showStatus('Всё уже скачано');
+    return;
+  }
   if (!confirm(`Скачать ${missing.length} треков (новые — вниз списка)?`)) return;
-  await api(downloadUrl('append'), {body:{tracks:missing}});
+  await api(downloadUrl('append'), {body: {tracks: missing}});
+  showStatus('Новые треки поставлены в очередь');
   startPolling();
 }
 
 async function rbSync() {
-  const key = current.kind === 'sc' ? 'sc:' + current.id : current.id;
+  const key = current.kind === 'sc' ? `sc:${current.id}` : current.id;
   if (!confirm(`Синхронизировать «${current.title}» в Rekordbox?\nRekordbox должен быть ЗАКРЫТ. Бэкап master.db будет создан автоматически.`)) return;
   try {
-    const r = await api('/api/rb/sync', {body:{playlist_key:key, playlist_title:current.title}});
-    alert(`Готово: плейлист «${r.playlist}»\nновых треков в коллекции: ${r.added_content}\nдобавлено в плейлист: ${r.added_to_playlist}\n\n${r.note}`);
-  } catch (e) {
-    alert('⚠ ' + e.message);
+    const result = await api('/api/rb/sync', {body: {playlist_key: key, playlist_title: current.title}});
+    showStatus(`Rekordbox: плейлист «${result.playlist}», новых треков: ${result.added_content}, добавлено в плейлист: ${result.added_to_playlist}. ${result.note}`);
+  } catch (error) {
+    showError(error, 'rekordbox');
   }
 }
 
 async function flipWav() {
-  const flipped = tracks.filter(t => t.flipped).length;
-  const to_wav = flipped === 0;
-  const msg = to_wav
+  const flipped = tracks.filter(track => track.flipped).length;
+  const toWav = flipped === 0;
+  const message = toWav
     ? `Конвертировать «${current.title}» в WAV для CDJ?\nВсе кью, сетка, BPM и порядок сохранятся (пути в master.db переключатся на WAV).\nRekordbox должен быть ЗАКРЫТ.`
     : `Вернуть «${current.title}» к исходникам (FLAC/MP3)?\nПути в master.db переключатся обратно. Rekordbox должен быть ЗАКРЫТ.`;
-  if (!confirm(msg)) return;
-  const key = current.kind === 'sc' ? 'sc:' + current.id : current.id;
-  await api('/api/flip', {body:{playlist_key:key, playlist_title:current.title, to_wav}});
-  startPolling();
+  if (!confirm(message)) return;
+  const key = current.kind === 'sc' ? `sc:${current.id}` : current.id;
+  try {
+    await api('/api/flip', {body: {playlist_key: key, playlist_title: current.title, to_wav: toWav}});
+    showStatus(toWav ? 'WAV-конвертация запущена' : 'Возврат к исходникам запущен');
+    startPolling();
+  } catch (error) {
+    showError(error, 'rekordbox');
+  }
 }
 
 async function bindPath() {
-  // нативный диалог выбора папки; fallback — ручной ввод с текущим путём
-  let p = null, browseFailed = false;
+  let selectedPath = null;
+  let browseFailed = false;
   try {
-    const b = await api('/api/browse');
-    p = b.path;
-  } catch (e) { browseFailed = true; }
-  if (!p && browseFailed) {
-    p = prompt('Папка для этого плейлиста (например на флешке E:\\Playlists\\Set):', $('#plpath').textContent);
+    const browse = await api('/api/browse');
+    selectedPath = browse.path;
+  } catch {
+    browseFailed = true;
   }
-  if (!p) return;
-  const key = current.kind === 'sc' ? 'sc:' + current.id : current.id;
-  await api(`/api/playlists/${key}/bind`, {body:{path:p}});
-  await loadTracks(current);   // сразу сканируем новую папку
-  loadPlaylists();
+  if (!selectedPath && browseFailed) {
+    selectedPath = prompt('Папка для этого плейлиста (например на флешке E:\\Playlists\\Set):', $('#plpath').textContent);
+  }
+  if (!selectedPath) return;
+  const key = current.kind === 'sc' ? `sc:${current.id}` : current.id;
+  await api(`/api/playlists/${key}/bind`, {body: {path: selectedPath}});
+  await loadTracks(current);
+  await loadPlaylists();
 }
 
 async function rescan() {
   if (!current) return;
   await loadTracks(current);
-  loadPlaylists();
+  await loadPlaylists();
+}
+
+function renderJobs(jobs) {
+  replaceChildren($('#jobs'), jobs.slice(0, 5).map(job => create('div', {className: 'job'}, [
+    create('strong', {text: job.title}),
+    text(`: ${job.done}/${job.total}`),
+    job.failed ? create('span', {className: 'err', text: ` (ошибок: ${job.failed})`}) : null,
+    job.current ? create('span', {className: 'dim', text: ` — ${job.current}`}) : null,
+    create('progress', {className: 'bar', attrs: {max: '100', value: progressValue(job.done, job.total)}}),
+  ])));
 }
 
 function startPolling() {
   if (pollTimer) return;
   pollTimer = setInterval(async () => {
-    const js = await api('/api/jobs');
-    const active = js.filter(j => j.state !== 'done');
-    $('#jobs').innerHTML = js.slice(0,5).map(j => `
-      <div class="job"><b>${esc(j.title)}</b>: ${j.done}/${j.total}
-        ${j.failed?`<span class="err">(ошибок: ${j.failed})</span>`:''}
-        ${j.current?`<span class="dim"> — ${esc(j.current)}</span>`:''}
-        <progress class="bar" max="100" value="${attr(progressValue(j.done, j.total))}"></progress>
-      </div>`).join('');
-    if (!active.length) {
-      clearInterval(pollTimer); pollTimer = null;
-      if (current) loadTracks(current);
-      loadPlaylists();
+    try {
+      const jobs = await api('/api/jobs');
+      const active = jobs.filter(job => job.state !== 'done');
+      renderJobs(jobs);
+      if (!active.length) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+        if (current) await loadTracks(current);
+        await loadPlaylists();
+      }
+    } catch (error) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+      showError(error, 'state');
     }
   }, 1500);
 }
@@ -817,14 +1152,20 @@ const changeActions = Object.freeze({
   'track-checkbox': el => _trackCb(el.dataset.service, Number(el.dataset.index), window._search[el.dataset.service].tracks[Number(el.dataset.index)]),
 });
 
+function activateAction(el, event) {
+  const action = clickActions[el.dataset.action];
+  if (!action) return false;
+  if (el.dataset.action === 'overlay-close' && event.target !== el) return false;
+  event.preventDefault();
+  clearError();
+  Promise.resolve(action(el, event)).catch(error => showError(error));
+  return true;
+}
+
 document.addEventListener('click', event => {
   const el = event.target.closest('[data-action]');
   if (!el) return;
-  const action = clickActions[el.dataset.action];
-  if (!action) return;
-  if (el.dataset.action === 'overlay-close' && event.target !== el) return;
-  event.preventDefault();
-  action(el, event);
+  activateAction(el, event);
 });
 
 document.addEventListener('change', event => {
@@ -832,12 +1173,33 @@ document.addEventListener('change', event => {
   if (!el) return;
   const action = changeActions[el.dataset.action];
   if (!action) return;
-  action(el, event);
+  Promise.resolve(action(el, event)).catch(error => showError(error));
+});
+
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && !$('#modalOverlay').classList.contains('hidden')) {
+    event.preventDefault();
+    closeLogin();
+    return;
+  }
+  trapDialogFocus(event);
+  if ((event.key === 'Enter' || event.key === ' ') && event.target.matches('[data-action]:not(button):not(input):not(select):not(textarea)')) {
+    activateAction(event.target, event);
+  }
 });
 
 $('#searchInput').addEventListener('keydown', event => {
   if (event.key === 'Enter') runSearch();
 });
 
-loadConfig();
-loadPlaylists();
+async function init() {
+  try {
+    await loadConfig();
+    await loadPlaylists();
+  } catch (error) {
+    showError(error, 'local');
+    setEmpty(describeError(error, 'local'));
+  }
+}
+
+init();
