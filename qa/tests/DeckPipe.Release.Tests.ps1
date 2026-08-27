@@ -67,27 +67,40 @@ function Get-TestSha256 {
     }
 }
 
+function Get-TestCurrentHead {
+    $revisionOutput = & git -C $repoRoot rev-parse HEAD 2>$null
+    $revisionExitCode = $LASTEXITCODE
+    $revisionItems = @($revisionOutput | Select-Object -First 1)
+    $revision = if ($revisionItems.Count -gt 0) { $revisionItems[0] } else { '' }
+    if (-not $revision -or $revisionExitCode -ne 0) { throw 'test setup failed: git rev-parse HEAD failed' }
+    return [string]$revision
+}
+
 function New-SyntheticReleaseStage {
     param(
         [switch]$WithExecutable,
         [switch]$SignedEvidence,
-        [string]$StageName = 'deckpipe-release-stage'
+        [string]$StageName = 'deckpipe-release-stage',
+        [string]$BuildId = '0.6.0+20260827.050713.6456dba254a6',
+        [string]$SourceRevision = ''
     )
+    if (-not $SourceRevision) { $SourceRevision = Get-TestCurrentHead }
     $temp = Join-Path ([IO.Path]::GetTempPath()) ($StageName + '-' + [guid]::NewGuid().ToString('N'))
     [IO.Directory]::CreateDirectory($temp) | Out-Null
     $files = @()
+    $sourceShort = $SourceRevision.Substring(0, 7)
     $evidence = [ordered]@{
         schema_version = 1
         product = 'DeckPipe'
         version = '0.6.0'
-        build_id = '0.6.0+20260827.050713.6456dba254a6'
-        source_revision = '09767c457f1578412c500cc9da13472f9fb2412c'
+        build_id = $BuildId
+        source_revision = $SourceRevision
         artifacts = @()
         signing = [ordered]@{ status = if ($SignedEvidence) { 'PASS' } else { 'BLOCKED' }; signed = @() }
         timestamp = [ordered]@{ status = if ($SignedEvidence) { 'PASS' } else { 'BLOCKED' } }
     }
     if ($WithExecutable) {
-        $artifactName = 'DeckPipe-0.6.0+20260827.050713.6456dba254a6-09767c4-x64.exe'
+        $artifactName = "DeckPipe-$BuildId-$sourceShort-x64.exe"
         $artifactPath = Join-Path $temp $artifactName
         Write-Utf8NoBom $artifactPath 'synthetic installer bytes'
         $hash = Get-TestSha256 $artifactPath
@@ -127,8 +140,8 @@ function New-SyntheticReleaseStage {
         spdxVersion = 'SPDX-2.3'
         dataLicense = 'CC0-1.0'
         SPDXID = 'SPDXRef-DOCUMENT'
-        name = 'DeckPipe-0.6.0+20260827.050713.6456dba254a6'
-        documentNamespace = 'https://deckpipe.local/spdx/0.6.0+20260827.050713.6456dba254a6'
+        name = "DeckPipe-$BuildId"
+        documentNamespace = "https://deckpipe.local/spdx/$BuildId"
         creationInfo = [ordered]@{ created = '2026-08-27T05:07:13Z'; creators = @('Tool: synthetic-release-test') }
         packages = @([ordered]@{
             SPDXID = 'SPDXRef-Package-DeckPipe'
@@ -218,7 +231,7 @@ function Invoke-SyntheticPassProbe {
             Status = 'Valid'
             TimeStamperCertificate = [pscustomobject]@{ Subject = 'CN=RFC3161 Test TSA'; Thumbprint = 'ABC123' }
         }
-    }
+    } -ExpectedSourceRevision (Get-TestCurrentHead)
 }
 
 function It {
@@ -329,7 +342,7 @@ It 'fails closed on stale or unsafe staging before writing release outputs' {
     [IO.Directory]::CreateDirectory($temp) | Out-Null
     try {
         Write-Utf8NoBom (Join-Path $temp 'stale.txt') 'old output'
-        Assert-Throws { & $build -StagingDirectory $temp -UnsignedEngineeringCandidate } 'nonempty|unexpected|stale'
+        Assert-Throws { & $build -StagingDirectory $temp -UnsignedEngineeringCandidate } 'Python lock BLOCKED'
         Assert-Equal @((Get-ChildItem -LiteralPath $temp -Force)).Count 1 'Rejected staging directory must not be cleaned or mutated'
     } finally {
         [IO.Directory]::Delete($temp, $true)
@@ -354,6 +367,18 @@ It 'blocks before staging when Python hash locks are unavailable' {
     }
 }
 
+It 'reports the Python lock blocker before validating a missing staging parent' {
+    $build = Join-Path $repoRoot 'release\build.ps1'
+    $missingRoot = Join-Path ([IO.Path]::GetTempPath()) ('deckpipe-missing-parent-' + [guid]::NewGuid().ToString('N'))
+    $stage = Join-Path $missingRoot 'stage'
+    try {
+        Assert-Throws { & $build -StagingDirectory $stage -UnsignedEngineeringCandidate } 'Python lock BLOCKED'
+        Assert-False (Test-Path -LiteralPath $missingRoot) 'Blocked build must not create the missing staging parent'
+    } finally {
+        if (Test-Path -LiteralPath $missingRoot) { [IO.Directory]::Delete($missingRoot, $true) }
+    }
+}
+
 It 'constructs only explicit thumbprint RFC3161 SHA256 signing commands' {
     . (Join-Path $repoRoot 'release\build.ps1')
     $args = New-SignToolArguments -CertificateThumbprint '001122AABBcc' -TimestampUrl 'https://timestamp.example/rfc3161' -ArtifactPath 'C:\out\DeckPipe.exe'
@@ -362,6 +387,20 @@ It 'constructs only explicit thumbprint RFC3161 SHA256 signing commands' {
     Assert-Throws { New-SignToolArguments -CertificateThumbprint '001122' -TimestampUrl 'http://timestamp.example' -ArtifactPath 'C:\out\DeckPipe.exe' } 'RFC3161|https'
     Assert-Throws { New-SignToolArguments -CertificateThumbprint '' -TimestampUrl 'https://timestamp.example/rfc3161' -ArtifactPath 'C:\out\DeckPipe.exe' } 'thumbprint'
     Assert-Throws { Invoke-ArtifactSigning -SignToolPath 'signtool.exe' -Artifacts @('C:\out\DeckPipe.exe') -CertificateThumbprint '001122AABBcc' -TimestampUrl 'https://timestamp.example/rfc3161' -SignExecutor { param($Tool, $Arguments) 1 } } 'signtool failed'
+}
+
+It 'rejects signed-looking evidence whose build id or source revision is not canonical current HEAD' {
+    $alternateBuildId = '0.6.0+20260827.050713.deadbee'
+    $alternateSource = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+    $stage = New-SyntheticReleaseStage -WithExecutable -SignedEvidence -StageName 'deckpipe-stale-freshness' -BuildId $alternateBuildId -SourceRevision $alternateSource
+    try {
+        . (Join-Path $repoRoot 'release\verify.ps1')
+        $result = Invoke-SyntheticPassProbe $stage
+        Assert-Equal $result.status 'FAIL' "Verifier must reject stale signed-looking evidence, got $($result.status): $($result.message)"
+        Assert-True ($result.message -match 'canonical|build_id|source|HEAD|fresh') "Expected freshness failure, got $($result.message)"
+    } finally {
+        [IO.Directory]::Delete($stage, $true)
+    }
 }
 
 It 'rejects manifest extras missing duplicate traversal and case-confusable paths' {
@@ -486,9 +525,10 @@ It 'rejects fully inventoried staging extras nested artifacts and evidence dupli
             Name = 'nested-artifact'
             Mutate = {
                 param($stage)
-                Remove-Item -LiteralPath (Join-Path $stage 'DeckPipe-0.6.0+20260827.050713.6456dba254a6-09767c4-x64.exe') -Force
+                $existingArtifact = @(Get-ChildItem -LiteralPath $stage -Force -File | Where-Object { $_.Name -match '\.exe$' })[0]
+                Remove-Item -LiteralPath $existingArtifact.FullName -Force
                 [IO.Directory]::CreateDirectory((Join-Path $stage 'nested')) | Out-Null
-                $artifact = 'nested/DeckPipe-0.6.0+20260827.050713.6456dba254a6-09767c4-x64-setup.exe'
+                $artifact = 'nested/' + ($existingArtifact.Name -replace '-x64\.exe$', '-x64-setup.exe')
                 Write-Utf8NoBom (Join-Path $stage ($artifact -replace '/', '\')) 'nested artifact bytes'
                 $hash = Get-TestSha256 (Join-Path $stage ($artifact -replace '/', '\'))
                 $evidence = Get-Content -LiteralPath (Join-Path $stage 'release-evidence.json') -Raw | ConvertFrom-Json
@@ -534,6 +574,32 @@ It 'rejects fully inventoried staging extras nested artifacts and evidence dupli
         }
     }
     if ($failures.Count -gt 0) { throw ($failures -join '; ') }
+}
+
+It 'rejects extra SPDX relationship types even when every required relationship is present' {
+    $stage = New-SyntheticReleaseStage -WithExecutable -SignedEvidence -StageName 'deckpipe-sbom-extra-relationship'
+    try {
+        $sbomPath = Join-Path $stage 'sbom.spdx.json'
+        $sbom = Get-Content -LiteralPath $sbomPath -Raw | ConvertFrom-Json
+        $artifactFile = @($sbom.files | Where-Object { $_.fileName -match '\.exe$' })[0]
+        $relationships = @($sbom.relationships)
+        $relationships += [pscustomobject]@{
+            spdxElementId = 'SPDXRef-Package-DeckPipe'
+            relationshipType = 'DEPENDS_ON'
+            relatedSpdxElement = $artifactFile.SPDXID
+        }
+        $sbom.relationships = $relationships
+        Write-Utf8NoBom $sbomPath ($sbom | ConvertTo-Json -Depth 10)
+        $manifest = Get-Content -LiteralPath (Join-Path $stage 'SHA256SUMS.txt')
+        $manifest = $manifest -replace '^[0-9a-f]{64}  sbom\.spdx\.json$', "$(Get-TestSha256 $sbomPath)  sbom.spdx.json"
+        Write-Utf8NoBom (Join-Path $stage 'SHA256SUMS.txt') (($manifest -join "`n") + "`n")
+
+        $result = Invoke-SyntheticPassProbe $stage
+        Assert-Equal $result.status 'FAIL' "Verifier must reject extra SBOM relationships, got $($result.status): $($result.message)"
+        Assert-True ($result.message -match 'SPDX|relationship|extra|DEPENDS_ON') "Expected SBOM relationship failure, got $($result.message)"
+    } finally {
+        [IO.Directory]::Delete($stage, $true)
+    }
 }
 
 It 'rejects ADS-like release paths and manifest tampering' {
@@ -599,6 +665,36 @@ It 'plans release builds only from an isolated tracked HEAD temp workspace' {
     }
 }
 
+It 'keeps final staging empty and cleans the owned candidate when candidate validation fails' {
+    . (Join-Path $repoRoot 'release\build.ps1')
+    $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('deckpipe-transaction-' + [guid]::NewGuid().ToString('N'))
+    $stage = Join-Path $tempRoot 'final-stage'
+    $observedCandidate = $null
+    [IO.Directory]::CreateDirectory($tempRoot) | Out-Null
+    try {
+        $version = Read-JsonFile 'release\version.json'
+        $sourceRevision = 'cccccccccccccccccccccccccccccccccccccccc'
+        Assert-Throws {
+            Invoke-ReleaseCandidateTransaction -StagingDirectory $stage -Version $version -SourceRevision $sourceRevision -UnsignedEngineeringCandidate -AssembleCandidate {
+                param($CandidateDirectory, $ExpectedArtifactNames)
+                $script:ObservedCandidateForTransactionTest = $CandidateDirectory
+                foreach ($name in @($ExpectedArtifactNames)) {
+                    Write-Utf8NoBom (Join-Path $CandidateDirectory $name) 'candidate bytes'
+                }
+            } -ValidateCandidate {
+                param($CandidateDirectory)
+                throw 'simulated candidate validation failure'
+            }
+        } 'simulated candidate validation failure'
+        $observedCandidate = $script:ObservedCandidateForTransactionTest
+        Assert-False (Test-Path -LiteralPath $stage) 'Failed candidate must not publish the final staging directory'
+        Assert-True ($observedCandidate -and -not (Test-Path -LiteralPath $observedCandidate)) 'Owned candidate directory must be cleaned after failure'
+    } finally {
+        if (Test-Path -LiteralPath $tempRoot) { [IO.Directory]::Delete($tempRoot, $true) }
+        $script:ObservedCandidateForTransactionTest = $null
+    }
+}
+
 It 'can reach PASS only through strict manifest SBOM evidence and injected signature probe' {
     . (Join-Path $repoRoot 'release\verify.ps1')
     $stage = New-SyntheticReleaseStage -WithExecutable -SignedEvidence -StageName 'deckpipe-pass'
@@ -609,7 +705,7 @@ It 'can reach PASS only through strict manifest SBOM evidence and injected signa
                 Status = 'Valid'
                 TimeStamperCertificate = [pscustomobject]@{ Subject = 'CN=RFC3161 Test TSA'; Thumbprint = 'ABC123' }
             }
-        }
+        } -ExpectedSourceRevision (Get-TestCurrentHead)
         Assert-Equal $result.status 'PASS' "PASS fixture failed: $($result.message)"
     } finally {
         [IO.Directory]::Delete($stage, $true)

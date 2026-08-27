@@ -5,6 +5,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+$script:RepoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $script:MetadataFiles = @('release-evidence.json', 'sbom.spdx.json', 'SHA256SUMS.txt')
 
 function New-Result {
@@ -29,6 +30,28 @@ function Get-Sha256 {
     } finally {
         $sha.Dispose()
     }
+}
+
+function Read-CanonicalVersion {
+    $versionPath = Join-Path $PSScriptRoot 'version.json'
+    if (-not (Test-Path -LiteralPath $versionPath -PathType Leaf)) { throw 'canonical release version is missing' }
+    $version = Get-Content -LiteralPath $versionPath -Raw | ConvertFrom-Json
+    foreach ($required in @('product', 'version', 'build_id', 'artifact_name_prefix')) {
+        if (-not ($version.PSObject.Properties.Name -contains $required)) { throw "canonical release version missing $required" }
+    }
+    if ($version.artifact_name_prefix -ne "DeckPipe-$($version.build_id)") { throw 'canonical release artifact prefix mismatch' }
+    return $version
+}
+
+function Get-CurrentSourceRevision {
+    $revisionOutput = & git -C $script:RepoRoot rev-parse HEAD 2>$null
+    $revisionExitCode = $LASTEXITCODE
+    $revisionItems = @($revisionOutput | Select-Object -First 1)
+    $revision = if ($revisionItems.Count -gt 0) { $revisionItems[0] } else { '' }
+    if (-not $revision -or $revisionExitCode -ne 0) { throw 'source provenance BLOCKED: git rev-parse HEAD failed' }
+    $revision = [string]$revision
+    if ($revision -notmatch '^[0-9a-f]{40}$') { throw 'source provenance BLOCKED: git rev-parse HEAD did not return a full revision' }
+    return $revision
 }
 
 function Get-ReleaseRelativePath {
@@ -72,13 +95,14 @@ function Test-IsArtifactPath {
 function Assert-CanonicalArtifactName {
     param(
         [string]$RelativePath,
-        $Evidence
+        $CanonicalVersion,
+        [string]$ExpectedSourceRevision
     )
-    $shortRevision = ([string]$Evidence.source_revision).Substring(0, 7)
-    $prefix = 'DeckPipe-' + [regex]::Escape([string]$Evidence.build_id) + '-' + [regex]::Escape($shortRevision)
+    $shortRevision = $ExpectedSourceRevision.Substring(0, 7)
+    $prefix = [regex]::Escape([string]$CanonicalVersion.artifact_name_prefix) + '-' + [regex]::Escape($shortRevision)
     $pattern = '^' + $prefix + '-x64(\.exe|-setup\.exe|\.msi)$'
     if ($RelativePath -notmatch $pattern) {
-        throw "ambiguous executable artifact or non-canonical artifact name for evidence version/build/source: $RelativePath"
+        throw "ambiguous executable artifact or non-canonical artifact name for canonical build/current HEAD: $RelativePath"
     }
 }
 
@@ -194,7 +218,9 @@ function Assert-ManifestExact {
 function Read-ReleaseEvidence {
     param(
         $StagePath,
-        $ManifestEntries = $null
+        $ManifestEntries = $null,
+        $CanonicalVersion = $null,
+        [string]$ExpectedSourceRevision = ''
     )
     if ($null -eq $ManifestEntries) {
         $ManifestEntries = $StagePath
@@ -213,9 +239,12 @@ function Read-ReleaseEvidence {
         if (-not ($evidence.signing.PSObject.Properties.Name -contains $required)) { throw "malformed release evidence: signing missing $required" }
     }
     if (-not ($evidence.timestamp.PSObject.Properties.Name -contains 'status')) { throw 'malformed release evidence: timestamp missing status' }
-    if ($evidence.product -ne 'DeckPipe' -or $evidence.version -ne '0.6.0') { throw 'malformed release evidence: product/version mismatch' }
-    if ($evidence.build_id -notmatch '^0\.6\.0\+[0-9]{8}\.[0-9]{6}\.[0-9a-f]{7,40}$') { throw 'malformed release evidence: invalid build_id' }
-    if ($evidence.source_revision -notmatch '^[0-9a-f]{40}$') { throw 'malformed release evidence: invalid source revision' }
+    if ($null -eq $CanonicalVersion) { $CanonicalVersion = Read-CanonicalVersion }
+    if (-not $ExpectedSourceRevision) { $ExpectedSourceRevision = Get-CurrentSourceRevision }
+    if ($evidence.product -ne $CanonicalVersion.product) { throw 'malformed release evidence: product mismatch with canonical version' }
+    if ($evidence.version -ne $CanonicalVersion.version) { throw 'malformed release evidence: version mismatch with canonical version' }
+    if ($evidence.build_id -ne $CanonicalVersion.build_id) { throw 'malformed release evidence: build_id mismatch with canonical version' }
+    if ($evidence.source_revision -ne $ExpectedSourceRevision) { throw 'malformed release evidence: source_revision mismatch with current HEAD' }
 
     $artifacts = @($evidence.artifacts)
     $signed = @($evidence.signing.signed)
@@ -230,7 +259,7 @@ function Read-ReleaseEvidence {
             if (-not ($artifact.PSObject.Properties.Name -contains $required)) { throw "malformed release evidence: artifact missing $required" }
         }
         $relative = Assert-NoForbiddenPath $artifact.path
-        Assert-CanonicalArtifactName -RelativePath $relative -Evidence $evidence
+        Assert-CanonicalArtifactName -RelativePath $relative -CanonicalVersion $CanonicalVersion -ExpectedSourceRevision $ExpectedSourceRevision
         $expectedType = Get-ArtifactType $relative
         if ([string]$artifact.type -ne $expectedType) { throw "malformed release evidence: artifact type/extension mismatch $relative" }
         $key = $relative.ToLowerInvariant()
@@ -312,6 +341,20 @@ function Assert-SbomExact {
         if (Test-IsArtifactPath $relative) { $sbomArtifactByPath[$key] = $relative }
     }
 
+    $allowedRelationships = @{}
+    $allowedRelationships['SPDXRef-DOCUMENT|DESCRIBES|SPDXRef-Package-DeckPipe'] = $true
+    foreach ($file in @($sbom.files)) {
+        $allowedRelationships["SPDXRef-Package-DeckPipe|CONTAINS|$($file.SPDXID)"] = $true
+    }
+    $seenRelationships = @{}
+    foreach ($relationship in @($sbom.relationships)) {
+        $key = "$($relationship.spdxElementId)|$($relationship.relationshipType)|$($relationship.relatedSpdxElement)"
+        if (-not $allowedRelationships.ContainsKey($key)) { throw "SPDX SBOM contains extra relationship: $key" }
+        if ($seenRelationships.ContainsKey($key)) { throw "SPDX SBOM contains duplicate relationship: $key" }
+        $seenRelationships[$key] = $true
+    }
+    Assert-KeySetsEqual -Expected $allowedRelationships -Actual $seenRelationships -Context 'SPDX relationship set mismatch'
+
     $expectedByPath = @{}
     foreach ($key in @($expected.Keys)) { $expectedByPath[$key] = $expected[$key].RelativePath }
     Assert-KeySetsEqual -Expected $expectedByPath -Actual $sbomByPath -Context 'SBOM/manifest file inventory mismatch'
@@ -332,7 +375,8 @@ function Get-SignedReleaseArtifacts {
 function Invoke-ReleaseVerification {
     param(
         [string]$StagingDirectory,
-        [scriptblock]$SignatureProbe
+        [scriptblock]$SignatureProbe,
+        [string]$ExpectedSourceRevision
     )
     if (-not $StagingDirectory) { return New-Result 'BLOCKED' 'Staging directory is missing' }
     $stagePath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($StagingDirectory)
@@ -343,13 +387,20 @@ function Invoke-ReleaseVerification {
     if ($null -eq $SignatureProbe) {
         $SignatureProbe = { param($ArtifactPath) Get-AuthenticodeSignature -LiteralPath $ArtifactPath }
     }
+    try {
+        $canonicalVersion = Read-CanonicalVersion
+        if (-not $ExpectedSourceRevision) { $ExpectedSourceRevision = Get-CurrentSourceRevision }
+    } catch {
+        return New-Result 'BLOCKED' $_.Exception.Message
+    }
 
     try {
         $script:CurrentStagePath = $stagePath
         $actualFiles = Assert-ClosedTopLevelStaging $stagePath
         $manifestEntries = Assert-ManifestExact -StagePath $stagePath -ActualFiles $actualFiles
-        $evidence = Read-ReleaseEvidence $manifestEntries
+        $evidence = Read-ReleaseEvidence -StagePath $stagePath -ManifestEntries $manifestEntries -CanonicalVersion $canonicalVersion -ExpectedSourceRevision $ExpectedSourceRevision
         Assert-ArtifactInventoryExact -ActualFiles $actualFiles -ManifestEntries $manifestEntries -Evidence $evidence
+        Assert-SbomExact -StagePath $stagePath -ManifestEntries $manifestEntries -Evidence $evidence
         if ($evidence.signing.status -ne 'PASS' -or $evidence.timestamp.status -ne 'PASS') {
             return New-Result 'BLOCKED' 'Release evidence does not contain PASS signing and timestamp status'
         }
@@ -358,7 +409,6 @@ function Invoke-ReleaseVerification {
             if ($signature.Status -ne 'Valid') { return New-Result 'BLOCKED' "Authenticode signature is not valid for $($artifact.RelativePath)" }
             if ($null -eq $signature.TimeStamperCertificate) { return New-Result 'BLOCKED' "Authenticode timestamp is missing for $($artifact.RelativePath)" }
         }
-        Assert-SbomExact -StagePath $stagePath -ManifestEntries $manifestEntries -Evidence $evidence
         return New-Result 'PASS' 'Release evidence, manifest, SBOM, Authenticode signatures, and timestamps are valid'
     } catch {
         return New-Result 'FAIL' $_.Exception.Message

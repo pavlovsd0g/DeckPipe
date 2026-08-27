@@ -141,8 +141,11 @@ function Assert-StagingDirectorySafe {
 }
 
 function Get-SourceRevision {
-    $revision = (& git -C $script:RepoRoot rev-parse HEAD 2>$null | Select-Object -First 1)
-    if (-not $revision -or $LASTEXITCODE -ne 0) { throw 'source provenance BLOCKED: git rev-parse HEAD failed' }
+    $revisionOutput = & git -C $script:RepoRoot rev-parse HEAD 2>$null
+    $revisionExitCode = $LASTEXITCODE
+    $revisionItems = @($revisionOutput | Select-Object -First 1)
+    $revision = if ($revisionItems.Count -gt 0) { $revisionItems[0] } else { '' }
+    if (-not $revision -or $revisionExitCode -ne 0) { throw 'source provenance BLOCKED: git rev-parse HEAD failed' }
     $dirty = (& git -C $script:RepoRoot status --porcelain --untracked-files=no 2>$null)
     if ($LASTEXITCODE -ne 0) { throw 'source provenance BLOCKED: git status failed' }
     if (@($dirty).Count -gt 0) { throw 'source provenance BLOCKED: tracked source is dirty' }
@@ -337,6 +340,90 @@ function Invoke-ArtifactSigning {
     }
 }
 
+function New-OwnedCandidateDirectory {
+    param([string]$StagePath)
+    $stageFull = [IO.Path]::GetFullPath($StagePath).TrimEnd('\')
+    $stageParent = Split-Path -Parent $stageFull
+    $stageLeaf = Split-Path -Leaf $stageFull
+    if (-not $stageParent -or -not (Test-Path -LiteralPath $stageParent -PathType Container)) { throw 'staging directory parent is missing' }
+    $candidate = Join-Path $stageParent (".$stageLeaf.candidate-" + [guid]::NewGuid().ToString('N'))
+    Assert-PathNotInside -Path $candidate -ForbiddenRoot $script:RepoRoot -Message 'candidate output directory must be outside the repository'
+    Assert-PathNotInside -Path $candidate -ForbiddenRoot $stageFull -Message 'candidate output directory must be outside final staging'
+    return $candidate
+}
+
+function Remove-OwnedCandidateDirectory {
+    param([string]$CandidateDirectory, [string]$StagePath)
+    if (-not $CandidateDirectory -or -not (Test-Path -LiteralPath $CandidateDirectory)) { return }
+    Assert-PathNotInside -Path $CandidateDirectory -ForbiddenRoot $script:RepoRoot -Message 'refusing to remove a repository path as release candidate'
+    Assert-PathNotInside -Path $CandidateDirectory -ForbiddenRoot $StagePath -Message 'refusing to remove the final staging path as release candidate'
+    Remove-Item -LiteralPath $CandidateDirectory -Recurse -Force
+}
+
+function Invoke-ReleaseVerifierForCandidate {
+    param(
+        [string]$CandidateDirectory,
+        [switch]$UnsignedEngineeringCandidate
+    )
+    $verifyScript = Join-Path $PSScriptRoot 'verify.ps1'
+    $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $verifyScript -StagingDirectory $CandidateDirectory 2>&1
+    $exitCode = $LASTEXITCODE
+    $text = ($output | Out-String)
+    try {
+        $result = $text | ConvertFrom-Json
+    } catch {
+        throw "candidate verification failed: verifier did not return clean JSON: $text"
+    }
+    if ($UnsignedEngineeringCandidate) {
+        if ($exitCode -ne 2 -or $result.status -ne 'BLOCKED') {
+            throw "candidate verification failed: unsigned engineering candidate must verify as BLOCKED, got exit $exitCode status $($result.status): $($result.message)"
+        }
+        if ($result.message -notmatch 'signing|timestamp') {
+            throw "candidate verification failed: unsigned engineering candidate is not blocked on signing/timestamp: $($result.message)"
+        }
+        return $result
+    }
+    if ($exitCode -ne 0 -or $result.status -ne 'PASS') {
+        throw "candidate verification failed: signed release candidate must verify as PASS, got exit $exitCode status $($result.status): $($result.message)"
+    }
+    return $result
+}
+
+function Invoke-ReleaseCandidateTransaction {
+    param(
+        [string]$StagingDirectory,
+        $Version,
+        [string]$SourceRevision,
+        [switch]$UnsignedEngineeringCandidate,
+        [scriptblock]$AssembleCandidate,
+        [scriptblock]$ValidateCandidate
+    )
+    if ($null -eq $AssembleCandidate) { throw 'candidate transaction requires an assembly step' }
+    if ($null -eq $ValidateCandidate) { throw 'candidate transaction requires a validation step' }
+
+    $stagePath = Assert-StagingDirectorySafe $StagingDirectory
+    $candidatePath = New-OwnedCandidateDirectory -StagePath $stagePath
+    $expectedNames = @(Get-ExpectedArtifactNames -Version $Version -SourceRevision $SourceRevision)
+    try {
+        [IO.Directory]::CreateDirectory($candidatePath) | Out-Null
+        & $AssembleCandidate $candidatePath $expectedNames
+        & $ValidateCandidate $candidatePath
+
+        if (Test-Path -LiteralPath $stagePath) {
+            $entries = @(Get-ChildItem -LiteralPath $stagePath -Force)
+            if ($entries.Count -gt 0) { throw 'staging directory became nonempty before publish' }
+            [IO.Directory]::Delete($stagePath, $false)
+        }
+        [IO.Directory]::Move($candidatePath, $stagePath)
+        $candidatePath = $null
+        return $stagePath
+    } finally {
+        if ($candidatePath) {
+            Remove-OwnedCandidateDirectory -CandidateDirectory $candidatePath -StagePath $stagePath
+        }
+    }
+}
+
 function Invoke-ReleaseBuild {
     param(
         [string]$StagingDirectory,
@@ -349,10 +436,10 @@ function Invoke-ReleaseBuild {
     )
 
     $plan = $null
-    $stagePath = Assert-StagingDirectorySafe $StagingDirectory
     $version = Assert-VersionSync
     Assert-PythonLocksReady
     $sourceRevision = Get-SourceRevision
+    $stagePath = Assert-StagingDirectorySafe $StagingDirectory
 
     if (-not $UnsignedEngineeringCandidate) {
         if (-not $SignToolPath) { throw 'signing BLOCKED: SignToolPath is required' }
@@ -361,97 +448,104 @@ function Invoke-ReleaseBuild {
     }
 
     $plan = New-ReleaseBuildPlan -StagingDirectory $stagePath -WheelhouseDirectory $WheelhouseDirectory -Version $version -SourceRevision $sourceRevision -PythonExe $PythonExe
-    [IO.Directory]::CreateDirectory($stagePath) | Out-Null
     [IO.Directory]::CreateDirectory($plan.BuildRoot) | Out-Null
     $oldCargoTargetDir = $env:CARGO_TARGET_DIR
     $oldCargoNetOffline = $env:CARGO_NET_OFFLINE
     try {
-        Export-TrackedSourceToTemp -Plan $plan
-        & $PythonExe -m venv $plan.VenvPath
-        if ($LASTEXITCODE -ne 0) { throw 'build failed: Python venv creation failed' }
-        foreach ($pipCommand in @($plan.PipInstallCommands)) {
-            & $plan.VenvPython @($pipCommand.Arguments)
-            if ($LASTEXITCODE -ne 0) { throw 'build failed: offline Python dependency install failed' }
+        $publishedStage = Invoke-ReleaseCandidateTransaction -StagingDirectory $stagePath -Version $version -SourceRevision $sourceRevision -UnsignedEngineeringCandidate:$UnsignedEngineeringCandidate -AssembleCandidate {
+            param($candidatePath, $expectedNames)
+
+            Export-TrackedSourceToTemp -Plan $plan
+            & $PythonExe -m venv $plan.VenvPath
+            if ($LASTEXITCODE -ne 0) { throw 'build failed: Python venv creation failed' }
+            foreach ($pipCommand in @($plan.PipInstallCommands)) {
+                & $plan.VenvPython @($pipCommand.Arguments)
+                if ($LASTEXITCODE -ne 0) { throw 'build failed: offline Python dependency install failed' }
+            }
+
+            Push-Location $plan.SourceRoot
+            try {
+                & $plan.VenvPython @($plan.PyInstallerArguments)
+                if ($LASTEXITCODE -ne 0) { throw 'build failed: PyInstaller backend build failed' }
+            } finally {
+                Pop-Location
+            }
+
+            $sidecarDir = Join-Path $plan.SourceRoot 'desktop\src-tauri\binaries'
+            [IO.Directory]::CreateDirectory($sidecarDir) | Out-Null
+            Copy-Item -LiteralPath (Join-Path $plan.PyInstallerDistPath 'deckpipe-backend.exe') -Destination (Join-Path $sidecarDir 'deckpipe-backend-x86_64-pc-windows-msvc.exe') -Force
+
+            Push-Location $plan.SourceRoot
+            try {
+                & npm ci --offline
+                if ($LASTEXITCODE -ne 0) { throw 'build failed: root npm ci --offline failed' }
+            } finally {
+                Pop-Location
+            }
+            Push-Location (Join-Path $plan.SourceRoot 'desktop')
+            try {
+                & npm ci --offline
+                if ($LASTEXITCODE -ne 0) { throw 'build failed: desktop npm ci --offline failed' }
+                $env:CARGO_TARGET_DIR = $plan.CargoTargetDir
+                $env:CARGO_NET_OFFLINE = 'true'
+                & npm run build
+                if ($LASTEXITCODE -ne 0) { throw 'build failed: Tauri build failed' }
+            } finally {
+                Pop-Location
+            }
+
+            $applicationExe = Join-Path $plan.CargoTargetDir 'release\deckpipe.exe'
+            if (-not (Test-Path -LiteralPath $applicationExe -PathType Leaf)) { throw 'build failed: application exe was not produced in temp cargo target' }
+            Copy-Item -LiteralPath $applicationExe -Destination (Join-Path $candidatePath $plan.ApplicationArtifactName)
+
+            $builtArtifacts = Get-ReleaseArtifacts $plan.BundleRoot
+            $setupArtifacts = @($builtArtifacts | Where-Object { $_.Name -match '(?i)setup\.exe$' })
+            $msiArtifacts = @($builtArtifacts | Where-Object { $_.Extension -ieq '.msi' })
+            if ($setupArtifacts.Count -ne 1) { throw 'build failed: expected exactly one setup executable artifact' }
+            if ($msiArtifacts.Count -ne 1) { throw 'build failed: expected exactly one MSI artifact' }
+            Copy-Item -LiteralPath $setupArtifacts[0].FullName -Destination (Join-Path $candidatePath $plan.SetupArtifactName)
+            Copy-Item -LiteralPath $msiArtifacts[0].FullName -Destination (Join-Path $candidatePath $plan.MsiArtifactName)
+
+            Remove-OwnedBuildRoot -BuildRoot $plan.BuildRoot -StagePath $stagePath
+
+            $candidateArtifacts = Get-TopLevelReleaseArtifacts $candidatePath
+            $expectedByName = @{}
+            foreach ($name in @($expectedNames)) { $expectedByName[$name.ToLowerInvariant()] = $name }
+            foreach ($artifact in $candidateArtifacts) {
+                if (-not $expectedByName.ContainsKey($artifact.Name.ToLowerInvariant())) { throw "unexpected candidate artifact: $($artifact.Name)" }
+                $expectedByName.Remove($artifact.Name.ToLowerInvariant())
+            }
+            if ($expectedByName.Count -gt 0) { throw "build failed: missing expected artifact(s): $((@($expectedByName.Values) | Sort-Object) -join ', ')" }
+
+            if (-not $UnsignedEngineeringCandidate) {
+                Invoke-ArtifactSigning -SignToolPath $SignToolPath -Artifacts @($candidateArtifacts | ForEach-Object { $_.FullName }) -CertificateThumbprint $SigningCertificateThumbprint -TimestampUrl $TimestampUrl
+            }
+
+            $artifactRecords = @()
+            foreach ($artifact in $candidateArtifacts) {
+                $relative = $artifact.FullName.Substring($candidatePath.Length).TrimStart('\') -replace '\\', '/'
+                $artifactType = if ($artifact.Extension -eq '.msi') { 'msi' } else { 'exe' }
+                $artifactRecords += [ordered]@{ path = $relative; type = $artifactType; sha256 = Get-Sha256 $artifact.FullName }
+            }
+            $status = if ($UnsignedEngineeringCandidate) { 'BLOCKED' } else { 'PASS' }
+            $evidence = [ordered]@{
+                schema_version = 1
+                product = $version.product
+                version = $version.version
+                build_id = $version.build_id
+                source_revision = $sourceRevision
+                artifacts = $artifactRecords
+                signing = [ordered]@{ status = $status; signed = @($artifactRecords | ForEach-Object { $_.path }) }
+                timestamp = [ordered]@{ status = $status }
+            }
+            Write-Utf8NoBom (Join-Path $candidatePath 'release-evidence.json') ($evidence | ConvertTo-Json -Depth 10)
+            & (Join-Path $PSScriptRoot 'New-SpdxSbom.ps1') -InputDirectory $candidatePath -OutputPath (Join-Path $candidatePath 'sbom.spdx.json') -VersionJsonPath (Join-Path $script:RepoRoot 'release\version.json')
+            Write-Sha256Manifest $candidatePath
+        } -ValidateCandidate {
+            param($candidatePath)
+            Invoke-ReleaseVerifierForCandidate -CandidateDirectory $candidatePath -UnsignedEngineeringCandidate:$UnsignedEngineeringCandidate | Out-Null
         }
-
-        Push-Location $plan.SourceRoot
-        try {
-            & $plan.VenvPython @($plan.PyInstallerArguments)
-            if ($LASTEXITCODE -ne 0) { throw 'build failed: PyInstaller backend build failed' }
-        } finally {
-            Pop-Location
-        }
-
-        $sidecarDir = Join-Path $plan.SourceRoot 'desktop\src-tauri\binaries'
-        [IO.Directory]::CreateDirectory($sidecarDir) | Out-Null
-        Copy-Item -LiteralPath (Join-Path $plan.PyInstallerDistPath 'deckpipe-backend.exe') -Destination (Join-Path $sidecarDir 'deckpipe-backend-x86_64-pc-windows-msvc.exe') -Force
-
-        Push-Location $plan.SourceRoot
-        try {
-            & npm ci --offline
-            if ($LASTEXITCODE -ne 0) { throw 'build failed: root npm ci --offline failed' }
-        } finally {
-            Pop-Location
-        }
-        Push-Location (Join-Path $plan.SourceRoot 'desktop')
-        try {
-            & npm ci --offline
-            if ($LASTEXITCODE -ne 0) { throw 'build failed: desktop npm ci --offline failed' }
-            $env:CARGO_TARGET_DIR = $plan.CargoTargetDir
-            $env:CARGO_NET_OFFLINE = 'true'
-            & npm run build
-            if ($LASTEXITCODE -ne 0) { throw 'build failed: Tauri build failed' }
-        } finally {
-            Pop-Location
-        }
-
-        $applicationExe = Join-Path $plan.CargoTargetDir 'release\deckpipe.exe'
-        if (-not (Test-Path -LiteralPath $applicationExe -PathType Leaf)) { throw 'build failed: application exe was not produced in temp cargo target' }
-        Copy-Item -LiteralPath $applicationExe -Destination (Join-Path $stagePath $plan.ApplicationArtifactName)
-
-        $builtArtifacts = Get-ReleaseArtifacts $plan.BundleRoot
-        $setupArtifacts = @($builtArtifacts | Where-Object { $_.Name -match '(?i)setup\.exe$' })
-        $msiArtifacts = @($builtArtifacts | Where-Object { $_.Extension -ieq '.msi' })
-        if ($setupArtifacts.Count -ne 1) { throw 'build failed: expected exactly one setup executable artifact' }
-        if ($msiArtifacts.Count -ne 1) { throw 'build failed: expected exactly one MSI artifact' }
-        Copy-Item -LiteralPath $setupArtifacts[0].FullName -Destination (Join-Path $stagePath $plan.SetupArtifactName)
-        Copy-Item -LiteralPath $msiArtifacts[0].FullName -Destination (Join-Path $stagePath $plan.MsiArtifactName)
-
-        Remove-OwnedBuildRoot -BuildRoot $plan.BuildRoot -StagePath $stagePath
-
-        $stagedArtifacts = Get-TopLevelReleaseArtifacts $stagePath
-        $expectedByName = @{}
-        foreach ($name in @($plan.ExpectedArtifactNames)) { $expectedByName[$name.ToLowerInvariant()] = $name }
-        foreach ($artifact in $stagedArtifacts) {
-            if (-not $expectedByName.ContainsKey($artifact.Name.ToLowerInvariant())) { throw "unexpected staged artifact: $($artifact.Name)" }
-            $expectedByName.Remove($artifact.Name.ToLowerInvariant())
-        }
-        if ($expectedByName.Count -gt 0) { throw "build failed: missing expected artifact(s): $((@($expectedByName.Values) | Sort-Object) -join ', ')" }
-
-        if (-not $UnsignedEngineeringCandidate) {
-            Invoke-ArtifactSigning -SignToolPath $SignToolPath -Artifacts @($stagedArtifacts | ForEach-Object { $_.FullName }) -CertificateThumbprint $SigningCertificateThumbprint -TimestampUrl $TimestampUrl
-        }
-
-        $artifactRecords = @()
-        foreach ($artifact in $stagedArtifacts) {
-            $relative = $artifact.FullName.Substring($stagePath.Length).TrimStart('\') -replace '\\', '/'
-            $artifactType = if ($artifact.Extension -eq '.msi') { 'msi' } else { 'exe' }
-            $artifactRecords += [ordered]@{ path = $relative; type = $artifactType; sha256 = Get-Sha256 $artifact.FullName }
-        }
-        $status = if ($UnsignedEngineeringCandidate) { 'BLOCKED' } else { 'PASS' }
-        $evidence = [ordered]@{
-            schema_version = 1
-            product = $version.product
-            version = $version.version
-            build_id = $version.build_id
-            source_revision = $sourceRevision
-            artifacts = $artifactRecords
-            signing = [ordered]@{ status = $status; signed = @($artifactRecords | ForEach-Object { $_.path }) }
-            timestamp = [ordered]@{ status = $status }
-        }
-        Write-Utf8NoBom (Join-Path $stagePath 'release-evidence.json') ($evidence | ConvertTo-Json -Depth 10)
-        & (Join-Path $PSScriptRoot 'New-SpdxSbom.ps1') -InputDirectory $stagePath -OutputPath (Join-Path $stagePath 'sbom.spdx.json') -VersionJsonPath (Join-Path $script:RepoRoot 'release\version.json')
-        Write-Sha256Manifest $stagePath
+        $evidence = Get-Content -LiteralPath (Join-Path $publishedStage 'release-evidence.json') -Raw | ConvertFrom-Json
         return $evidence
     } finally {
         $env:CARGO_TARGET_DIR = $oldCargoTargetDir
