@@ -1,6 +1,7 @@
 param(
     [string]$StagingDirectory,
     [switch]$UnsignedEngineeringCandidate,
+    [switch]$PrivateBetaCandidate,
     [string]$SignToolPath,
     [string]$SigningCertificateThumbprint,
     [string]$TimestampUrl,
@@ -45,6 +46,32 @@ function Get-Sha256 {
         }
     } finally {
         $sha.Dispose()
+    }
+}
+
+function Copy-PrivateBetaPolicy {
+    param([string]$DestinationDirectory)
+    $policyPath = Join-Path $PSScriptRoot 'policy.json'
+    if (-not (Test-Path -LiteralPath $policyPath -PathType Leaf)) { throw 'private-beta policy BLOCKED: release/policy.json is missing' }
+    Copy-Item -LiteralPath $policyPath -Destination (Join-Path $DestinationDirectory 'policy.json') -Force
+    return Get-Sha256 (Join-Path $DestinationDirectory 'policy.json')
+}
+
+function Assert-ReleaseBuildMode {
+    param(
+        [switch]$UnsignedEngineeringCandidate,
+        [switch]$PrivateBetaCandidate,
+        [string]$SignToolPath,
+        [string]$SigningCertificateThumbprint,
+        [string]$TimestampUrl
+    )
+    if ($PrivateBetaCandidate -and $UnsignedEngineeringCandidate) {
+        throw 'PrivateBetaCandidate cannot combine with UnsignedEngineeringCandidate'
+    }
+    if ($PrivateBetaCandidate -and (-not [string]::IsNullOrWhiteSpace($SignToolPath) -or
+            -not [string]::IsNullOrWhiteSpace($SigningCertificateThumbprint) -or
+            -not [string]::IsNullOrWhiteSpace($TimestampUrl))) {
+        throw 'PrivateBetaCandidate cannot combine with signing or timestamp inputs'
     }
 }
 
@@ -153,12 +180,13 @@ function Get-SourceRevision {
 }
 
 function Get-ExpectedArtifactNames {
-    param($Version, [string]$SourceRevision)
+    param($Version, [string]$SourceRevision, [switch]$PrivateBetaCandidate)
     $short = $SourceRevision.Substring(0, 7)
+    $label = if ($PrivateBetaCandidate) { '-unsigned-private-beta' } else { '' }
     return @(
-        "$($Version.artifact_name_prefix)-$short-x64.exe",
-        "$($Version.artifact_name_prefix)-$short-x64-setup.exe",
-        "$($Version.artifact_name_prefix)-$short-x64.msi"
+        "$($Version.artifact_name_prefix)-$short$label-x64.exe",
+        "$($Version.artifact_name_prefix)-$short$label-x64-setup.exe",
+        "$($Version.artifact_name_prefix)-$short$label-x64.msi"
     )
 }
 
@@ -181,7 +209,8 @@ function New-ReleaseBuildPlan {
         [string]$WheelhouseDirectory,
         $Version,
         [string]$SourceRevision,
-        [string]$PythonExe = 'python.exe'
+        [string]$PythonExe = 'python.exe',
+        [switch]$PrivateBetaCandidate
     )
     if (-not $WheelhouseDirectory) { throw 'dependency BLOCKED: explicit offline wheelhouse is required' }
     if (-not (Test-Path -LiteralPath $WheelhouseDirectory -PathType Container)) { throw 'dependency BLOCKED: offline wheelhouse is missing' }
@@ -236,10 +265,10 @@ function New-ReleaseBuildPlan {
         PipInstallCommands = $pipInstallCommands
         CargoTargetDir = $cargoTarget
         BundleRoot = $bundleRoot
-        ExpectedArtifactNames = @(Get-ExpectedArtifactNames -Version $Version -SourceRevision $SourceRevision)
-        ApplicationArtifactName = "$($Version.artifact_name_prefix)-$($SourceRevision.Substring(0, 7))-x64.exe"
-        SetupArtifactName = "$($Version.artifact_name_prefix)-$($SourceRevision.Substring(0, 7))-x64-setup.exe"
-        MsiArtifactName = "$($Version.artifact_name_prefix)-$($SourceRevision.Substring(0, 7))-x64.msi"
+        ExpectedArtifactNames = @(Get-ExpectedArtifactNames -Version $Version -SourceRevision $SourceRevision -PrivateBetaCandidate:$PrivateBetaCandidate)
+        ApplicationArtifactName = @(Get-ExpectedArtifactNames -Version $Version -SourceRevision $SourceRevision -PrivateBetaCandidate:$PrivateBetaCandidate)[0]
+        SetupArtifactName = @(Get-ExpectedArtifactNames -Version $Version -SourceRevision $SourceRevision -PrivateBetaCandidate:$PrivateBetaCandidate)[1]
+        MsiArtifactName = @(Get-ExpectedArtifactNames -Version $Version -SourceRevision $SourceRevision -PrivateBetaCandidate:$PrivateBetaCandidate)[2]
         PythonExe = $PythonExe
     }
 }
@@ -363,7 +392,8 @@ function Remove-OwnedCandidateDirectory {
 function Invoke-ReleaseVerifierForCandidate {
     param(
         [string]$CandidateDirectory,
-        [switch]$UnsignedEngineeringCandidate
+        [switch]$UnsignedEngineeringCandidate,
+        [switch]$PrivateBetaCandidate
     )
     $verifyScript = Join-Path $PSScriptRoot 'verify.ps1'
     $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $verifyScript -StagingDirectory $CandidateDirectory 2>&1
@@ -383,6 +413,15 @@ function Invoke-ReleaseVerifierForCandidate {
         }
         return $result
     }
+    if ($PrivateBetaCandidate) {
+        if ($exitCode -ne 0 -or $result.status -ne 'PASS') {
+            throw "candidate verification failed: private beta candidate must verify as PASS, got exit $exitCode status $($result.status): $($result.message)"
+        }
+        if ($result.message -notmatch 'private-beta|policy|waiver') {
+            throw "candidate verification failed: private beta candidate did not bind policy waiver: $($result.message)"
+        }
+        return $result
+    }
     if ($exitCode -ne 0 -or $result.status -ne 'PASS') {
         throw "candidate verification failed: signed release candidate must verify as PASS, got exit $exitCode status $($result.status): $($result.message)"
     }
@@ -395,6 +434,7 @@ function Invoke-ReleaseCandidateTransaction {
         $Version,
         [string]$SourceRevision,
         [switch]$UnsignedEngineeringCandidate,
+        [switch]$PrivateBetaCandidate,
         [scriptblock]$AssembleCandidate,
         [scriptblock]$ValidateCandidate
     )
@@ -403,7 +443,7 @@ function Invoke-ReleaseCandidateTransaction {
 
     $stagePath = Assert-StagingDirectorySafe $StagingDirectory
     $candidatePath = New-OwnedCandidateDirectory -StagePath $stagePath
-    $expectedNames = @(Get-ExpectedArtifactNames -Version $Version -SourceRevision $SourceRevision)
+    $expectedNames = @(Get-ExpectedArtifactNames -Version $Version -SourceRevision $SourceRevision -PrivateBetaCandidate:$PrivateBetaCandidate)
     try {
         [IO.Directory]::CreateDirectory($candidatePath) | Out-Null
         & $AssembleCandidate $candidatePath $expectedNames
@@ -428,6 +468,7 @@ function Invoke-ReleaseBuild {
     param(
         [string]$StagingDirectory,
         [switch]$UnsignedEngineeringCandidate,
+        [switch]$PrivateBetaCandidate,
         [string]$SignToolPath,
         [string]$SigningCertificateThumbprint,
         [string]$TimestampUrl,
@@ -436,23 +477,24 @@ function Invoke-ReleaseBuild {
     )
 
     $plan = $null
+    Assert-ReleaseBuildMode -UnsignedEngineeringCandidate:$UnsignedEngineeringCandidate -PrivateBetaCandidate:$PrivateBetaCandidate -SignToolPath $SignToolPath -SigningCertificateThumbprint $SigningCertificateThumbprint -TimestampUrl $TimestampUrl
     $version = Assert-VersionSync
     Assert-PythonLocksReady
     $sourceRevision = Get-SourceRevision
     $stagePath = Assert-StagingDirectorySafe $StagingDirectory
 
-    if (-not $UnsignedEngineeringCandidate) {
+    if (-not $UnsignedEngineeringCandidate -and -not $PrivateBetaCandidate) {
         if (-not $SignToolPath) { throw 'signing BLOCKED: SignToolPath is required' }
         if (-not $SigningCertificateThumbprint) { throw 'signing BLOCKED: exact certificate thumbprint is required' }
         if (-not $TimestampUrl) { throw 'timestamp BLOCKED: RFC3161 TimestampUrl is required' }
     }
 
-    $plan = New-ReleaseBuildPlan -StagingDirectory $stagePath -WheelhouseDirectory $WheelhouseDirectory -Version $version -SourceRevision $sourceRevision -PythonExe $PythonExe
+    $plan = New-ReleaseBuildPlan -StagingDirectory $stagePath -WheelhouseDirectory $WheelhouseDirectory -Version $version -SourceRevision $sourceRevision -PythonExe $PythonExe -PrivateBetaCandidate:$PrivateBetaCandidate
     [IO.Directory]::CreateDirectory($plan.BuildRoot) | Out-Null
     $oldCargoTargetDir = $env:CARGO_TARGET_DIR
     $oldCargoNetOffline = $env:CARGO_NET_OFFLINE
     try {
-        $publishedStage = Invoke-ReleaseCandidateTransaction -StagingDirectory $stagePath -Version $version -SourceRevision $sourceRevision -UnsignedEngineeringCandidate:$UnsignedEngineeringCandidate -AssembleCandidate {
+        $publishedStage = Invoke-ReleaseCandidateTransaction -StagingDirectory $stagePath -Version $version -SourceRevision $sourceRevision -UnsignedEngineeringCandidate:$UnsignedEngineeringCandidate -PrivateBetaCandidate:$PrivateBetaCandidate -AssembleCandidate {
             param($candidatePath, $expectedNames)
 
             Export-TrackedSourceToTemp -Plan $plan
@@ -517,7 +559,7 @@ function Invoke-ReleaseBuild {
             }
             if ($expectedByName.Count -gt 0) { throw "build failed: missing expected artifact(s): $((@($expectedByName.Values) | Sort-Object) -join ', ')" }
 
-            if (-not $UnsignedEngineeringCandidate) {
+            if (-not $UnsignedEngineeringCandidate -and -not $PrivateBetaCandidate) {
                 Invoke-ArtifactSigning -SignToolPath $SignToolPath -Artifacts @($candidateArtifacts | ForEach-Object { $_.FullName }) -CertificateThumbprint $SigningCertificateThumbprint -TimestampUrl $TimestampUrl
             }
 
@@ -527,7 +569,13 @@ function Invoke-ReleaseBuild {
                 $artifactType = if ($artifact.Extension -eq '.msi') { 'msi' } else { 'exe' }
                 $artifactRecords += [ordered]@{ path = $relative; type = $artifactType; sha256 = Get-Sha256 $artifact.FullName }
             }
-            $status = if ($UnsignedEngineeringCandidate) { 'BLOCKED' } else { 'PASS' }
+            $policySha256 = ''
+            if ($PrivateBetaCandidate) {
+                $policySha256 = Copy-PrivateBetaPolicy -DestinationDirectory $candidatePath
+            }
+            $status = if ($UnsignedEngineeringCandidate) { 'BLOCKED' } elseif ($PrivateBetaCandidate) { 'WAIVED_BY_OWNER' } else { 'PASS' }
+            $signedArtifacts = @($artifactRecords | ForEach-Object { $_.path })
+            if ($PrivateBetaCandidate) { $signedArtifacts = @() }
             $evidence = [ordered]@{
                 schema_version = 1
                 product = $version.product
@@ -535,15 +583,25 @@ function Invoke-ReleaseBuild {
                 build_id = $version.build_id
                 source_revision = $sourceRevision
                 artifacts = $artifactRecords
-                signing = [ordered]@{ status = $status; signed = @($artifactRecords | ForEach-Object { $_.path }) }
+                signing = [ordered]@{ status = $status; signed = $signedArtifacts }
                 timestamp = [ordered]@{ status = $status }
+            }
+            if ($PrivateBetaCandidate) {
+                $evidence['distribution'] = [ordered]@{
+                    channel = 'private-beta'
+                    artifact_label = 'unsigned-private-beta'
+                    policy_path = 'policy.json'
+                    policy_sha256 = $policySha256
+                }
+                $evidence.signing['policy_path'] = 'policy.json'
+                $evidence.timestamp['policy_path'] = 'policy.json'
             }
             Write-Utf8NoBom (Join-Path $candidatePath 'release-evidence.json') ($evidence | ConvertTo-Json -Depth 10)
             & (Join-Path $PSScriptRoot 'New-SpdxSbom.ps1') -InputDirectory $candidatePath -OutputPath (Join-Path $candidatePath 'sbom.spdx.json') -VersionJsonPath (Join-Path $script:RepoRoot 'release\version.json')
             Write-Sha256Manifest $candidatePath
         } -ValidateCandidate {
             param($candidatePath)
-            Invoke-ReleaseVerifierForCandidate -CandidateDirectory $candidatePath -UnsignedEngineeringCandidate:$UnsignedEngineeringCandidate | Out-Null
+            Invoke-ReleaseVerifierForCandidate -CandidateDirectory $candidatePath -UnsignedEngineeringCandidate:$UnsignedEngineeringCandidate -PrivateBetaCandidate:$PrivateBetaCandidate | Out-Null
         }
         $evidence = Get-Content -LiteralPath (Join-Path $publishedStage 'release-evidence.json') -Raw | ConvertFrom-Json
         return $evidence

@@ -7,6 +7,16 @@ Set-StrictMode -Version Latest
 
 $script:RepoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $script:MetadataFiles = @('release-evidence.json', 'sbom.spdx.json', 'SHA256SUMS.txt')
+$script:OptionalMetadataFiles = @('policy.json')
+$script:PrivateBetaPolicy = [ordered]@{
+    schema_version = 1
+    channel = 'private-beta'
+    signing_requirement = 'owner-waived'
+    timestamp_requirement = 'owner-waived'
+    windows_reputation_warning = 'accepted'
+    waiver_date = '2026-08-28'
+    intended_audience = 'controlled-small-group'
+}
 
 function New-Result {
     param([string]$Status, [string]$Message)
@@ -30,6 +40,28 @@ function Get-Sha256 {
     } finally {
         $sha.Dispose()
     }
+}
+
+function Assert-ExactPrivateBetaPolicyObject {
+    param($Policy, [string]$Context)
+    $actualNames = @($Policy.PSObject.Properties.Name)
+    $expectedNames = @($script:PrivateBetaPolicy.Keys)
+    foreach ($name in $expectedNames) {
+        if (-not ($actualNames -contains $name)) { throw "$Context private-beta policy missing $name" }
+        if ([string]$Policy.$name -ne [string]$script:PrivateBetaPolicy[$name]) { throw "$Context private-beta policy drift: $name" }
+    }
+    foreach ($name in $actualNames) {
+        if (-not ($script:PrivateBetaPolicy.Contains($name))) { throw "$Context private-beta policy extra $name" }
+    }
+}
+
+function Get-TrackedPrivateBetaPolicyRecord {
+    $policyPath = Join-Path $PSScriptRoot 'policy.json'
+    if (-not (Test-Path -LiteralPath $policyPath -PathType Leaf)) { throw 'tracked private-beta policy is missing: policy.json' }
+    $raw = Get-Content -LiteralPath $policyPath -Raw
+    $policy = $raw | ConvertFrom-Json
+    Assert-ExactPrivateBetaPolicyObject -Policy $policy -Context 'tracked'
+    return [pscustomobject]@{ Path = $policyPath; Raw = $raw; Sha256 = Get-Sha256 $policyPath }
 }
 
 function Read-CanonicalVersion {
@@ -305,10 +337,14 @@ function Assert-CanonicalArtifactName {
     param(
         [string]$RelativePath,
         $CanonicalVersion,
-        [string]$ExpectedSourceRevision
+        [string]$ExpectedSourceRevision,
+        [string]$ArtifactLabel = ''
     )
     $shortRevision = $ExpectedSourceRevision.Substring(0, 7)
     $prefix = [regex]::Escape([string]$CanonicalVersion.artifact_name_prefix) + '-' + [regex]::Escape($shortRevision)
+    if (-not [string]::IsNullOrWhiteSpace($ArtifactLabel)) {
+        $prefix += '-' + [regex]::Escape($ArtifactLabel)
+    }
     $pattern = '^' + $prefix + '-x64(\.exe|-setup\.exe|\.msi)$'
     if ($RelativePath -notmatch $pattern) {
         throw "ambiguous executable artifact or non-canonical artifact name for canonical build/current HEAD: $RelativePath"
@@ -331,7 +367,7 @@ function Assert-ClosedTopLevelStaging {
         if ($seen.ContainsKey($key)) { throw "duplicate or case-confusable staged path: $relative" }
         $seen[$key] = $true
 
-        $metadataMatch = @($script:MetadataFiles | Where-Object { $_ -ieq $relative })
+        $metadataMatch = @((@($script:MetadataFiles) + @($script:OptionalMetadataFiles)) | Where-Object { $_ -ieq $relative })
         if ($metadataMatch.Count -gt 0 -and $metadataMatch[0] -cne $relative) {
             throw "case-confusable release metadata path: $relative"
         }
@@ -455,20 +491,59 @@ function Read-ReleaseEvidence {
     if ($evidence.build_id -ne $CanonicalVersion.build_id) { throw 'malformed release evidence: build_id mismatch with canonical version' }
     if ($evidence.source_revision -ne $ExpectedSourceRevision) { throw 'malformed release evidence: source_revision mismatch with current HEAD' }
 
+    $manifestByPath = @{}
+    foreach ($entry in $ManifestEntries) { $manifestByPath[$entry.RelativePath.ToLowerInvariant()] = $entry }
+    $hasDistribution = $evidence.PSObject.Properties.Name -contains 'distribution'
+    $signingStatus = [string]$evidence.signing.status
+    $timestampStatus = [string]$evidence.timestamp.status
+    $hasSigningPolicyPath = $evidence.signing.PSObject.Properties.Name -contains 'policy_path'
+    $hasTimestampPolicyPath = $evidence.timestamp.PSObject.Properties.Name -contains 'policy_path'
+    $isWaived = $signingStatus -eq 'WAIVED_BY_OWNER' -or $timestampStatus -eq 'WAIVED_BY_OWNER' -or $hasSigningPolicyPath -or $hasTimestampPolicyPath
+    $isPrivateBeta = $false
+    $artifactLabel = ''
+
+    if ($hasDistribution -or $isWaived) {
+        if (-not $hasDistribution) { throw 'WAIVED_BY_OWNER requires exact private-beta policy distribution evidence' }
+        foreach ($required in @('channel', 'artifact_label', 'policy_path', 'policy_sha256')) {
+            if (-not ($evidence.distribution.PSObject.Properties.Name -contains $required)) { throw "private-beta distribution missing $required" }
+        }
+        if ([string]$evidence.distribution.channel -ne 'private-beta') { throw "WAIVED_BY_OWNER requires private-beta distribution channel, got $($evidence.distribution.channel)" }
+        if ([string]$evidence.distribution.artifact_label -ne 'unsigned-private-beta') { throw 'private-beta distribution artifact_label must be unsigned-private-beta' }
+        if ([string]$evidence.distribution.policy_path -cne 'policy.json') { throw 'private-beta distribution policy_path must be policy.json, not a caller-supplied path' }
+        if ($signingStatus -ne 'WAIVED_BY_OWNER' -or $timestampStatus -ne 'WAIVED_BY_OWNER') {
+            throw 'private-beta policy evidence requires WAIVED_BY_OWNER signing and timestamp status'
+        }
+        if (-not $hasSigningPolicyPath -or [string]$evidence.signing.policy_path -cne 'policy.json') { throw 'private-beta signing policy_path must be policy.json' }
+        if (-not $hasTimestampPolicyPath -or [string]$evidence.timestamp.policy_path -cne 'policy.json') { throw 'private-beta timestamp policy_path must be policy.json' }
+        if (@($evidence.signing.signed).Count -ne 0) { throw 'private-beta WAIVED_BY_OWNER evidence requires empty signing.signed' }
+        if ([string]$evidence.distribution.policy_sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'private-beta policy_sha256 must be a lowercase SHA-256 digest' }
+        if (-not $manifestByPath.ContainsKey('policy.json')) { throw 'private-beta policy missing from manifest' }
+        $trackedPolicy = Get-TrackedPrivateBetaPolicyRecord
+        $stagedPolicyPath = Join-Path $stagePathForEvidence 'policy.json'
+        if (-not (Test-Path -LiteralPath $stagedPolicyPath -PathType Leaf)) { throw 'staged private-beta policy is missing: policy.json' }
+        $stagedRaw = Get-Content -LiteralPath $stagedPolicyPath -Raw
+        if ($stagedRaw -cne $trackedPolicy.Raw) { throw 'staged private-beta policy must be byte-for-byte identical to tracked policy.json' }
+        $stagedPolicy = $stagedRaw | ConvertFrom-Json
+        Assert-ExactPrivateBetaPolicyObject -Policy $stagedPolicy -Context 'staged'
+        $stagedPolicyHash = Get-Sha256 $stagedPolicyPath
+        if ($stagedPolicyHash -cne [string]$evidence.distribution.policy_sha256) { throw 'private-beta policy_sha256 hash mismatch' }
+        if ($manifestByPath['policy.json'].Sha256 -cne $stagedPolicyHash) { throw 'private-beta manifest policy hash mismatch' }
+        $isPrivateBeta = $true
+        $artifactLabel = 'unsigned-private-beta'
+    }
+
     $artifacts = @($evidence.artifacts)
     $signed = @($evidence.signing.signed)
     if ($artifacts.Count -eq 0) { throw 'release evidence artifacts must be nonempty' }
-    if ($signed.Count -eq 0) { throw 'release evidence signing.signed must be nonempty' }
+    if (-not $isPrivateBeta -and $signed.Count -eq 0) { throw 'release evidence signing.signed must be nonempty' }
 
-    $manifestByPath = @{}
-    foreach ($entry in $ManifestEntries) { $manifestByPath[$entry.RelativePath.ToLowerInvariant()] = $entry }
     $artifactByPath = @{}
     foreach ($artifact in $artifacts) {
         foreach ($required in @('path', 'sha256', 'type')) {
             if (-not ($artifact.PSObject.Properties.Name -contains $required)) { throw "malformed release evidence: artifact missing $required" }
         }
         $relative = Assert-NoForbiddenPath $artifact.path
-        Assert-CanonicalArtifactName -RelativePath $relative -CanonicalVersion $CanonicalVersion -ExpectedSourceRevision $ExpectedSourceRevision
+        Assert-CanonicalArtifactName -RelativePath $relative -CanonicalVersion $CanonicalVersion -ExpectedSourceRevision $ExpectedSourceRevision -ArtifactLabel $artifactLabel
         $expectedType = Get-ArtifactType $relative
         if ([string]$artifact.type -ne $expectedType) { throw "malformed release evidence: artifact type/extension mismatch $relative" }
         $key = $relative.ToLowerInvariant()
@@ -485,8 +560,20 @@ function Read-ReleaseEvidence {
         if ($signedByPath.ContainsKey($key)) { throw "duplicate or case-confusable signed artifact path: $relative" }
         $signedByPath[$key] = $relative
     }
-    Assert-KeySetsEqual -Expected $artifactByPath -Actual $signedByPath -Context 'signed/artifact evidence mismatch'
+    if (-not $isPrivateBeta) {
+        Assert-KeySetsEqual -Expected $artifactByPath -Actual $signedByPath -Context 'signed/artifact evidence mismatch'
+    }
     return $evidence
+}
+
+function Test-IsPrivateBetaWaiverEvidence {
+    param($Evidence)
+    if ($null -eq $Evidence) { return $false }
+    if (-not ($Evidence.PSObject.Properties.Name -contains 'distribution')) { return $false }
+    return ([string]$Evidence.distribution.channel -eq 'private-beta' -and
+        [string]$Evidence.distribution.artifact_label -eq 'unsigned-private-beta' -and
+        [string]$Evidence.signing.status -eq 'WAIVED_BY_OWNER' -and
+        [string]$Evidence.timestamp.status -eq 'WAIVED_BY_OWNER')
 }
 
 function Assert-ArtifactInventoryExact {
@@ -610,6 +697,9 @@ function Invoke-ReleaseVerification {
         $evidence = Read-ReleaseEvidence -StagePath $stagePath -ManifestEntries $manifestEntries -CanonicalVersion $canonicalVersion -ExpectedSourceRevision $ExpectedSourceRevision
         Assert-ArtifactInventoryExact -ActualFiles $actualFiles -ManifestEntries $manifestEntries -Evidence $evidence
         Assert-SbomExact -StagePath $stagePath -ManifestEntries $manifestEntries -Evidence $evidence
+        if (Test-IsPrivateBetaWaiverEvidence -Evidence $evidence) {
+            return New-Result 'PASS' 'Private-beta policy waiver, release evidence, manifest, and SBOM are valid'
+        }
         if ($evidence.signing.status -ne 'PASS' -or $evidence.timestamp.status -ne 'PASS') {
             return New-Result 'BLOCKED' 'Release evidence does not contain PASS signing and timestamp status'
         }

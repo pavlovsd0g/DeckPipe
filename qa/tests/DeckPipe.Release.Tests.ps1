@@ -4,6 +4,15 @@ Set-StrictMode -Version Latest
 $script:Passed = 0
 $script:Failed = 0
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
+$script:ExpectedPrivateBetaPolicy = [ordered]@{
+    schema_version = 1
+    channel = 'private-beta'
+    signing_requirement = 'owner-waived'
+    timestamp_requirement = 'owner-waived'
+    windows_reputation_warning = 'accepted'
+    waiver_date = '2026-08-28'
+    intended_audience = 'controlled-small-group'
+}
 
 function Assert-True {
     param([bool]$Condition, [string]$Message = 'Expected condition to be true')
@@ -74,6 +83,18 @@ function Get-TestCurrentHead {
     $revision = if ($revisionItems.Count -gt 0) { $revisionItems[0] } else { '' }
     if (-not $revision -or $revisionExitCode -ne 0) { throw 'test setup failed: git rev-parse HEAD failed' }
     return [string]$revision
+}
+
+function New-TestPrivateBetaPolicy {
+    return [ordered]@{
+        schema_version = 1
+        channel = 'private-beta'
+        signing_requirement = 'owner-waived'
+        timestamp_requirement = 'owner-waived'
+        windows_reputation_warning = 'accepted'
+        waiver_date = '2026-08-28'
+        intended_audience = 'controlled-small-group'
+    }
 }
 
 function New-SyntheticReleaseStage {
@@ -164,6 +185,56 @@ function New-SyntheticReleaseStage {
     }
     Write-Utf8NoBom (Join-Path $temp 'SHA256SUMS.txt') (($manifestLines -join "`n") + "`n")
     return $temp
+}
+
+function Set-SyntheticPrivateBetaPolicy {
+    param(
+        [Parameter(Mandatory)][string]$StagePath,
+        $Policy = $null,
+        [string]$PolicyPath = 'policy.json',
+        [string]$PolicySha256 = '',
+        [string]$Channel = 'private-beta',
+        [string]$ArtifactLabel = 'unsigned-private-beta',
+        [string]$SigningStatus = 'WAIVED_BY_OWNER',
+        [string[]]$Signed = @(),
+        [string]$TimestampStatus = 'WAIVED_BY_OWNER'
+    )
+
+    $policyRelative = if ($PolicyPath -eq 'policy.json') { 'policy.json' } else { 'policy.json' }
+    if ($null -eq $Policy) {
+        Copy-Item -LiteralPath (Join-Path $repoRoot 'release\policy.json') -Destination (Join-Path $StagePath $policyRelative) -Force
+    } else {
+        Write-Utf8NoBom (Join-Path $StagePath $policyRelative) ($Policy | ConvertTo-Json -Depth 8)
+    }
+    $policyHash = if ($PolicySha256) { $PolicySha256 } else { Get-TestSha256 (Join-Path $StagePath $policyRelative) }
+    $evidencePath = Join-Path $StagePath 'release-evidence.json'
+    $evidence = Get-Content -LiteralPath $evidencePath -Raw | ConvertFrom-Json
+    foreach ($artifact in @($evidence.artifacts)) {
+        $oldName = [string]$artifact.path
+        if ($oldName -notmatch '-unsigned-private-beta-x64') {
+            $newName = $oldName -replace '-x64', '-unsigned-private-beta-x64'
+            Rename-Item -LiteralPath (Join-Path $StagePath $oldName) -NewName $newName
+            $artifact.path = $newName
+            $artifact.sha256 = Get-TestSha256 (Join-Path $StagePath $newName)
+        }
+    }
+    $normalizedSigned = @()
+    foreach ($signedPath in @($Signed)) {
+        $normalizedSigned += ([string]$signedPath -replace '-x64', '-unsigned-private-beta-x64')
+    }
+    $evidence | Add-Member -Force -NotePropertyName distribution -NotePropertyValue ([pscustomobject][ordered]@{
+        channel = $Channel
+        artifact_label = $ArtifactLabel
+        policy_path = $PolicyPath
+        policy_sha256 = $policyHash
+    })
+    $evidence.signing.status = $SigningStatus
+    $evidence.signing.signed = $normalizedSigned
+    $evidence.signing | Add-Member -Force -NotePropertyName policy_path -NotePropertyValue $PolicyPath
+    $evidence.timestamp.status = $TimestampStatus
+    $evidence.timestamp | Add-Member -Force -NotePropertyName policy_path -NotePropertyValue $PolicyPath
+    Write-Utf8NoBom $evidencePath ($evidence | ConvertTo-Json -Depth 10)
+    Update-SyntheticStageInventory $StagePath
 }
 
 function Update-SyntheticStageInventory {
@@ -352,6 +423,18 @@ It 'defines one canonical release version and synchronizes every package source'
         Assert-False ($text -match 'release["'']?\s*/\s*["'']?version\.json|version_path|_load_release_info|json\.load') "$relative must not read repo-layout release/version.json at import"
         Assert-True ($text -match 'APP_VERSION\s*=\s*"0\.6\.0"') "$relative must embed synchronized version"
         Assert-True ($text -match 'APP_BUILD_ID\s*=\s*"0\.6\.0\+20260827\.050713\.6456dba254a6"') "$relative must embed synchronized build id"
+    }
+}
+
+It 'defines exactly one tracked private beta waiver policy' {
+    $policyPath = Join-Path $repoRoot 'release\policy.json'
+    Assert-True (Test-Path -LiteralPath $policyPath -PathType Leaf) 'Missing tracked release/policy.json'
+    $policy = Get-Content -LiteralPath $policyPath -Raw | ConvertFrom-Json
+    $actualNames = @($policy.PSObject.Properties.Name)
+    $expectedNames = @($script:ExpectedPrivateBetaPolicy.Keys)
+    Assert-Equal ($actualNames -join '|') ($expectedNames -join '|') 'Private beta policy properties must be exact and in canonical order'
+    foreach ($name in $expectedNames) {
+        Assert-Equal $policy.$name $script:ExpectedPrivateBetaPolicy[$name] "Private beta policy drift: $name"
     }
 }
 
@@ -779,6 +862,100 @@ It 'blocks unsigned candidates and fails malformed release evidence' {
     }
 }
 
+It 'allows private beta PASS only when exact tracked policy and evidence hash are bound' {
+    $stage = New-SyntheticReleaseStage -WithExecutable -StageName 'deckpipe-private-beta-pass'
+    try {
+        Set-SyntheticPrivateBetaPolicy -StagePath $stage
+        $result = Invoke-ReleaseScript 'release\verify.ps1' @('-StagingDirectory', $stage)
+        Assert-Equal $result.ExitCode 0 "Private beta verifier exit code. Output: $($result.Output)"
+        $json = $result.Output | ConvertFrom-Json
+        Assert-Equal $json.status 'PASS'
+        Assert-True ($json.message -match 'private-beta|policy|waiver') "Expected private beta policy waiver message, got $($json.message)"
+    } finally {
+        [IO.Directory]::Delete($stage, $true)
+    }
+}
+
+It 'rejects private beta policy drift forged hashes caller policy paths and signed-looking waiver evidence' {
+    $cases = @(
+        @{
+            Name = 'missing-policy-field'
+            Mutate = {
+                param($stage)
+                $policy = New-TestPrivateBetaPolicy
+                $policy.Remove('intended_audience')
+                Set-SyntheticPrivateBetaPolicy -StagePath $stage -Policy $policy
+            }
+            Pattern = 'policy|missing|intended_audience|exact'
+        },
+        @{
+            Name = 'extra-policy-field'
+            Mutate = {
+                param($stage)
+                $policy = New-TestPrivateBetaPolicy
+                $policy['approved_by'] = 'owner'
+                Set-SyntheticPrivateBetaPolicy -StagePath $stage -Policy $policy
+            }
+            Pattern = 'policy|extra|approved_by|exact'
+        },
+        @{
+            Name = 'public-channel'
+            Mutate = {
+                param($stage)
+                Set-SyntheticPrivateBetaPolicy -StagePath $stage -Channel 'public'
+            }
+            Pattern = 'private-beta|public|channel|policy'
+        },
+        @{
+            Name = 'caller-policy-path'
+            Mutate = {
+                param($stage)
+                Set-SyntheticPrivateBetaPolicy -StagePath $stage -PolicyPath (Join-Path $stage 'policy.json')
+            }
+            Pattern = 'policy_path|policy\.json|caller|path'
+        },
+        @{
+            Name = 'forged-policy-hash'
+            Mutate = {
+                param($stage)
+                Set-SyntheticPrivateBetaPolicy -StagePath $stage -PolicySha256 ('0' * 64)
+            }
+            Pattern = 'policy|sha256|hash|mismatch'
+        },
+        @{
+            Name = 'pass-signing-without-valid-signature'
+            Mutate = {
+                param($stage)
+                $artifact = @(Get-ChildItem -LiteralPath $stage -Force -File | Where-Object { $_.Name -match '\.exe$' })[0]
+                Set-SyntheticPrivateBetaPolicy -StagePath $stage -SigningStatus 'PASS' -TimestampStatus 'PASS' -Signed @($artifact.Name)
+            }
+            Pattern = 'Authenticode|signature|timestamp|PASS'
+        },
+        @{
+            Name = 'waived-without-exact-private-beta-policy'
+            Mutate = {
+                param($stage)
+                $policy = New-TestPrivateBetaPolicy
+                $policy['channel'] = 'public'
+                Set-SyntheticPrivateBetaPolicy -StagePath $stage -Policy $policy
+            }
+            Pattern = 'private-beta|policy|WAIVED_BY_OWNER|exact'
+        }
+    )
+
+    foreach ($case in $cases) {
+        $stage = New-SyntheticReleaseStage -WithExecutable -StageName "deckpipe-private-beta-$($case.Name)"
+        try {
+            & $case.Mutate $stage
+            $result = Invoke-ReleaseScript 'release\verify.ps1' @('-StagingDirectory', $stage)
+            Assert-False ($result.ExitCode -eq 0) "Expected verifier rejection for $($case.Name), got PASS: $($result.Output)"
+            Assert-True ($result.Output -match $case.Pattern) "Expected $($case.Pattern) for $($case.Name), got $($result.Output)"
+        } finally {
+            [IO.Directory]::Delete($stage, $true)
+        }
+    }
+}
+
 It 'rejects artifact evidence sets that omit actual artifacts or signed paths' {
     $cases = @(
         @{
@@ -985,6 +1162,37 @@ It 'plans release builds only from an isolated tracked HEAD temp workspace' {
         Assert-True ($plan.ExpectedArtifactNames -contains 'DeckPipe-0.6.0+20260827.050713.6456dba254a6-aaaaaaa-x64.exe') 'Expected application artifact name missing'
         Assert-True ($plan.ExpectedArtifactNames -contains 'DeckPipe-0.6.0+20260827.050713.6456dba254a6-aaaaaaa-x64-setup.exe') 'Expected setup artifact name missing'
         Assert-True ($plan.ExpectedArtifactNames -contains 'DeckPipe-0.6.0+20260827.050713.6456dba254a6-aaaaaaa-x64.msi') 'Expected MSI artifact name missing'
+    } finally {
+        if (Test-Path -LiteralPath $tempRoot) { [IO.Directory]::Delete($tempRoot, $true) }
+    }
+}
+
+It 'plans private beta artifacts with explicit unsigned-private-beta naming and rejects mixed signing modes' {
+    . (Join-Path $repoRoot 'release\build.ps1')
+    $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('deckpipe-private-beta-plan-' + [guid]::NewGuid().ToString('N'))
+    $stage = Join-Path $tempRoot 'stage'
+    $wheelhouse = Join-Path $tempRoot 'wheelhouse'
+    [IO.Directory]::CreateDirectory($wheelhouse) | Out-Null
+    try {
+        $version = Read-JsonFile 'release\version.json'
+        $sourceRevision = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+        $plan = New-ReleaseBuildPlan -StagingDirectory $stage -WheelhouseDirectory $wheelhouse -Version $version -SourceRevision $sourceRevision -PythonExe 'python.exe' -PrivateBetaCandidate
+        Assert-True ($plan.ExpectedArtifactNames -contains 'DeckPipe-0.6.0+20260827.050713.6456dba254a6-bbbbbbb-unsigned-private-beta-x64.exe') 'Private beta application artifact name missing'
+        Assert-True ($plan.ExpectedArtifactNames -contains 'DeckPipe-0.6.0+20260827.050713.6456dba254a6-bbbbbbb-unsigned-private-beta-x64-setup.exe') 'Private beta setup artifact name missing'
+        Assert-True ($plan.ExpectedArtifactNames -contains 'DeckPipe-0.6.0+20260827.050713.6456dba254a6-bbbbbbb-unsigned-private-beta-x64.msi') 'Private beta MSI artifact name missing'
+
+        Assert-Throws {
+            Invoke-ReleaseBuild -StagingDirectory $stage -UnsignedEngineeringCandidate -PrivateBetaCandidate
+        } 'PrivateBetaCandidate|UnsignedEngineeringCandidate|cannot combine'
+        Assert-Throws {
+            Invoke-ReleaseBuild -StagingDirectory $stage -PrivateBetaCandidate -SignToolPath 'signtool.exe'
+        } 'PrivateBetaCandidate|signing|cannot combine'
+        Assert-Throws {
+            Invoke-ReleaseBuild -StagingDirectory $stage -PrivateBetaCandidate -SigningCertificateThumbprint '001122'
+        } 'PrivateBetaCandidate|signing|cannot combine'
+        Assert-Throws {
+            Invoke-ReleaseBuild -StagingDirectory $stage -PrivateBetaCandidate -TimestampUrl 'https://timestamp.example/rfc3161'
+        } 'PrivateBetaCandidate|timestamp|cannot combine'
     } finally {
         if (Test-Path -LiteralPath $tempRoot) { [IO.Directory]::Delete($tempRoot, $true) }
     }

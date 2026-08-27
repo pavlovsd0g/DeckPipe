@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "channel": "private-beta",
+  "signing_requirement": "owner-waived",
+  "timestamp_requirement": "owner-waived",
+  "windows_reputation_warning": "accepted",
+  "waiver_date": "2026-08-28",
+  "intended_audience": "controlled-small-group"
+}

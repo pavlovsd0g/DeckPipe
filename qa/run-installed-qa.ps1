@@ -56,6 +56,16 @@ $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $modulePath = Join-Path $PSScriptRoot 'DeckPipe.QA.psm1'
 $budgetPath = Join-Path $PSScriptRoot 'performance-budget.json'
 $releaseVerifierPath = Join-Path $repoRoot 'release\verify.ps1'
+$privateBetaPolicyPath = Join-Path $repoRoot 'release\policy.json'
+$privateBetaPolicy = [ordered]@{
+    schema_version = 1
+    channel = 'private-beta'
+    signing_requirement = 'owner-waived'
+    timestamp_requirement = 'owner-waived'
+    windows_reputation_warning = 'accepted'
+    waiver_date = '2026-08-28'
+    intended_audience = 'controlled-small-group'
+}
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = Join-Path $repoRoot '.bench\runs'
 }
@@ -172,14 +182,47 @@ function Get-DeckPipeArtifactType {
 function Assert-DeckPipeCanonicalArtifactName {
     param(
         [Parameter(Mandatory)][string]$RelativePath,
-        [Parameter(Mandatory)]$Evidence
+        [Parameter(Mandatory)]$Evidence,
+        [string]$ArtifactLabel = ''
     )
 
     $shortRevision = ([string]$Evidence.source_revision).Substring(0, 7)
     $prefix = 'DeckPipe-' + [regex]::Escape([string]$Evidence.build_id) + '-' + [regex]::Escape($shortRevision)
+    if (-not [string]::IsNullOrWhiteSpace($ArtifactLabel)) {
+        $prefix += '-' + [regex]::Escape($ArtifactLabel)
+    }
     $pattern = '^' + $prefix + '-x64(\.exe|-setup\.exe|\.msi)$'
     if ($RelativePath -notmatch $pattern) {
         throw "ambiguous executable artifact or non-canonical artifact name for evidence version/build/source: $RelativePath"
+    }
+}
+
+function Assert-DeckPipeExactPrivateBetaPolicyObject {
+    param(
+        [Parameter(Mandatory)]$Policy,
+        [Parameter(Mandatory)][string]$Context
+    )
+
+    $actualNames = @($Policy.PSObject.Properties.Name)
+    foreach ($name in @($privateBetaPolicy.Keys)) {
+        if (-not ($actualNames -contains $name)) { throw "$Context private-beta policy missing $name" }
+        if ([string]$Policy.$name -ne [string]$privateBetaPolicy[$name]) { throw "$Context private-beta policy drift: $name" }
+    }
+    foreach ($name in $actualNames) {
+        if (-not $privateBetaPolicy.Contains($name)) { throw "$Context private-beta policy extra $name" }
+    }
+}
+
+function Get-DeckPipePrivateBetaPolicyRecord {
+    if (-not (Test-Path -LiteralPath $privateBetaPolicyPath -PathType Leaf)) {
+        throw 'tracked private-beta policy is missing: policy.json'
+    }
+    $raw = Get-Content -LiteralPath $privateBetaPolicyPath -Raw
+    $policy = $raw | ConvertFrom-Json
+    Assert-DeckPipeExactPrivateBetaPolicyObject -Policy $policy -Context 'tracked'
+    return [pscustomobject]@{
+        Raw = $raw
+        Sha256 = (Get-FileHash -LiteralPath $privateBetaPolicyPath -Algorithm SHA256).Hash.ToLowerInvariant()
     }
 }
 
@@ -205,6 +248,7 @@ function Get-DeckPipeStageFileRecords {
     $records = @()
     $seen = @{}
     $metadataFiles = @('release-evidence.json', 'sbom.spdx.json', 'SHA256SUMS.txt')
+    $optionalMetadataFiles = @('policy.json')
     foreach ($entry in @(Get-ChildItem -LiteralPath $StagePath -Force | Sort-Object Name)) {
         Assert-DeckPipeNoReparseAttributes -Attributes $entry.Attributes -Context "evidence top-level entry $($entry.Name)"
         if ($entry.PSIsContainer) { throw "staging subdirectories are not allowed: $($entry.Name)" }
@@ -213,7 +257,7 @@ function Get-DeckPipeStageFileRecords {
         if ($seen.ContainsKey($key)) { throw "duplicate or case-confusable staged path: $relative" }
         $seen[$key] = $true
 
-        $metadataMatch = @($metadataFiles | Where-Object { $_ -ieq $relative })
+        $metadataMatch = @((@($metadataFiles) + @($optionalMetadataFiles)) | Where-Object { $_ -ieq $relative })
         if ($metadataMatch.Count -gt 0 -and $metadataMatch[0] -cne $relative) {
             throw "case-confusable release metadata path: $relative"
         }
@@ -312,13 +356,74 @@ function Read-DeckPipeReleaseEvidence {
         throw 'malformed release evidence: invalid source revision'
     }
 
+    $manifestByPath = @{}
+    foreach ($entry in $ManifestEntries) { $manifestByPath[$entry.RelativePath.ToLowerInvariant()] = $entry }
+    $hasDistribution = $evidence.PSObject.Properties.Name -contains 'distribution'
+    $signingStatus = [string]$evidence.signing.status
+    $timestampStatus = [string]$evidence.timestamp.status
+    $hasSigningPolicyPath = $evidence.signing.PSObject.Properties.Name -contains 'policy_path'
+    $hasTimestampPolicyPath = $evidence.timestamp.PSObject.Properties.Name -contains 'policy_path'
+    $isWaived = $signingStatus -eq 'WAIVED_BY_OWNER' -or $timestampStatus -eq 'WAIVED_BY_OWNER' -or $hasSigningPolicyPath -or $hasTimestampPolicyPath
+    $isPrivateBeta = $false
+    $artifactLabel = ''
+
+    if ($hasDistribution -or $isWaived) {
+        if (-not $hasDistribution) { throw 'WAIVED_BY_OWNER requires exact private-beta policy distribution evidence' }
+        foreach ($required in @('channel', 'artifact_label', 'policy_path', 'policy_sha256')) {
+            if (-not ($evidence.distribution.PSObject.Properties.Name -contains $required)) {
+                throw "private-beta distribution missing $required"
+            }
+        }
+        if ([string]$evidence.distribution.channel -ne 'private-beta') {
+            throw "WAIVED_BY_OWNER requires private-beta distribution channel, got $($evidence.distribution.channel)"
+        }
+        if ([string]$evidence.distribution.artifact_label -ne 'unsigned-private-beta') {
+            throw 'private-beta distribution artifact_label must be unsigned-private-beta'
+        }
+        if ([string]$evidence.distribution.policy_path -cne 'policy.json') {
+            throw 'private-beta distribution policy_path must be policy.json, not a caller-supplied path'
+        }
+        if ($signingStatus -ne 'WAIVED_BY_OWNER' -or $timestampStatus -ne 'WAIVED_BY_OWNER') {
+            throw 'private-beta policy evidence requires WAIVED_BY_OWNER signing and timestamp status'
+        }
+        if (-not $hasSigningPolicyPath -or [string]$evidence.signing.policy_path -cne 'policy.json') {
+            throw 'private-beta signing policy_path must be policy.json'
+        }
+        if (-not $hasTimestampPolicyPath -or [string]$evidence.timestamp.policy_path -cne 'policy.json') {
+            throw 'private-beta timestamp policy_path must be policy.json'
+        }
+        if (@($evidence.signing.signed).Count -ne 0) {
+            throw 'private-beta WAIVED_BY_OWNER evidence requires empty signing.signed'
+        }
+        if ([string]$evidence.distribution.policy_sha256 -cnotmatch '^[0-9a-f]{64}$') {
+            throw 'private-beta policy_sha256 must be a lowercase SHA-256 digest'
+        }
+        if (-not $manifestByPath.ContainsKey('policy.json')) { throw 'private-beta policy missing from manifest' }
+        $trackedPolicy = Get-DeckPipePrivateBetaPolicyRecord
+        $stagedPolicyPath = Join-Path $StagePath 'policy.json'
+        Assert-DeckPipeItemNotReparse -Path $stagedPolicyPath -Context 'evidence top-level entry policy.json' | Out-Null
+        $stagedRaw = Get-Content -LiteralPath $stagedPolicyPath -Raw
+        if ($stagedRaw -cne $trackedPolicy.Raw) {
+            throw 'staged private-beta policy must be byte-for-byte identical to tracked policy.json'
+        }
+        $stagedPolicy = $stagedRaw | ConvertFrom-Json
+        Assert-DeckPipeExactPrivateBetaPolicyObject -Policy $stagedPolicy -Context 'staged'
+        $stagedPolicyHash = (Get-FileHash -LiteralPath $stagedPolicyPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($stagedPolicyHash -cne [string]$evidence.distribution.policy_sha256) {
+            throw 'private-beta policy_sha256 hash mismatch'
+        }
+        if ($manifestByPath['policy.json'].Sha256 -cne $stagedPolicyHash) {
+            throw 'private-beta manifest policy hash mismatch'
+        }
+        $isPrivateBeta = $true
+        $artifactLabel = 'unsigned-private-beta'
+    }
+
     $artifacts = @($evidence.artifacts)
     $signed = @($evidence.signing.signed)
     if ($artifacts.Count -eq 0) { throw 'release evidence artifacts must be nonempty' }
-    if ($signed.Count -eq 0) { throw 'release evidence signing.signed must be nonempty' }
+    if (-not $isPrivateBeta -and $signed.Count -eq 0) { throw 'release evidence signing.signed must be nonempty' }
 
-    $manifestByPath = @{}
-    foreach ($entry in $ManifestEntries) { $manifestByPath[$entry.RelativePath.ToLowerInvariant()] = $entry }
     $artifactByPath = @{}
     foreach ($artifact in $artifacts) {
         foreach ($required in @('path', 'sha256', 'type')) {
@@ -327,7 +432,7 @@ function Read-DeckPipeReleaseEvidence {
             }
         }
         $relative = Assert-DeckPipeNoForbiddenReleasePath -RelativePath ([string]$artifact.path)
-        Assert-DeckPipeCanonicalArtifactName -RelativePath $relative -Evidence $evidence
+        Assert-DeckPipeCanonicalArtifactName -RelativePath $relative -Evidence $evidence -ArtifactLabel $artifactLabel
         $expectedType = Get-DeckPipeArtifactType -RelativePath $relative
         if ([string]$artifact.type -ne $expectedType) {
             throw "malformed release evidence: artifact type/extension mismatch $relative"
@@ -350,7 +455,9 @@ function Read-DeckPipeReleaseEvidence {
         if ($signedByPath.ContainsKey($key)) { throw "duplicate or case-confusable signed artifact path: $relative" }
         $signedByPath[$key] = $relative
     }
-    Assert-DeckPipeKeySetsEqual -Expected $artifactByPath -Actual $signedByPath -Context 'signed/artifact evidence mismatch'
+    if (-not $isPrivateBeta) {
+        Assert-DeckPipeKeySetsEqual -Expected $artifactByPath -Actual $signedByPath -Context 'signed/artifact evidence mismatch'
+    }
     return $evidence
 }
 

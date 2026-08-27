@@ -79,7 +79,7 @@ $allFiles = @(Get-ChildItem -LiteralPath $inputPath -Force -File |
 foreach ($file in $allFiles) {
     $relative = $file.FullName.Substring($inputPath.Length).TrimStart('\') -replace '\\', '/'
     $relative = Assert-NoForbiddenPath $relative
-    if ($relative -ne 'release-evidence.json' -and [IO.Path]::GetExtension($relative).ToLowerInvariant() -notin @('.exe', '.msi')) {
+    if ($relative -notin @('release-evidence.json', 'policy.json') -and [IO.Path]::GetExtension($relative).ToLowerInvariant() -notin @('.exe', '.msi')) {
         throw "unexpected SBOM input outside release allowlist: $relative"
     }
     $pathKey = $relative.ToLowerInvariant()

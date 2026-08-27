@@ -18,6 +18,15 @@ SOURCE_REVISION = subprocess.check_output(
 ).strip()
 ARTIFACT_NAME = f"DeckPipe-{BUILD_ID}-{SOURCE_REVISION[:7]}-x64.exe"
 SPOOFED_SOURCE_REVISION = "0123456789abcdef0123456789abcdef01234567"
+PRIVATE_BETA_POLICY = {
+    "schema_version": 1,
+    "channel": "private-beta",
+    "signing_requirement": "owner-waived",
+    "timestamp_requirement": "owner-waived",
+    "windows_reputation_warning": "accepted",
+    "waiver_date": "2026-08-28",
+    "intended_audience": "controlled-small-group",
+}
 
 
 class InstalledRunnerContractTests(unittest.TestCase):
@@ -110,11 +119,18 @@ class InstalledRunnerContractTests(unittest.TestCase):
         artifact_name: str | None = None,
         source_revision: str = SOURCE_REVISION,
         second_artifact_same_bytes: bool = False,
+        private_beta: bool = False,
+        policy: dict | None = None,
+        policy_path: str = "policy.json",
+        policy_sha256: str | None = None,
+        channel: str = "private-beta",
+        artifact_label: str = "unsigned-private-beta",
     ):
         stage = directory / "stage"
         stage.mkdir()
         if artifact_name is None:
-            artifact_name = f"DeckPipe-{BUILD_ID}-{source_revision[:7]}-x64.exe"
+            label = "-unsigned-private-beta" if private_beta else ""
+            artifact_name = f"DeckPipe-{BUILD_ID}-{source_revision[:7]}{label}-x64.exe"
         artifact = stage / artifact_name
         artifact.write_bytes(artifact_bytes)
         artifacts = [{"path": artifact_name, "type": "exe", "sha256": self.sha256(artifact)}]
@@ -125,6 +141,7 @@ class InstalledRunnerContractTests(unittest.TestCase):
             artifacts.append({"path": second.name, "type": "exe", "sha256": self.sha256(second)})
             files.append(second.name)
 
+        signed = [a["path"] for a in artifacts]
         evidence = {
             "schema_version": 1,
             "product": "DeckPipe",
@@ -132,9 +149,25 @@ class InstalledRunnerContractTests(unittest.TestCase):
             "build_id": BUILD_ID,
             "source_revision": source_revision,
             "artifacts": artifacts,
-            "signing": {"status": status, "signed": [a["path"] for a in artifacts]},
+            "signing": {"status": status, "signed": signed},
             "timestamp": {"status": status},
         }
+        if private_beta:
+            if policy is None:
+                shutil.copyfile(ROOT / "release" / "policy.json", stage / "policy.json")
+            else:
+                self.write_json(stage / "policy.json", policy)
+            files.append("policy.json")
+            actual_policy_sha = self.sha256(stage / "policy.json")
+            effective_policy_sha = policy_sha256 if policy_sha256 is not None else actual_policy_sha
+            evidence["distribution"] = {
+                "channel": channel,
+                "artifact_label": artifact_label,
+                "policy_path": policy_path,
+                "policy_sha256": effective_policy_sha,
+            }
+            evidence["signing"] = {"status": "WAIVED_BY_OWNER", "signed": [], "policy_path": policy_path}
+            evidence["timestamp"] = {"status": "WAIVED_BY_OWNER", "policy_path": policy_path}
         self.write_json(stage / "release-evidence.json", evidence)
         files.append("release-evidence.json")
 
@@ -283,6 +316,48 @@ class InstalledRunnerContractTests(unittest.TestCase):
             self.assertNotEqual(0, result.returncode, result.stdout)
             self.assertIn("release verifier status", result.stdout)
             self.assertNotIn("source_revision mismatch", result.stdout)
+            self.assertNotIn("SELFTEST_LAUNCH", result.stdout)
+            self.assertNotIn("launch_allowed", result.stdout)
+
+    def test_normal_installed_identity_accepts_verifier_confirmed_private_beta_pass(self):
+        with tempfile.TemporaryDirectory(prefix="deckpipe-runner-contract-") as tmp:
+            tmp_path = Path(tmp)
+            stage, artifact = self.make_stage(tmp_path, private_beta=True)
+            installed = self.make_installed_copy(tmp_path, artifact)
+
+            result = self.run_runner(
+                "-SelfTestContract",
+                "identity",
+                "-ExePath",
+                installed,
+                "-CandidateEvidenceDirectory",
+                stage,
+            )
+
+            self.assertEqual(0, result.returncode, result.stdout)
+            payload = self.parse_selftest_json(result)
+            self.assertTrue(payload["launch_allowed"])
+            self.assertTrue(payload["identity"]["matched"])
+            self.assertEqual("PASS", payload["identity"]["release_verifier_status"])
+            self.assertFalse(payload["identity"]["engineering_mode"])
+
+    def test_fake_policy_path_cannot_authorize_private_beta_launch(self):
+        with tempfile.TemporaryDirectory(prefix="deckpipe-runner-contract-") as tmp:
+            tmp_path = Path(tmp)
+            stage, artifact = self.make_stage(tmp_path, private_beta=True, policy_path=str(tmp_path / "policy.json"))
+            installed = self.make_installed_copy(tmp_path, artifact)
+
+            result = self.run_runner(
+                "-SelfTestContract",
+                "identity",
+                "-ExePath",
+                installed,
+                "-CandidateEvidenceDirectory",
+                stage,
+            )
+
+            self.assertNotEqual(0, result.returncode, result.stdout)
+            self.assertRegex(result.stdout, r"policy_path|policy\.json|release verifier status")
             self.assertNotIn("SELFTEST_LAUNCH", result.stdout)
             self.assertNotIn("launch_allowed", result.stdout)
 
