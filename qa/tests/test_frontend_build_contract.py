@@ -1,8 +1,10 @@
 import hashlib
+import io
 import json
 import re
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,16 +25,41 @@ def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def git_blob_bytes(repo_path):
+def git_blob_bytes(repo_path, repo_root=None):
+    root = ROOT if repo_root is None else Path(repo_root)
     result = subprocess.run(
-        ["git", "show", f":{repo_path}"],
-        cwd=ROOT,
+        ["git", "show", f"HEAD:{repo_path}"],
+        cwd=root,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
     if result.returncode != 0:
         raise AssertionError(result.stderr.decode("utf-8", errors="replace"))
     return result.stdout
+
+
+def git_archive_blob_bytes(repo_paths, repo_root=None):
+    root = ROOT if repo_root is None else Path(repo_root)
+    result = subprocess.run(
+        ["git", "archive", "--format=tar", "HEAD", "--", *repo_paths],
+        cwd=root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr.decode("utf-8", errors="replace"))
+    blobs = {}
+    with tarfile.open(fileobj=io.BytesIO(result.stdout), mode="r:") as archive:
+        for repo_path in repo_paths:
+            try:
+                member = archive.getmember(repo_path)
+            except KeyError as error:
+                raise AssertionError(f"git archive HEAD did not include {repo_path}") from error
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                raise AssertionError(f"git archive HEAD member {repo_path} is not a file")
+            blobs[repo_path] = extracted.read()
+    return blobs
 
 
 def run_frontend_transport_probe(probe_script):
@@ -254,12 +281,61 @@ class FrontendBuildContractTests(unittest.TestCase):
             } | {
                 f"desktop/ui/{name}": (desktop_out / name).read_bytes() for name in ASSETS
             }
+            archive_blobs = git_archive_blob_bytes(list(generated))
             for repo_path, generated_bytes in generated.items():
+                committed_bytes = git_blob_bytes(repo_path)
                 self.assertEqual(
-                    git_blob_bytes(repo_path),
-                    generated_bytes,
-                    f"staged Git blob for {repo_path} differs from frontend/build.mjs output",
+                    archive_blobs[repo_path],
+                    committed_bytes,
+                    f"git archive HEAD bytes for {repo_path} differ from committed HEAD blob",
                 )
+                self.assertEqual(
+                    committed_bytes,
+                    generated_bytes,
+                    f"committed HEAD blob for {repo_path} differs from frontend/build.mjs output",
+                )
+
+    def test_git_blob_bytes_reads_committed_head_not_staged_index(self):
+        committed_bytes = b"committed asset bytes\n"
+        staged_bytes = b"staged-only asset bytes\n"
+        repo_path = "app/static/app.js"
+        old_root = ROOT
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            asset = repo / repo_path
+            asset.parent.mkdir(parents=True)
+            asset.write_bytes(committed_bytes)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "core.autocrlf", "false"], cwd=repo, check=True)
+            subprocess.run(["git", "add", repo_path], cwd=repo, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Frontend Contract Test",
+                    "-c",
+                    "user.email=frontend-contract@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "seed asset",
+                ],
+                cwd=repo,
+                check=True,
+            )
+            asset.write_bytes(staged_bytes)
+            subprocess.run(["git", "add", repo_path], cwd=repo, check=True)
+            try:
+                globals()["ROOT"] = repo
+                blob = git_blob_bytes(repo_path)
+                archive_blob = git_archive_blob_bytes([repo_path])[repo_path]
+            finally:
+                globals()["ROOT"] = old_root
+
+        self.assertEqual(blob, committed_bytes)
+        self.assertEqual(archive_blob, committed_bytes)
+        self.assertNotEqual(blob, staged_bytes)
+        self.assertNotEqual(archive_blob, staged_bytes)
 
     def test_build_is_deterministic_across_clean_output_directories(self):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
