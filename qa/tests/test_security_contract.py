@@ -4,13 +4,16 @@ import asyncio
 import importlib
 import json
 import os
+import re
 import sys
 import unittest
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Iterable
 from unittest.mock import patch
 
 
+ROOT = Path(__file__).resolve().parents[2]
 SENTINEL_TOKEN = "sentinel-launch-token-DO-NOT-LEAK"
 BOUND_PORT = 7100
 
@@ -88,6 +91,10 @@ def request(method: str, path: str, headers: dict[str, str] | None = None):
     default_headers = {"host": f"127.0.0.1:{BOUND_PORT}"}
     default_headers.update(headers or {})
     return asyncio.run(asgi_request(fresh_app(), method, path, default_headers))
+
+
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
 
 
 class SecurityContractTests(unittest.TestCase):
@@ -233,6 +240,34 @@ class SecurityContractTests(unittest.TestCase):
         self.assertEqual("no-referrer", headers.get("referrer-policy"))
         self.assertEqual("DENY", headers.get("x-frame-options"))
         self.assertNotIn("content-security-policy", headers)
+
+    def test_deezer_login_contract_exposes_only_arl_and_no_password_auth_surface(self) -> None:
+        sources = {
+            "app/deezer_client.py": read_text(ROOT / "app" / "deezer_client.py"),
+            "app/main.py": read_text(ROOT / "app" / "main.py"),
+            "frontend/app.js": read_text(ROOT / "frontend" / "app.js"),
+            "frontend/index.html": read_text(ROOT / "frontend" / "index.html"),
+            "app/static/app.js": read_text(ROOT / "app" / "static" / "app.js"),
+            "app/static/index.html": read_text(ROOT / "app" / "static" / "index.html"),
+            "desktop/ui/app.js": read_text(ROOT / "desktop" / "ui" / "app.js"),
+            "desktop/ui/index.html": read_text(ROOT / "desktop" / "ui" / "index.html"),
+        }
+        combined = "\n".join(sources.values())
+
+        for forbidden in [
+            "DZ_CLIENT_SECRET",
+            "DZ_CLIENT_ID",
+            "login_with_password",
+            "/api/login/deezer/password",
+            "user_auth.php",
+            "loginPassword",
+            "loginEmail",
+            "loginPasswordBlock",
+        ]:
+            self.assertNotIn(forbidden, combined)
+        self.assertNotRegex(combined, r"type=[\"']password[\"']")
+        self.assertNotRegex(sources["app/deezer_client.py"], r"client[_-]?secret\s*=", re.IGNORECASE)
+        self.assertIn("/api/login/deezer", combined)
 
 
 if __name__ == "__main__":

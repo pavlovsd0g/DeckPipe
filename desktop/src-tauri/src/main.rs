@@ -16,6 +16,7 @@ use tauri_plugin_shell::ShellExt;
 use tokio::time::timeout;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const LOGIN_CANCELLED: &str = "DECKPIPE_LOGIN_CANCELLED";
 const CHILD_ENV_ALLOWLIST: &[&str] = &[
     "APPDATA",
     "LOCALAPPDATA",
@@ -80,7 +81,7 @@ async fn service_login(app: tauri::AppHandle, service: String) -> Result<String,
 
     for _ in 0..300 {
         match app.get_webview_window(&label) {
-            None => return Err("login window closed".into()),
+            None => return Err(LOGIN_CANCELLED.into()),
             Some(w) => {
                 if let Ok(cookies) = w.cookies() {
                     if let Some(c) = cookies

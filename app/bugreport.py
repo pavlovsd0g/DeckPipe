@@ -4,7 +4,7 @@ import platform
 
 import requests
 
-from .deezer_client import load_config
+from .deezer_client import get_telegram_bot_token, load_config
 
 APP_VERSION = "0.6.0"
 APP_BUILD_ID = "0.6.0+20260827.050713.6456dba254a6"
@@ -14,9 +14,9 @@ def send_report(text: str, context: dict | None = None) -> dict:
     """Отправляет репорт в TG. Возвращает {"ok": bool, "error": str}."""
     cfg = load_config()
     tg = cfg.get("telegram", {})
-    token, chat_id = tg.get("bot_token"), tg.get("chat_id")
+    token, chat_id = get_telegram_bot_token(), tg.get("chat_id")
     if not token or not chat_id:
-        return {"ok": False, "error": "Telegram не настроен (нет bot_token/chat_id)"}
+        return {"ok": False, "error": "Telegram is not configured"}
 
     lines = [
         f"DeckPipe bug report v{APP_VERSION} ({APP_BUILD_ID})",
@@ -39,6 +39,6 @@ def send_report(text: str, context: dict | None = None) -> dict:
             timeout=20)
         if r.ok and r.json().get("ok"):
             return {"ok": True}
-        return {"ok": False, "error": f"TG API: {r.text[:200]}"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": "Telegram delivery failed"}
+    except Exception:
+        return {"ok": False, "error": "Telegram delivery failed"}

@@ -18,6 +18,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[2]
 TASK_MODULES = (
     "app.main",
+    "app.bugreport",
     "app.soundcloud",
     "app.deezer_client",
     "app.secure_store",
@@ -32,6 +33,7 @@ def generated_values() -> dict[str, str]:
     return {
         "deezer": f"generated-dz-{uuid.uuid4().hex}",
         "soundcloud": f"generated-sc-{uuid.uuid4().hex}",
+        "telegram": f"{uuid.uuid4().int % 900000000 + 100000000}:{uuid.uuid4().hex}",
     }
 
 
@@ -212,6 +214,25 @@ class SecureStoreTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         deezer_client.save_config({field: values["deezer"], "music_root": "X:\\DeckPipeTest"})
 
+                config_path = Path(tmp) / "config.local.json"
+                config_path.write_text(
+                    json.dumps(
+                        {
+                            "telegram": {
+                                "bot_token": values["telegram"],
+                                "chat_id": "generated-chat",
+                                "enabled": True,
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                loaded = deezer_client.load_config()
+                self.assertEqual({"chat_id": "generated-chat", "enabled": True}, loaded["telegram"])
+                self.assertNotIn(values["telegram"], json.dumps(loaded))
+                with self.assertRaises(ValueError):
+                    deezer_client.save_config({"telegram": {"bot_token": values["telegram"], "chat_id": "generated-chat"}})
+
     def test_data_dir_override_is_source_test_only_and_import_is_not_mutating(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -276,6 +297,11 @@ class SecureStoreTests(unittest.TestCase):
                 legacy = {
                     "arl": values["deezer"],
                     "sc_oauth": values["soundcloud"],
+                    "telegram": {
+                        "bot_token": values["telegram"],
+                        "chat_id": "generated-chat",
+                        "enabled": True,
+                    },
                     "sc_username": "generated-user",
                     "music_root": "X:\\DeckPipeTest",
                     "numbering": True,
@@ -321,21 +347,27 @@ class SecureStoreTests(unittest.TestCase):
                                 )
 
                 result = secure_store.migrate_legacy_config(config_path=config_path, store_path=store_path)
-                self.assertEqual(("arl", "sc_oauth"), result.migrated_fields)
+                self.assertEqual(("arl", "sc_oauth", "telegram_bot_token"), result.migrated_fields)
                 self.assertFalse(any(value in repr(result) for value in values.values()))
 
                 migrated = json.loads(read_text(config_path))
                 self.assertEqual(
-                    {"sc_username": "generated-user", "music_root": "X:\\DeckPipeTest", "numbering": True},
+                    {
+                        "telegram": {"chat_id": "generated-chat", "enabled": True},
+                        "sc_username": "generated-user",
+                        "music_root": "X:\\DeckPipeTest",
+                        "numbering": True,
+                    },
                     migrated,
                 )
                 store = secure_store.SecureCredentialStore(store_path)
                 self.assertTrue(store.get_deezer_arl() == values["deezer"])
                 self.assertTrue(store.get_soundcloud_oauth() == values["soundcloud"])
+                self.assertTrue(store.get_telegram_bot_token() == values["telegram"])
 
                 second = secure_store.migrate_legacy_config(config_path=config_path, store_path=store_path)
                 self.assertEqual((), second.migrated_fields)
-                self.assertEqual(("arl", "sc_oauth"), second.already_present_fields)
+                self.assertEqual(("arl", "sc_oauth", "telegram_bot_token"), second.already_present_fields)
 
     def test_startup_lifespan_runs_migration_only_inside_injected_data_dir(self) -> None:
         values = generated_values()
@@ -344,7 +376,14 @@ class SecureStoreTests(unittest.TestCase):
             with isolated_app_modules(data_dir):
                 config_path = data_dir / "config.local.json"
                 config_path.write_text(
-                    json.dumps({"arl": values["deezer"], "sc_oauth": values["soundcloud"], "theme": "dark"}),
+                    json.dumps(
+                        {
+                            "arl": values["deezer"],
+                            "sc_oauth": values["soundcloud"],
+                            "telegram": {"bot_token": values["telegram"], "chat_id": "generated-chat"},
+                            "theme": "dark",
+                        }
+                    ),
                     encoding="utf-8",
                 )
                 main = importlib.import_module("app.main")
@@ -356,11 +395,12 @@ class SecureStoreTests(unittest.TestCase):
 
                 asyncio.run(enter_lifespan())
 
-                self.assertEqual({"theme": "dark"}, json.loads(read_text(config_path)))
+                self.assertEqual({"telegram": {"chat_id": "generated-chat"}, "theme": "dark"}, json.loads(read_text(config_path)))
                 secure_store = importlib.import_module("app.secure_store")
                 store = secure_store.SecureCredentialStore(data_dir / "secrets.dpapi")
                 self.assertTrue(store.get_deezer_arl() == values["deezer"])
                 self.assertTrue(store.get_soundcloud_oauth() == values["soundcloud"])
+                self.assertTrue(store.get_telegram_bot_token() == values["telegram"])
 
     def test_consumers_use_explicit_secret_accessors_and_no_browser_bridge_route(self) -> None:
         sources = {
@@ -374,6 +414,8 @@ class SecureStoreTests(unittest.TestCase):
         self.assertNotIn('load_config().get("sc_oauth")', combined)
         self.assertNotIn('cfg["arl"]', combined)
         self.assertNotIn('cfg["sc_oauth"]', combined)
+        self.assertNotIn('tg.get("bot_token")', read_text(ROOT / "app" / "bugreport.py"))
+        self.assertIn("get_telegram_bot_token(", read_text(ROOT / "app" / "bugreport.py"))
         self.assertNotIn("LoginFromBrowserIn", sources["app/main.py"])
         self.assertNotIn('/api/login/from-browser', sources["app/main.py"])
         self.assertIn("set_deezer_arl(", sources["app/main.py"])
@@ -475,6 +517,38 @@ class SecureStoreTests(unittest.TestCase):
                 with self.assertRaises(secure_store.SecureStoreError) as unprotect_capture:
                     secure_store.SecureCredentialStore(store_path, dpapi=failing).get_deezer_arl()
                 self.assertFalse(any(value in formatted_exception(unprotect_capture.exception) for value in values.values()))
+
+    def test_bugreport_uses_secure_telegram_token_and_never_returns_remote_leaks(self) -> None:
+        values = generated_values()
+
+        class HostileResponse:
+            ok = False
+            text = "remote body leaked " + values["telegram"]
+
+            def json(self):
+                return {"ok": False, "description": "remote json leaked " + values["telegram"]}
+
+        def hostile_post(url, **_kwargs):
+            raise RuntimeError("request exception leaked " + url + " " + values["telegram"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with isolated_app_modules(Path(tmp)):
+                bugreport = importlib.import_module("app.bugreport")
+                cfg = {"telegram": {"chat_id": "generated-chat"}, "wav_mode": "source"}
+                with patch.object(bugreport, "load_config", return_value=cfg):
+                    with patch.object(bugreport, "get_telegram_bot_token", return_value=values["telegram"], create=True):
+                        with patch.object(bugreport.requests, "post", return_value=HostileResponse()):
+                            failed_response = bugreport.send_report("synthetic report")
+                        with patch.object(bugreport.requests, "post", side_effect=hostile_post):
+                            failed_exception = bugreport.send_report("synthetic report")
+
+                combined = json.dumps([failed_response, failed_exception], ensure_ascii=False)
+                self.assertEqual(False, failed_response["ok"])
+                self.assertEqual(False, failed_exception["ok"])
+                self.assertNotIn(values["telegram"], combined)
+                self.assertNotIn("remote body", combined)
+                self.assertNotIn("request exception", combined)
+                self.assertNotIn("api.telegram.org", combined)
 
 
 if __name__ == "__main__":

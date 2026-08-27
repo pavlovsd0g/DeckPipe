@@ -149,6 +149,14 @@ class DesktopContractTests(unittest.TestCase):
         self.assertIn("tauri_plugin_single_instance::init", rust)
         self.assertNotRegex(rust, r"println!\([^)]*token|eprintln!\([^)]*token", "token must not be logged")
 
+    def test_login_window_cancel_uses_stable_sentinel_not_localized_error_text(self) -> None:
+        rust = read_text(TAURI / "src" / "main.rs")
+
+        self.assertIn("LOGIN_CANCELLED", rust)
+        self.assertIn("DECKPIPE_LOGIN_CANCELLED", rust)
+        self.assertNotIn("login window closed", rust)
+        self.assertRegex(rust, r"None\s*=>\s*return\s+Err\(LOGIN_CANCELLED\.into\(\)\)")
+
     def test_backend_uses_single_prebound_listener_and_same_socket_for_uvicorn(self) -> None:
         run_backend = importlib.import_module("run_backend")
         listener = run_backend.create_bound_listener("127.0.0.1", 0)

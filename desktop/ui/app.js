@@ -92,6 +92,7 @@ var searchSel = {};
 var searchExpanded = {};
 var $ = (s) => document.querySelector(s);
 var RB_APPLY_CONFIRMATION_TOKEN = "APPLY_REKORDBOX_CHANGES";
+var LOGIN_CANCELLED = "DECKPIPE_LOGIN_CANCELLED";
 var FORMAT_CLASS_BY_VALUE = Object.freeze({
   aac: "fmt-aac",
   aiff: "fmt-aiff",
@@ -187,6 +188,9 @@ function describeError(error, fallbackKind = "generic") {
   const label = ERROR_KIND_LABELS[kind] || ERROR_KIND_LABELS.generic;
   const message = error && error.message ? error.message : String(error || "неизвестная ошибка");
   return `${label}: ${message}`;
+}
+function isLoginCancelled(error) {
+  return String(error && error.message ? error.message : error) === LOGIN_CANCELLED;
 }
 function showStatus(message) {
   const region = $("#statusRegion");
@@ -366,11 +370,14 @@ async function openLogin(service) {
   const steps = [];
   if (service === "deezer") {
     $("#loginTitle").textContent = "Вход в Deezer";
-    steps.push(create("strong", { text: "Просто email и пароль" }), text(" — как в Saturn:"));
-    setHidden($("#loginPasswordBlock"), false);
-    $("#loginToken").placeholder = "…или вставьте ARL cookie вручную сюда";
+    steps.push(
+      create("strong", { text: "Вручную:" }),
+      text(" F12 → Application → Cookies → "),
+      create("strong", { text: "arl" }),
+      text(" на deezer.com → вставить ниже")
+    );
+    $("#loginToken").placeholder = "arl cookie";
   } else {
-    setHidden($("#loginPasswordBlock"), true);
     $("#loginTitle").textContent = "Вход в SoundCloud";
     steps.push(
       create("strong", { text: "Вручную:" }),
@@ -399,22 +406,16 @@ async function tauriLogin(service) {
     if (service === "sc") switchTab("sc");
     else await loadPlaylists();
   } catch (error) {
-    if (!String(error).includes("закрыто")) showError(error, "security");
+    if (!isLoginCancelled(error)) showError(error, "security");
   }
 }
 async function doLogin() {
   const token = $("#loginToken").value.trim();
-  const email = $("#loginEmail").value.trim();
-  const password = $("#loginPassword").value;
   let url, body;
   if (loginService === "deezer") {
-    if (email && password) {
-      url = "/api/login/deezer/password";
-      body = { email, password };
-    } else if (token) {
-      url = "/api/login/deezer";
-      body = { arl: token };
-    } else return;
+    if (!token) return;
+    url = "/api/login/deezer";
+    body = { arl: token };
   } else {
     if (!token) return;
     url = "/api/login/soundcloud";

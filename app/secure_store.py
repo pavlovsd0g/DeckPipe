@@ -20,10 +20,12 @@ STORE_FILE_PURPOSE = "deckpipe.secure-store.dpapi.current-user.v1"
 STORE_PAYLOAD_PURPOSE = "deckpipe.credentials.v1"
 DEEZER_ARL_RECORD = "deezer_arl"
 SOUNDCLOUD_OAUTH_RECORD = "soundcloud_oauth"
-LEGACY_SECRET_FIELDS = ("arl", "sc_oauth")
+TELEGRAM_BOT_TOKEN_RECORD = "telegram_bot_token"
+LEGACY_SECRET_FIELDS = ("arl", "sc_oauth", "telegram_bot_token")
 _FIELD_TO_RECORD = {
     "arl": DEEZER_ARL_RECORD,
     "sc_oauth": SOUNDCLOUD_OAUTH_RECORD,
+    "telegram_bot_token": TELEGRAM_BOT_TOKEN_RECORD,
 }
 _ALLOWED_RECORDS = frozenset(_FIELD_TO_RECORD.values())
 _WRITE_LOCK = threading.RLock()
@@ -306,6 +308,12 @@ class SecureCredentialStore:
     def get_soundcloud_oauth(self) -> str | None:
         return self.get_secret("sc_oauth")
 
+    def set_telegram_bot_token(self, value: str) -> None:
+        self.set_secret("telegram_bot_token", value)
+
+    def get_telegram_bot_token(self) -> str | None:
+        return self.get_secret("telegram_bot_token")
+
 
 SecureStore = SecureCredentialStore
 
@@ -333,6 +341,37 @@ def _default_readback_validator(store: SecureCredentialStore, records: dict[str,
             raise SecureStoreError("secure migration readback failed")
 
 
+def _legacy_secret_records(config: dict) -> dict[str, str]:
+    records: dict[str, str] = {}
+    for field in ("arl", "sc_oauth"):
+        value = config.get(field)
+        if isinstance(value, str) and value:
+            records[field] = value
+    telegram = config.get("telegram")
+    if isinstance(telegram, dict):
+        value = telegram.get("bot_token")
+        if isinstance(value, str) and value:
+            records["telegram_bot_token"] = value
+    return records
+
+
+def _sanitize_legacy_config(config: dict, records: dict[str, str]) -> dict:
+    sanitized = dict(config)
+    for field in ("arl", "sc_oauth"):
+        if field in records:
+            sanitized.pop(field, None)
+    if "telegram_bot_token" in records:
+        telegram = sanitized.get("telegram")
+        if isinstance(telegram, dict):
+            telegram = dict(telegram)
+            telegram.pop("bot_token", None)
+            if telegram:
+                sanitized["telegram"] = telegram
+            else:
+                sanitized.pop("telegram", None)
+    return sanitized
+
+
 def migrate_legacy_config(
     *,
     config_path: Path,
@@ -347,11 +386,7 @@ def migrate_legacy_config(
     if not isinstance(config, dict):
         raise SecureStoreError("legacy preference file is unsupported")
 
-    records: dict[str, str] = {}
-    for field in LEGACY_SECRET_FIELDS:
-        value = config.get(field)
-        if isinstance(value, str) and value:
-            records[field] = value
+    records = _legacy_secret_records(config)
 
     store = SecureCredentialStore(store_path, dpapi=dpapi, replace=replace)
     try:
@@ -368,9 +403,7 @@ def migrate_legacy_config(
     except Exception:
         raise SecureStoreError("secure migration failed") from None
 
-    sanitized = dict(config)
-    for field in records:
-        sanitized.pop(field, None)
+    sanitized = _sanitize_legacy_config(config, records)
     try:
         _atomic_write_json(config_path, sanitized, replace)
     except Exception:

@@ -581,7 +581,6 @@ console.log(JSON.stringify({
         for route in [
             "/api/config",
             "/api/login/deezer",
-            "/api/login/deezer/password",
             "/api/login/soundcloud",
             "/api/sc/account",
             "/api/sc/account/import",
@@ -603,6 +602,10 @@ console.log(JSON.stringify({
             "/api/jobs",
         ]:
             self.assertIn(route, combined)
+        self.assertNotIn("/api/login/deezer/password", combined)
+        self.assertNotIn("loginPassword", combined)
+        self.assertNotIn("loginEmail", combined)
+        self.assertNotRegex(combined, r"type=[\"']password[\"']")
 
     def test_node_syntax_checks_source_and_generated_scripts(self):
         for script in [

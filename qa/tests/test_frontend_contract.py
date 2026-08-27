@@ -41,7 +41,7 @@ def run_frontend_app_probe(probe_script):
     source = read_text(FRONTEND / "app.js")
     source = re.sub(
         r"import\s+\{\s*invoke\s*\}\s+from\s+['\"]@tauri-apps/api/core['\"]\s*;",
-        "const invoke = async name => { globalThis.__invokeCalls.push(name); return globalThis.__invokeResult; };",
+        "const invoke = async (...args) => { if (globalThis.__invokeImpl) return globalThis.__invokeImpl(...args); globalThis.__invokeCalls.push(args[0]); return globalThis.__invokeResult; };",
         source,
         count=1,
     )
@@ -227,6 +227,39 @@ class FrontendInteractionContractTests(unittest.TestCase):
         self.assertRegex(js, r"function\s+describeError", "errors must be normalized before display")
         self.assertRegex(js, r"function\s+showError", "errors must flow into an accessible alert region")
         self.assertNotRegex(js, r"\balert\s*\(", "errors/results must not rely on inaccessible alert dialogs")
+
+    def test_tauri_login_cancel_is_suppressed_but_other_login_errors_surface(self):
+        result = run_frontend_app_probe(
+            r"""
+globalThis.fetch = async () => {
+  throw new Error('login cancel test must not call backend after invoke failure');
+};
+const outcomes = [];
+for (const [name, rejection] of [
+  ['cancel', 'DECKPIPE_LOGIN_CANCELLED'],
+  ['other', 'login window unavailable'],
+]) {
+  elements.get('#errorRegion').textContent = '';
+  elements.get('#errorRegion').classList.add('hidden');
+  elements.get('#statusRegion').textContent = '';
+  globalThis.__invokeImpl = async () => { throw rejection; };
+  await tauriLogin('deezer');
+  outcomes.push({
+    name,
+    error: elements.get('#errorRegion').textContent,
+    hidden: elements.get('#errorRegion').classList.contains('hidden'),
+    status: elements.get('#statusRegion').textContent,
+  });
+}
+console.log(JSON.stringify(outcomes));
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        outcomes = __import__("json").loads(result.stdout)
+        self.assertEqual({"name": "cancel", "error": "", "hidden": True, "status": ""}, outcomes[0])
+        self.assertEqual("other", outcomes[1]["name"])
+        self.assertFalse(outcomes[1]["hidden"])
+        self.assertIn("login window unavailable", outcomes[1]["error"])
 
     def test_minimum_size_and_reduced_motion_contracts_are_encoded(self):
         html = read_text(FRONTEND / "index.html")
