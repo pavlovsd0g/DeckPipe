@@ -48,11 +48,12 @@ function Get-SpdxId {
 function Assert-NoForbiddenPath {
     param([string]$RelativePath)
     $normalized = ($RelativePath -replace '\\', '/')
+    if ($normalized -match '^[A-Za-z]:|^/|//|:|(^|/)\.\.(/|$)') { throw "path traversal, ADS, or escape in SBOM input: $RelativePath" }
+    if (($normalized -split '/').Count -ne 1) { throw "nested SBOM input is not allowed: $RelativePath" }
     if ($normalized -match '(^|/)(config\.local\.json|cookies?\.txt|master\.db)$') { throw "forbidden SBOM input: $RelativePath" }
     if ($normalized -match '(?i)(credential|secret|token|cookie|profile|appdata|localappdata|rekordbox|master\.db|\.sqlite|\.db$|\.media$)') {
         throw "forbidden SBOM input: $RelativePath"
     }
-    if ($normalized -match '^[A-Za-z]:|^/|(^|/)\.\.(/|$)') { throw "path traversal in SBOM input: $RelativePath" }
     return $normalized
 }
 
@@ -68,12 +69,19 @@ $relationships = @([ordered]@{
 })
 $seenPaths = @{}
 $seenIds = @{}
-$allFiles = @(Get-ChildItem -LiteralPath $inputPath -Recurse -Force -File |
+foreach ($entry in @(Get-ChildItem -LiteralPath $inputPath -Force)) {
+    if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "reparse point is not allowed in SBOM input: $($entry.Name)" }
+    if ($entry.PSIsContainer) { throw "nested SBOM input is not allowed: $($entry.Name)" }
+}
+$allFiles = @(Get-ChildItem -LiteralPath $inputPath -Force -File |
     Where-Object { $_.FullName -ne $outputFullPath -and $_.Name -ne 'SHA256SUMS.txt' } |
-    Sort-Object FullName)
+    Sort-Object Name)
 foreach ($file in $allFiles) {
     $relative = $file.FullName.Substring($inputPath.Length).TrimStart('\') -replace '\\', '/'
     $relative = Assert-NoForbiddenPath $relative
+    if ($relative -ne 'release-evidence.json' -and [IO.Path]::GetExtension($relative).ToLowerInvariant() -notin @('.exe', '.msi')) {
+        throw "unexpected SBOM input outside release allowlist: $relative"
+    }
     $pathKey = $relative.ToLowerInvariant()
     if ($seenPaths.ContainsKey($pathKey)) { throw "duplicate or case-confusable SBOM path: $relative" }
     $seenPaths[$pathKey] = $true

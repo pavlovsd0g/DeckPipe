@@ -5,6 +5,8 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+$script:MetadataFiles = @('release-evidence.json', 'sbom.spdx.json', 'SHA256SUMS.txt')
+
 function New-Result {
     param([string]$Status, [string]$Message)
     [pscustomobject]@{
@@ -33,13 +35,14 @@ function Get-ReleaseRelativePath {
     param([string]$RelativePath)
     if (-not $RelativePath) { throw 'empty release path' }
     $path = ($RelativePath -replace '\\', '/')
-    if ($path -match '^[A-Za-z]:|^/|//') { throw "path traversal or escape in release path: $RelativePath" }
+    if ($path -match '^[A-Za-z]:|^/|//|:') { throw "path traversal, ADS, or escape in release path: $RelativePath" }
     $parts = @($path -split '/' | Where-Object { $_ -ne '' })
     if ($parts.Count -eq 0) { throw 'empty release path' }
     foreach ($part in $parts) {
         if ($part -eq '.' -or $part -eq '..') { throw "path traversal or escape in release path: $RelativePath" }
     }
-    return ($parts -join '/')
+    if ($parts.Count -ne 1) { throw "nested release paths are not allowed: $RelativePath" }
+    return $parts[0]
 }
 
 function Assert-NoForbiddenPath {
@@ -52,15 +55,70 @@ function Assert-NoForbiddenPath {
     return $normalized
 }
 
-function Get-ActualReleaseFiles {
+function Get-ArtifactType {
+    param([string]$RelativePath)
+    $extension = [IO.Path]::GetExtension($RelativePath).ToLowerInvariant()
+    if ($extension -eq '.exe') { return 'exe' }
+    if ($extension -eq '.msi') { return 'msi' }
+    throw "unexpected artifact extension: $RelativePath"
+}
+
+function Test-IsArtifactPath {
+    param([string]$RelativePath)
+    $extension = [IO.Path]::GetExtension($RelativePath).ToLowerInvariant()
+    return ($extension -eq '.exe' -or $extension -eq '.msi')
+}
+
+function Assert-CanonicalArtifactName {
+    param(
+        [string]$RelativePath,
+        $Evidence
+    )
+    $shortRevision = ([string]$Evidence.source_revision).Substring(0, 7)
+    $prefix = 'DeckPipe-' + [regex]::Escape([string]$Evidence.build_id) + '-' + [regex]::Escape($shortRevision)
+    $pattern = '^' + $prefix + '-x64(\.exe|-setup\.exe|\.msi)$'
+    if ($RelativePath -notmatch $pattern) {
+        throw "ambiguous executable artifact or non-canonical artifact name for evidence version/build/source: $RelativePath"
+    }
+}
+
+function Assert-ClosedTopLevelStaging {
+    param([string]$StagePath)
+    $stageItem = Get-Item -LiteralPath $StagePath -Force
+    if (($stageItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'staging directory reparse point is not allowed' }
+    if (-not $stageItem.PSIsContainer) { throw 'staging path must be a directory' }
+
+    $seen = @{}
+    $files = @()
+    foreach ($entry in @(Get-ChildItem -LiteralPath $StagePath -Force | Sort-Object Name)) {
+        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "staging reparse point is not allowed: $($entry.Name)" }
+        if ($entry.PSIsContainer) { throw "staging subdirectories are not allowed: $($entry.Name)" }
+        $relative = Assert-NoForbiddenPath $entry.Name
+        $key = $relative.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { throw "duplicate or case-confusable staged path: $relative" }
+        $seen[$key] = $true
+
+        $metadataMatch = @($script:MetadataFiles | Where-Object { $_ -ieq $relative })
+        if ($metadataMatch.Count -gt 0 -and $metadataMatch[0] -cne $relative) {
+            throw "case-confusable release metadata path: $relative"
+        }
+        if ($metadataMatch.Count -eq 0 -and -not (Test-IsArtifactPath $relative)) {
+            throw "extra staged file outside release allowlist: $relative"
+        }
+        $files += [pscustomobject]@{ RelativePath = $relative; FullName = $entry.FullName; Sha256 = Get-Sha256 $entry.FullName }
+    }
+    foreach ($required in $script:MetadataFiles) {
+        if (-not $seen.ContainsKey($required.ToLowerInvariant())) { throw "required release file is missing: $required" }
+    }
+    return $files
+}
+
+function Get-TopLevelStageFileRecords {
     param([string]$StagePath)
     $files = @()
-    foreach ($file in @(Get-ChildItem -LiteralPath $StagePath -Recurse -Force -File | Sort-Object FullName)) {
-        $relative = $file.FullName.Substring($StagePath.Length).TrimStart('\') -replace '\\', '/'
-        $relative = Assert-NoForbiddenPath $relative
-        if ($relative -ne 'SHA256SUMS.txt') {
-            $files += [pscustomobject]@{ RelativePath = $relative; FullName = $file.FullName; Sha256 = Get-Sha256 $file.FullName }
-        }
+    foreach ($file in @(Get-ChildItem -LiteralPath $StagePath -Force -File | Sort-Object Name)) {
+        $relative = Assert-NoForbiddenPath $file.Name
+        $files += [pscustomobject]@{ RelativePath = $relative; FullName = $file.FullName; Sha256 = Get-Sha256 $file.FullName }
     }
     return $files
 }
@@ -75,6 +133,7 @@ function Read-ManifestEntries {
         if (-not $line.Trim()) { continue }
         if ($line -notmatch '^([0-9a-f]{64})  (.+)$') { throw "invalid SHA-256 manifest line: $line" }
         $relative = Assert-NoForbiddenPath $Matches[2]
+        if ($relative -eq 'SHA256SUMS.txt') { throw 'SHA-256 manifest must not contain itself' }
         $key = $relative.ToLowerInvariant()
         if ($seen.ContainsKey($key)) { throw "duplicate or case-confusable manifest path: $relative" }
         $seen[$key] = $true
@@ -83,62 +142,144 @@ function Read-ManifestEntries {
     return $entries
 }
 
+function Assert-KeySetsEqual {
+    param(
+        [hashtable]$Expected,
+        [hashtable]$Actual,
+        [string]$Context
+    )
+    foreach ($key in @($Expected.Keys)) {
+        if (-not $Actual.ContainsKey($key)) { throw "$Context missing: $($Expected[$key])" }
+    }
+    foreach ($key in @($Actual.Keys)) {
+        if (-not $Expected.ContainsKey($key)) { throw "$Context extra: $($Actual[$key])" }
+    }
+}
+
+function ConvertTo-PathSet {
+    param($Items)
+    $set = @{}
+    foreach ($item in @($Items)) {
+        $relative = Assert-NoForbiddenPath $item.RelativePath
+        $set[$relative.ToLowerInvariant()] = $relative
+    }
+    return $set
+}
+
 function Assert-ManifestExact {
-    param([string]$StagePath)
+    param(
+        [string]$StagePath,
+        $ActualFiles = $null
+    )
     $entries = Read-ManifestEntries $StagePath
-    $actual = Get-ActualReleaseFiles $StagePath
+    $actualList = @(Get-TopLevelStageFileRecords $StagePath)
     $actualByPath = @{}
-    foreach ($file in $actual) {
-        $key = $file.RelativePath.ToLowerInvariant()
-        if ($actualByPath.ContainsKey($key)) { throw "duplicate or case-confusable staged path: $($file.RelativePath)" }
-        $actualByPath[$key] = $file
+    foreach ($file in @($actualList | Where-Object { $_.RelativePath -ne 'SHA256SUMS.txt' })) {
+        $actualByPath[$file.RelativePath.ToLowerInvariant()] = $file.RelativePath
     }
     $manifestByPath = @{}
-    foreach ($entry in $entries) { $manifestByPath[$entry.RelativePath.ToLowerInvariant()] = $entry }
+    foreach ($entry in $entries) { $manifestByPath[$entry.RelativePath.ToLowerInvariant()] = $entry.RelativePath }
+    Assert-KeySetsEqual -Expected $actualByPath -Actual $manifestByPath -Context 'manifest/staging inventory mismatch'
 
+    $actualHashByPath = @{}
+    foreach ($file in $actualList) { $actualHashByPath[$file.RelativePath.ToLowerInvariant()] = $file.Sha256 }
     foreach ($entry in $entries) {
-        $key = $entry.RelativePath.ToLowerInvariant()
-        if (-not $actualByPath.ContainsKey($key)) { throw "manifest target missing: $($entry.RelativePath)" }
-        if ($actualByPath[$key].Sha256 -ne $entry.Sha256) { throw "manifest hash mismatch: $($entry.RelativePath)" }
-    }
-    foreach ($file in $actual) {
-        if (-not $manifestByPath.ContainsKey($file.RelativePath.ToLowerInvariant())) {
-            throw "extra staged file not listed in manifest: $($file.RelativePath)"
+        if ($actualHashByPath[$entry.RelativePath.ToLowerInvariant()] -ne $entry.Sha256) {
+            throw "manifest hash mismatch: $($entry.RelativePath)"
         }
     }
     return $entries
 }
 
 function Read-ReleaseEvidence {
-    param([string]$StagePath, $ManifestEntries)
-    $evidencePath = Join-Path $StagePath 'release-evidence.json'
+    param(
+        $StagePath,
+        $ManifestEntries = $null
+    )
+    if ($null -eq $ManifestEntries) {
+        $ManifestEntries = $StagePath
+        $stagePathForEvidence = $script:CurrentStagePath
+    } else {
+        $stagePathForEvidence = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath([string]$StagePath)
+    }
+    if (-not $stagePathForEvidence) { throw 'release evidence stage path is missing' }
+    $evidencePath = Join-Path $stagePathForEvidence 'release-evidence.json'
     if (-not (Test-Path -LiteralPath $evidencePath)) { throw 'release evidence is missing' }
     $evidence = Get-Content -LiteralPath $evidencePath -Raw | ConvertFrom-Json
     foreach ($required in @('schema_version', 'product', 'version', 'build_id', 'source_revision', 'artifacts', 'signing', 'timestamp')) {
         if (-not ($evidence.PSObject.Properties.Name -contains $required)) { throw "malformed release evidence: missing $required" }
     }
+    foreach ($required in @('status', 'signed')) {
+        if (-not ($evidence.signing.PSObject.Properties.Name -contains $required)) { throw "malformed release evidence: signing missing $required" }
+    }
+    if (-not ($evidence.timestamp.PSObject.Properties.Name -contains 'status')) { throw 'malformed release evidence: timestamp missing status' }
     if ($evidence.product -ne 'DeckPipe' -or $evidence.version -ne '0.6.0') { throw 'malformed release evidence: product/version mismatch' }
     if ($evidence.build_id -notmatch '^0\.6\.0\+[0-9]{8}\.[0-9]{6}\.[0-9a-f]{7,40}$') { throw 'malformed release evidence: invalid build_id' }
     if ($evidence.source_revision -notmatch '^[0-9a-f]{40}$') { throw 'malformed release evidence: invalid source revision' }
 
+    $artifacts = @($evidence.artifacts)
+    $signed = @($evidence.signing.signed)
+    if ($artifacts.Count -eq 0) { throw 'release evidence artifacts must be nonempty' }
+    if ($signed.Count -eq 0) { throw 'release evidence signing.signed must be nonempty' }
+
     $manifestByPath = @{}
     foreach ($entry in $ManifestEntries) { $manifestByPath[$entry.RelativePath.ToLowerInvariant()] = $entry }
-    foreach ($artifact in @($evidence.artifacts)) {
+    $artifactByPath = @{}
+    foreach ($artifact in $artifacts) {
         foreach ($required in @('path', 'sha256', 'type')) {
             if (-not ($artifact.PSObject.Properties.Name -contains $required)) { throw "malformed release evidence: artifact missing $required" }
         }
         $relative = Assert-NoForbiddenPath $artifact.path
-        if ([IO.Path]::GetExtension($relative) -notin @('.exe', '.msi')) { throw "malformed release evidence: unexpected artifact extension $relative" }
-        if ($artifact.type -notin @('exe', 'msi', 'installer')) { throw "malformed release evidence: unexpected artifact type $($artifact.type)" }
+        Assert-CanonicalArtifactName -RelativePath $relative -Evidence $evidence
+        $expectedType = Get-ArtifactType $relative
+        if ([string]$artifact.type -ne $expectedType) { throw "malformed release evidence: artifact type/extension mismatch $relative" }
         $key = $relative.ToLowerInvariant()
+        if ($artifactByPath.ContainsKey($key)) { throw "duplicate or case-confusable evidence artifact path: $relative" }
+        $artifactByPath[$key] = $relative
         if (-not $manifestByPath.ContainsKey($key)) { throw "malformed release evidence: artifact missing from manifest $relative" }
         if ($manifestByPath[$key].Sha256 -ne $artifact.sha256) { throw "malformed release evidence: artifact hash mismatch $relative" }
     }
+
+    $signedByPath = @{}
+    foreach ($signedPath in $signed) {
+        $relative = Assert-NoForbiddenPath $signedPath
+        $key = $relative.ToLowerInvariant()
+        if ($signedByPath.ContainsKey($key)) { throw "duplicate or case-confusable signed artifact path: $relative" }
+        $signedByPath[$key] = $relative
+    }
+    Assert-KeySetsEqual -Expected $artifactByPath -Actual $signedByPath -Context 'signed/artifact evidence mismatch'
     return $evidence
 }
 
+function Assert-ArtifactInventoryExact {
+    param(
+        $ActualFiles,
+        $ManifestEntries,
+        $Evidence
+    )
+    $actualArtifacts = @($ActualFiles | Where-Object { Test-IsArtifactPath $_.RelativePath })
+    if ($actualArtifacts.Count -eq 0) { throw 'At least one signed executable or installer artifact is required' }
+    $actualByPath = ConvertTo-PathSet $actualArtifacts
+
+    $evidenceByPath = @{}
+    foreach ($artifact in @($Evidence.artifacts)) {
+        $relative = Assert-NoForbiddenPath $artifact.path
+        $evidenceByPath[$relative.ToLowerInvariant()] = $relative
+    }
+
+    $manifestArtifacts = @($ManifestEntries | Where-Object { Test-IsArtifactPath $_.RelativePath })
+    $manifestByPath = ConvertTo-PathSet $manifestArtifacts
+    Assert-KeySetsEqual -Expected $actualByPath -Actual $evidenceByPath -Context 'actual/evidence artifact mismatch'
+    Assert-KeySetsEqual -Expected $actualByPath -Actual $manifestByPath -Context 'actual/manifest artifact mismatch'
+}
+
 function Assert-SbomExact {
-    param([string]$StagePath, $ManifestEntries)
+    param(
+        [string]$StagePath,
+        $ManifestEntries,
+        $Evidence = $null
+    )
+    if ($null -eq $Evidence) { $Evidence = Read-ReleaseEvidence -StagePath $StagePath -ManifestEntries $ManifestEntries }
     $sbomPath = Join-Path $StagePath 'sbom.spdx.json'
     if (-not (Test-Path -LiteralPath $sbomPath)) { throw 'SPDX SBOM is missing' }
     $sbom = Get-Content -LiteralPath $sbomPath -Raw | ConvertFrom-Json
@@ -151,27 +292,41 @@ function Assert-SbomExact {
     foreach ($entry in $ManifestEntries) {
         if ($entry.RelativePath -ne 'sbom.spdx.json') { $expected[$entry.RelativePath.ToLowerInvariant()] = $entry }
     }
+    if (-not $expected.ContainsKey('release-evidence.json')) { throw 'SBOM expected set must include release evidence' }
+
+    $sbomByPath = @{}
+    $sbomArtifactByPath = @{}
     $fileIds = @{}
     foreach ($file in @($sbom.files)) {
         $relative = Assert-NoForbiddenPath $file.fileName
         $key = $relative.ToLowerInvariant()
         if ($fileIds.ContainsKey($file.SPDXID)) { throw "duplicate SPDXID: $($file.SPDXID)" }
+        if ($sbomByPath.ContainsKey($key)) { throw "duplicate or case-confusable SBOM file path: $relative" }
         $fileIds[$file.SPDXID] = $true
+        $sbomByPath[$key] = $relative
         if (-not $expected.ContainsKey($key)) { throw "SBOM contains unexpected file: $relative" }
-        $shaEntries = @($file.checksums | Where-Object { $_.algorithm -eq 'SHA256' } | Select-Object -First 1)
+        $shaEntries = @($file.checksums | Where-Object { $_.algorithm -eq 'SHA256' })
         if ($shaEntries.Count -ne 1 -or $shaEntries[0].checksumValue -ne $expected[$key].Sha256) { throw "SBOM checksum mismatch: $relative" }
         $contains = @($sbom.relationships | Where-Object { $_.spdxElementId -eq 'SPDXRef-Package-DeckPipe' -and $_.relationshipType -eq 'CONTAINS' -and $_.relatedSpdxElement -eq $file.SPDXID })
         if ($contains.Count -ne 1) { throw "SBOM missing Package CONTAINS File relationship: $relative" }
-        $expected.Remove($key)
+        if (Test-IsArtifactPath $relative) { $sbomArtifactByPath[$key] = $relative }
     }
-    if ($expected.Count -gt 0) { throw 'SBOM is missing manifest file entries' }
+
+    $expectedByPath = @{}
+    foreach ($key in @($expected.Keys)) { $expectedByPath[$key] = $expected[$key].RelativePath }
+    Assert-KeySetsEqual -Expected $expectedByPath -Actual $sbomByPath -Context 'SBOM/manifest file inventory mismatch'
+
+    $evidenceArtifactByPath = @{}
+    foreach ($artifact in @($Evidence.artifacts)) {
+        $relative = Assert-NoForbiddenPath $artifact.path
+        $evidenceArtifactByPath[$relative.ToLowerInvariant()] = $relative
+    }
+    Assert-KeySetsEqual -Expected $evidenceArtifactByPath -Actual $sbomArtifactByPath -Context 'SBOM/evidence artifact mismatch'
 }
 
 function Get-SignedReleaseArtifacts {
-    param([string]$StagePath)
-    return @(Get-ChildItem -LiteralPath $StagePath -Recurse -Force -File |
-        Where-Object { $_.Extension -in @('.exe', '.msi') } |
-        Sort-Object FullName)
+    param($ActualFiles)
+    return @($ActualFiles | Where-Object { Test-IsArtifactPath $_.RelativePath } | Sort-Object RelativePath)
 }
 
 function Invoke-ReleaseVerification {
@@ -190,22 +345,25 @@ function Invoke-ReleaseVerification {
     }
 
     try {
-        $manifestEntries = Assert-ManifestExact $stagePath
-        $evidence = Read-ReleaseEvidence $stagePath $manifestEntries
-        $artifacts = @(Get-SignedReleaseArtifacts $stagePath)
-        if ($artifacts.Count -eq 0) { return New-Result 'BLOCKED' 'At least one signed executable or installer artifact is required' }
+        $script:CurrentStagePath = $stagePath
+        $actualFiles = Assert-ClosedTopLevelStaging $stagePath
+        $manifestEntries = Assert-ManifestExact -StagePath $stagePath -ActualFiles $actualFiles
+        $evidence = Read-ReleaseEvidence $manifestEntries
+        Assert-ArtifactInventoryExact -ActualFiles $actualFiles -ManifestEntries $manifestEntries -Evidence $evidence
         if ($evidence.signing.status -ne 'PASS' -or $evidence.timestamp.status -ne 'PASS') {
             return New-Result 'BLOCKED' 'Release evidence does not contain PASS signing and timestamp status'
         }
-        foreach ($artifact in $artifacts) {
+        foreach ($artifact in @(Get-SignedReleaseArtifacts $actualFiles)) {
             $signature = & $SignatureProbe $artifact.FullName
-            if ($signature.Status -ne 'Valid') { return New-Result 'BLOCKED' "Authenticode signature is not valid for $($artifact.Name)" }
-            if ($null -eq $signature.TimeStamperCertificate) { return New-Result 'BLOCKED' "Authenticode timestamp is missing for $($artifact.Name)" }
+            if ($signature.Status -ne 'Valid') { return New-Result 'BLOCKED' "Authenticode signature is not valid for $($artifact.RelativePath)" }
+            if ($null -eq $signature.TimeStamperCertificate) { return New-Result 'BLOCKED' "Authenticode timestamp is missing for $($artifact.RelativePath)" }
         }
-        Assert-SbomExact $stagePath $manifestEntries
+        Assert-SbomExact -StagePath $stagePath -ManifestEntries $manifestEntries -Evidence $evidence
         return New-Result 'PASS' 'Release evidence, manifest, SBOM, Authenticode signatures, and timestamps are valid'
     } catch {
         return New-Result 'FAIL' $_.Exception.Message
+    } finally {
+        $script:CurrentStagePath = $null
     }
 }
 
@@ -213,5 +371,6 @@ if ($MyInvocation.InvocationName -ne '.') {
     $result = Invoke-ReleaseVerification -StagingDirectory $StagingDirectory
     $result | ConvertTo-Json -Depth 6
     if ($result.status -eq 'FAIL') { exit 1 }
+    if ($result.status -eq 'BLOCKED') { exit 2 }
     exit 0
 }
