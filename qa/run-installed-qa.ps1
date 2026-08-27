@@ -545,8 +545,8 @@ function Invoke-DeckPipeReleaseVerifierProcess {
     $stderr = [string]$stderrTask.Result
     $json = ConvertFrom-DeckPipeVerifierStdout -Stdout $stdout
     $exitCode = [int]$process.ExitCode
-    if ([string]$json.status -eq 'PASS' -and -not [string]::IsNullOrWhiteSpace($stderr)) {
-        throw "release verifier wrote stderr while returning PASS: $stderr"
+    if (-not [string]::IsNullOrWhiteSpace($stderr)) {
+        throw "release verifier wrote stderr while returning $($json.status): $stderr"
     }
     $expectedExit = @{ PASS = 0; FAIL = 1; BLOCKED = 2 }[[string]$json.status]
     if ($exitCode -ne $expectedExit) {
@@ -1433,6 +1433,18 @@ param([string]`$StagingDirectory)
 [Console]::Error.WriteLine('unexpected stderr')
 Write-Output '{"schema_version":1,"status":"PASS","message":"ok"}'
 exit 0
+"@
+        fail_stderr = @"
+param([string]`$StagingDirectory)
+[Console]::Error.WriteLine('unexpected stderr')
+Write-Output '{"schema_version":1,"status":"FAIL","message":"bad"}'
+exit 1
+"@
+        blocked_stderr = @"
+param([string]`$StagingDirectory)
+[Console]::Error.WriteLine('unexpected stderr')
+Write-Output '{"schema_version":1,"status":"BLOCKED","message":"blocked"}'
+exit 2
 "@
         pass_exit_1 = @"
 param([string]`$StagingDirectory)

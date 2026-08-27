@@ -12,7 +12,10 @@ ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "qa" / "run-installed-qa.ps1"
 POWERSHELL = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
 BUILD_ID = "0.6.0+20260827.050713.6456dba254a6"
-SOURCE_REVISION = "46ef5d8f1578412c500cc9da13472f9fb2412cab"
+SOURCE_REVISION = subprocess.check_output(
+    ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+    text=True,
+).strip()
 ARTIFACT_NAME = f"DeckPipe-{BUILD_ID}-{SOURCE_REVISION[:7]}-x64.exe"
 
 
@@ -113,7 +116,7 @@ class InstalledRunnerContractTests(unittest.TestCase):
         artifacts = [{"path": artifact_name, "type": "exe", "sha256": self.sha256(artifact)}]
         files = [artifact_name]
         if second_artifact_same_bytes:
-            second = stage / f"DeckPipe-{BUILD_ID}-{SOURCE_REVISION[:7]}-copy-x64.exe"
+            second = stage / f"DeckPipe-{BUILD_ID}-{SOURCE_REVISION[:7]}-x64-setup.exe"
             second.write_bytes(artifact_bytes)
             artifacts.append({"path": second.name, "type": "exe", "sha256": self.sha256(second)})
             files.append(second.name)
@@ -248,6 +251,7 @@ class InstalledRunnerContractTests(unittest.TestCase):
 
             self.assertNotEqual(0, result.returncode, result.stdout)
             self.assertIn("release verifier status", result.stdout)
+            self.assertNotIn("source_revision mismatch", result.stdout)
             self.assertNotIn("SELFTEST_LAUNCH", result.stdout)
             self.assertNotIn("launch_allowed", result.stdout)
 
@@ -279,6 +283,7 @@ function Get-AuthenticodeSignature {
             self.assertNotEqual(0, result.returncode, result.stdout)
             self.assertIn("release verifier status", result.stdout)
             self.assertRegex(result.stdout, r"Authenticode|Get-AuthenticodeSignature|signature")
+            self.assertNotIn("source_revision mismatch", result.stdout)
             self.assertNotIn("SELFTEST_LAUNCH", result.stdout)
             self.assertNotIn("launch_allowed", result.stdout)
 
@@ -313,6 +318,8 @@ function Get-AuthenticodeSignature {
                 "multiple": "REJECTED",
                 "noise": "REJECTED",
                 "pass_stderr": "REJECTED",
+                "fail_stderr": "REJECTED",
+                "blocked_stderr": "REJECTED",
                 "pass_exit_1": "REJECTED",
                 "fail_exit_0": "REJECTED",
                 "blocked_exit_0": "REJECTED",
