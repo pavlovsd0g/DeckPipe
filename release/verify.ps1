@@ -43,15 +43,117 @@ function Read-CanonicalVersion {
     return $version
 }
 
+function Assert-GitSourceRevision {
+    param([string]$Revision, [string]$Context)
+    $value = if ($null -eq $Revision) { '' } else { [string]$Revision }
+    $value = $value.Trim()
+    if ($value -notmatch '^[0-9a-f]{40}$') {
+        throw "source provenance BLOCKED: $Context did not contain a full lowercase revision"
+    }
+    return $value
+}
+
+function Resolve-GitMetadataPath {
+    param([string]$BasePath, [string]$GitPath)
+    if ([string]::IsNullOrWhiteSpace($GitPath)) { throw 'source provenance BLOCKED: git metadata path is empty' }
+    $candidate = [string]$GitPath
+    if (-not [IO.Path]::IsPathRooted($candidate)) {
+        $candidate = Join-Path $BasePath $candidate
+    }
+    return [IO.Path]::GetFullPath($candidate)
+}
+
+function Read-GitMetadataFirstLine {
+    param([string]$Path, [string]$Context)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "source provenance BLOCKED: $Context is missing"
+    }
+    $lines = @(Get-Content -LiteralPath $Path -TotalCount 1)
+    if ($lines.Count -eq 0 -or [string]::IsNullOrWhiteSpace([string]$lines[0])) {
+        throw "source provenance BLOCKED: $Context is empty"
+    }
+    return ([string]$lines[0]).Trim()
+}
+
+function Test-SafeGitRefName {
+    param([string]$RefName)
+    if ([string]::IsNullOrWhiteSpace($RefName)) { return $false }
+    if ([IO.Path]::IsPathRooted($RefName)) { return $false }
+    if ($RefName -match '^[A-Za-z]:|\\|:|(^|/)\.\.?(/|$)|//') { return $false }
+    return $true
+}
+
+function Get-GitPackedRefRevision {
+    param([string]$GitDirectory, [string]$RefName)
+    $packedRefsPath = Join-Path $GitDirectory 'packed-refs'
+    if (-not (Test-Path -LiteralPath $packedRefsPath -PathType Leaf)) { return '' }
+    foreach ($line in @(Get-Content -LiteralPath $packedRefsPath)) {
+        $trimmed = ([string]$line).Trim()
+        if (-not $trimmed -or $trimmed.StartsWith('#') -or $trimmed.StartsWith('^')) { continue }
+        if ($trimmed -match '^([0-9a-f]{40})\s+(.+)$' -and $Matches[2] -eq $RefName) {
+            return (Assert-GitSourceRevision -Revision $Matches[1] -Context "packed ref $RefName")
+        }
+    }
+    return ''
+}
+
+function Get-GitRefRevision {
+    param([string[]]$GitDirectories, [string]$RefName)
+    if (-not (Test-SafeGitRefName $RefName)) {
+        throw "source provenance BLOCKED: unsafe git ref name $RefName"
+    }
+    foreach ($gitDirectory in @($GitDirectories)) {
+        if ([string]::IsNullOrWhiteSpace($gitDirectory)) { continue }
+        $refPath = Join-Path $gitDirectory ($RefName -replace '/', '\')
+        if (Test-Path -LiteralPath $refPath -PathType Leaf) {
+            $revision = Read-GitMetadataFirstLine -Path $refPath -Context "git ref $RefName"
+            return (Assert-GitSourceRevision -Revision $revision -Context "git ref $RefName")
+        }
+    }
+    foreach ($gitDirectory in @($GitDirectories)) {
+        if ([string]::IsNullOrWhiteSpace($gitDirectory)) { continue }
+        $revision = Get-GitPackedRefRevision -GitDirectory $gitDirectory -RefName $RefName
+        if ($revision) { return $revision }
+    }
+    throw "source provenance BLOCKED: git ref $RefName is unavailable"
+}
+
 function Get-CurrentSourceRevision {
-    $revisionOutput = & git -C $script:RepoRoot rev-parse HEAD 2>$null
-    $revisionExitCode = $LASTEXITCODE
-    $revisionItems = @($revisionOutput | Select-Object -First 1)
-    $revision = if ($revisionItems.Count -gt 0) { $revisionItems[0] } else { '' }
-    if (-not $revision -or $revisionExitCode -ne 0) { throw 'source provenance BLOCKED: git rev-parse HEAD failed' }
-    $revision = [string]$revision
-    if ($revision -notmatch '^[0-9a-f]{40}$') { throw 'source provenance BLOCKED: git rev-parse HEAD did not return a full revision' }
-    return $revision
+    $repoRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($script:RepoRoot)
+    $dotGit = Join-Path $repoRoot '.git'
+    if (Test-Path -LiteralPath $dotGit -PathType Container) {
+        $gitDir = [IO.Path]::GetFullPath($dotGit)
+    } elseif (Test-Path -LiteralPath $dotGit -PathType Leaf) {
+        $gitFile = Read-GitMetadataFirstLine -Path $dotGit -Context '.git file'
+        if ($gitFile -notmatch '^gitdir:\s*(.+)$') {
+            throw 'source provenance BLOCKED: .git file does not point to gitdir'
+        }
+        $gitDir = Resolve-GitMetadataPath -BasePath $repoRoot -GitPath $Matches[1]
+    } else {
+        throw 'source provenance BLOCKED: .git metadata is missing'
+    }
+    if (-not (Test-Path -LiteralPath $gitDir -PathType Container)) {
+        throw 'source provenance BLOCKED: gitdir is unavailable'
+    }
+
+    $commonDir = $gitDir
+    $commonDirFile = Join-Path $gitDir 'commondir'
+    if (Test-Path -LiteralPath $commonDirFile -PathType Leaf) {
+        $commonDir = Resolve-GitMetadataPath -BasePath $gitDir -GitPath (Read-GitMetadataFirstLine -Path $commonDirFile -Context 'commondir')
+        if (-not (Test-Path -LiteralPath $commonDir -PathType Container)) {
+            throw 'source provenance BLOCKED: commondir is unavailable'
+        }
+    }
+
+    $head = Read-GitMetadataFirstLine -Path (Join-Path $gitDir 'HEAD') -Context 'HEAD'
+    if ($head -match '^[0-9a-f]{40}$') {
+        return (Assert-GitSourceRevision -Revision $head -Context 'HEAD')
+    }
+    if ($head -notmatch '^ref:\s*(.+)$') {
+        throw 'source provenance BLOCKED: HEAD is malformed'
+    }
+    $refName = [string]$Matches[1]
+    return (Get-GitRefRevision -GitDirectories @($gitDir, $commonDir) -RefName $refName)
 }
 
 function Get-ReleaseRelativePath {

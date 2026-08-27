@@ -234,6 +234,38 @@ function Invoke-SyntheticPassProbe {
     } -ExpectedSourceRevision (Get-TestCurrentHead)
 }
 
+function New-TestGitMetadataFixture {
+    param(
+        [string]$Name,
+        [string]$Revision,
+        [switch]$Packed,
+        [switch]$LinkedWorktree
+    )
+    $root = Join-Path ([IO.Path]::GetTempPath()) ($Name + '-' + [guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($root) | Out-Null
+    if ($LinkedWorktree) {
+        $common = Join-Path $root 'common.git'
+        $gitDir = Join-Path $common 'worktrees\fixture'
+        [IO.Directory]::CreateDirectory($gitDir) | Out-Null
+        Write-Utf8NoBom (Join-Path $root '.git') "gitdir: $gitDir`n"
+        Write-Utf8NoBom (Join-Path $gitDir 'commondir') "..\..`n"
+        Write-Utf8NoBom (Join-Path $gitDir 'HEAD') "ref: refs/heads/main`n"
+        $refRoot = $common
+    } else {
+        $gitDir = Join-Path $root '.git'
+        [IO.Directory]::CreateDirectory($gitDir) | Out-Null
+        Write-Utf8NoBom (Join-Path $gitDir 'HEAD') "ref: refs/heads/main`n"
+        $refRoot = $gitDir
+    }
+    if ($Packed) {
+        Write-Utf8NoBom (Join-Path $refRoot 'packed-refs') "# pack-refs with: peeled fully-peeled sorted`n$Revision refs/heads/main`n"
+    } else {
+        $refPath = Join-Path $refRoot 'refs\heads\main'
+        Write-Utf8NoBom $refPath "$Revision`n"
+    }
+    return $root
+}
+
 function It {
     param([string]$Name, [scriptblock]$Body)
     try {
@@ -400,6 +432,79 @@ It 'rejects signed-looking evidence whose build id or source revision is not can
         Assert-True ($result.message -match 'canonical|build_id|source|HEAD|fresh') "Expected freshness failure, got $($result.message)"
     } finally {
         [IO.Directory]::Delete($stage, $true)
+    }
+}
+
+It 'derives source revision from git metadata without trusting caller PATH git' {
+    $spoofedSource = '0123456789abcdef0123456789abcdef01234567'
+    $fakeBin = Join-Path ([IO.Path]::GetTempPath()) ('deckpipe-fake-git-' + [guid]::NewGuid().ToString('N'))
+    $stage = New-SyntheticReleaseStage -WithExecutable -SignedEvidence -StageName 'deckpipe-hostile-path' -SourceRevision $spoofedSource
+    $oldPath = $env:PATH
+    try {
+        [IO.Directory]::CreateDirectory($fakeBin) | Out-Null
+        Write-Utf8NoBom (Join-Path $fakeBin 'git.cmd') "@echo off`r`necho $spoofedSource`r`nexit /b 0`r`n"
+        $env:PATH = $fakeBin + [IO.Path]::PathSeparator + $oldPath
+        . (Join-Path $repoRoot 'release\verify.ps1')
+
+        $result = Invoke-ReleaseVerification -StagingDirectory $stage -SignatureProbe {
+            param($ArtifactPath)
+            [pscustomobject]@{
+                Status = 'Valid'
+                TimeStamperCertificate = [pscustomobject]@{ Subject = 'CN=RFC3161 Test TSA'; Thumbprint = 'ABC123' }
+            }
+        }
+
+        Assert-Equal $result.status 'FAIL' "Verifier must reject PATH-spoofed source revision, got $($result.status): $($result.message)"
+        Assert-True ($result.message -match 'source_revision|current HEAD|source provenance') "Expected provenance failure, got $($result.message)"
+    } finally {
+        $env:PATH = $oldPath
+        if (Test-Path -LiteralPath $stage) { [IO.Directory]::Delete($stage, $true) }
+        if (Test-Path -LiteralPath $fakeBin) { [IO.Directory]::Delete($fakeBin, $true) }
+    }
+}
+
+It 'reads current source revision from loose packed and linked worktree git metadata' {
+    . (Join-Path $repoRoot 'release\verify.ps1')
+    $cases = @(
+        @{ Name = 'loose'; Revision = '1111111111111111111111111111111111111111'; Packed = $false; Linked = $false },
+        @{ Name = 'packed'; Revision = '2222222222222222222222222222222222222222'; Packed = $true; Linked = $false },
+        @{ Name = 'linked-packed'; Revision = '3333333333333333333333333333333333333333'; Packed = $true; Linked = $true }
+    )
+    $originalRepoRoot = $script:RepoRoot
+    foreach ($case in $cases) {
+        $fixture = New-TestGitMetadataFixture -Name "deckpipe-git-$($case.Name)" -Revision $case.Revision -Packed:([bool]$case.Packed) -LinkedWorktree:([bool]$case.Linked)
+        try {
+            $script:RepoRoot = $fixture
+            Assert-Equal (Get-CurrentSourceRevision) $case.Revision "metadata revision mismatch for $($case.Name)"
+        } finally {
+            $script:RepoRoot = $originalRepoRoot
+            [IO.Directory]::Delete($fixture, $true)
+        }
+    }
+}
+
+It 'blocks verification when trusted git metadata is missing or malformed' {
+    . (Join-Path $repoRoot 'release\verify.ps1')
+    $fixture = Join-Path ([IO.Path]::GetTempPath()) ('deckpipe-git-malformed-' + [guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory((Join-Path $fixture '.git')) | Out-Null
+    Write-Utf8NoBom (Join-Path $fixture '.git\HEAD') "ref: refs/heads/main`n"
+    $originalRepoRoot = $script:RepoRoot
+    $stage = New-SyntheticReleaseStage -WithExecutable -SignedEvidence -StageName 'deckpipe-metadata-blocked'
+    try {
+        $script:RepoRoot = $fixture
+        $result = Invoke-ReleaseVerification -StagingDirectory $stage -SignatureProbe {
+            param($ArtifactPath)
+            [pscustomobject]@{
+                Status = 'Valid'
+                TimeStamperCertificate = [pscustomobject]@{ Subject = 'CN=RFC3161 Test TSA'; Thumbprint = 'ABC123' }
+            }
+        }
+        Assert-Equal $result.status 'BLOCKED' "Malformed metadata must block verifier, got $($result.status): $($result.message)"
+        Assert-True ($result.message -match 'source provenance BLOCKED') "Expected source provenance BLOCKED, got $($result.message)"
+    } finally {
+        $script:RepoRoot = $originalRepoRoot
+        if ($stage -and (Test-Path -LiteralPath $stage)) { [IO.Directory]::Delete($stage, $true) }
+        if (Test-Path -LiteralPath $fixture) { [IO.Directory]::Delete($fixture, $true) }
     }
 }
 

@@ -17,6 +17,7 @@ SOURCE_REVISION = subprocess.check_output(
     text=True,
 ).strip()
 ARTIFACT_NAME = f"DeckPipe-{BUILD_ID}-{SOURCE_REVISION[:7]}-x64.exe"
+SPOOFED_SOURCE_REVISION = "0123456789abcdef0123456789abcdef01234567"
 
 
 class InstalledRunnerContractTests(unittest.TestCase):
@@ -106,11 +107,14 @@ class InstalledRunnerContractTests(unittest.TestCase):
         *,
         artifact_bytes: bytes = b"synthetic deckpipe executable\n",
         status: str = "BLOCKED",
-        artifact_name: str = ARTIFACT_NAME,
+        artifact_name: str | None = None,
+        source_revision: str = SOURCE_REVISION,
         second_artifact_same_bytes: bool = False,
     ):
         stage = directory / "stage"
         stage.mkdir()
+        if artifact_name is None:
+            artifact_name = f"DeckPipe-{BUILD_ID}-{source_revision[:7]}-x64.exe"
         artifact = stage / artifact_name
         artifact.write_bytes(artifact_bytes)
         artifacts = [{"path": artifact_name, "type": "exe", "sha256": self.sha256(artifact)}]
@@ -126,7 +130,7 @@ class InstalledRunnerContractTests(unittest.TestCase):
             "product": "DeckPipe",
             "version": "0.6.0",
             "build_id": BUILD_ID,
-            "source_revision": SOURCE_REVISION,
+            "source_revision": source_revision,
             "artifacts": artifacts,
             "signing": {"status": status, "signed": [a["path"] for a in artifacts]},
             "timestamp": {"status": status},
@@ -192,6 +196,33 @@ class InstalledRunnerContractTests(unittest.TestCase):
             encoding="utf-8",
         )
         return stage, artifact
+
+    def test_hostile_parent_path_git_cannot_authorize_spoofed_source_revision(self):
+        with tempfile.TemporaryDirectory(prefix="deckpipe-runner-contract-") as tmp:
+            tmp_path = Path(tmp)
+            fake_bin = tmp_path / "fake-bin"
+            fake_bin.mkdir()
+            fake_git = fake_bin / "git.cmd"
+            fake_git.write_text(f"@echo off\r\necho {SPOOFED_SOURCE_REVISION}\r\nexit /b 0\r\n", encoding="ascii")
+            stage, artifact = self.make_stage(tmp_path, source_revision=SPOOFED_SOURCE_REVISION)
+            installed = self.make_installed_copy(tmp_path, artifact)
+            env = {"PATH": str(fake_bin) + os.pathsep + os.environ["PATH"]}
+
+            result = self.run_runner(
+                "-SelfTestContract",
+                "identity",
+                "-AllowUnsignedEngineeringEvidence",
+                "-ExePath",
+                installed,
+                "-CandidateEvidenceDirectory",
+                stage,
+                env=env,
+            )
+
+            self.assertNotEqual(0, result.returncode, result.stdout)
+            self.assertRegex(result.stdout, r"source_revision|source provenance|current HEAD")
+            self.assertNotIn("SELFTEST_LAUNCH", result.stdout)
+            self.assertNotIn("launch_allowed", result.stdout)
 
     def make_installed_copy(self, directory: Path, staged_artifact: Path):
         install_dir = directory / "installed" / "DeckPipe"
