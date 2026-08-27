@@ -1,7 +1,11 @@
 [CmdletBinding()]
 param(
-    [string]$ExePath = 'E:\DeckPipe\deckpipe.exe',
-    [uri]$BaseUri = 'http://127.0.0.1:24680',
+    [string]$ExePath = '',
+    [string]$ExpectedSha256 = '',
+    [string]$ExpectedVersion = '',
+    [string]$ExpectedBuildId = '',
+    [string]$CandidateVersionJsonPath = '',
+    [uri]$BaseUri = $null,
     [string]$OutputDirectory = '',
     [ValidateRange(1, 20)]
     [int]$Samples = 5,
@@ -9,11 +13,42 @@ param(
     [int]$StartupTimeoutSeconds = 30,
     [switch]$NoFailOnFindings,
     [switch]$IsolatedUi,
-    [switch]$ValidateOnly
+    [switch]$ValidateOnly,
+    [ValidateSet('', 'identity', 'isolated-preflight', 'listener-owned', 'listener-none', 'listener-multiple', 'listener-unowned')]
+    [string]$SelfTestContract = ''
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+if ($null -eq (Get-Command Get-FileHash -ErrorAction SilentlyContinue)) {
+    function global:Get-FileHash {
+        param(
+            [Parameter(Mandatory)][string]$LiteralPath,
+            [string]$Algorithm = 'SHA256'
+        )
+
+        if ($Algorithm -ne 'SHA256') {
+            throw 'Only SHA256 is supported by the DeckPipe QA Get-FileHash fallback.'
+        }
+        $stream = [IO.File]::OpenRead($LiteralPath)
+        try {
+            $sha = [Security.Cryptography.SHA256]::Create()
+            try {
+                $hashBytes = $sha.ComputeHash($stream)
+                $builder = [Text.StringBuilder]::new()
+                foreach ($byte in $hashBytes) {
+                    [void]$builder.Append($byte.ToString('x2'))
+                }
+                [pscustomobject]@{ Hash = $builder.ToString().ToUpperInvariant() }
+            } finally {
+                $sha.Dispose()
+            }
+        } finally {
+            $stream.Dispose()
+        }
+    }
+}
 
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $modulePath = Join-Path $PSScriptRoot 'DeckPipe.QA.psm1'
@@ -55,6 +90,112 @@ function Get-PropertyValue {
     return $property.Value
 }
 
+function Assert-DeckPipeExpectedIdentityFormat {
+    if ([string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+        throw 'ExpectedSha256 is required before launching installed QA.'
+    }
+    if ($ExpectedSha256 -notmatch '^[0-9A-Fa-f]{64}$') {
+        throw 'ExpectedSha256 must be 64 hexadecimal characters.'
+    }
+    if ([string]::IsNullOrWhiteSpace($ExpectedVersion)) {
+        throw 'ExpectedVersion is required before launching installed QA.'
+    }
+    if ($ExpectedVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+        throw 'ExpectedVersion must use numeric semantic version format.'
+    }
+    if ([string]::IsNullOrWhiteSpace($ExpectedBuildId)) {
+        throw 'ExpectedBuildId is required before launching installed QA.'
+    }
+    $versionPrefix = [regex]::Escape($ExpectedVersion)
+    if ($ExpectedBuildId -notmatch "^$versionPrefix\+[0-9]{8}\.[0-9]{6}\.[0-9a-f]{7,40}$") {
+        throw 'ExpectedBuildId must include version, UTC timestamp, and git id.'
+    }
+}
+
+function Get-DeckPipeExecutableMetadata {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $info = [Diagnostics.FileVersionInfo]::GetVersionInfo($Path)
+    $versionCandidates = @($info.ProductVersion, $info.FileVersion) | Where-Object {
+        -not [string]::IsNullOrWhiteSpace([string]$_) -and [string]$_ -match '^[0-9]+\.[0-9]+\.[0-9]+'
+    }
+    $buildCandidates = @($info.ProductVersion, $info.FileVersion, $info.SpecialBuild, $info.Comments) | Where-Object {
+        -not [string]::IsNullOrWhiteSpace([string]$_) -and [string]$_ -match '^[0-9]+\.[0-9]+\.[0-9]+\+[0-9]{8}\.[0-9]{6}\.[0-9a-f]{7,40}$'
+    }
+    [pscustomobject]@{
+        Version = if (@($versionCandidates).Count -gt 0) { [string]$versionCandidates[0] } else { $null }
+        BuildId = if (@($buildCandidates).Count -gt 0) { [string]$buildCandidates[0] } else { $null }
+        Source = 'executable-metadata'
+    }
+}
+
+function Get-DeckPipeCandidateMetadata {
+    param(
+        [Parameter(Mandatory)][string]$ResolvedExe,
+        [AllowNull()][string]$ManifestPath
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ManifestPath)) {
+        if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+            throw "Candidate version manifest was not found: $ManifestPath"
+        }
+        $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+        return [pscustomobject]@{
+            Version = [string](Get-PropertyValue -InputObject $manifest -Name 'version')
+            BuildId = [string](Get-PropertyValue -InputObject $manifest -Name 'build_id')
+            Source = (Resolve-Path -LiteralPath $ManifestPath).Path
+        }
+    }
+
+    return Get-DeckPipeExecutableMetadata -Path $ResolvedExe
+}
+
+function Assert-DeckPipeCandidateIdentity {
+    param([Parameter(Mandatory)][string]$Path)
+
+    Assert-DeckPipeExpectedIdentityFormat
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw 'ExePath is required before launching installed QA.'
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "DeckPipe executable was not found: $Path"
+    }
+
+    $resolved = (Resolve-Path -LiteralPath $Path).Path
+    $actualSha = (Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash.ToUpperInvariant()
+    $expectedSha = $ExpectedSha256.ToUpperInvariant()
+    if ($actualSha -cne $expectedSha) {
+        throw "candidate SHA-256 mismatch: expected $expectedSha actual $actualSha"
+    }
+
+    $metadata = Get-DeckPipeCandidateMetadata -ResolvedExe $resolved -ManifestPath $CandidateVersionJsonPath
+    if ([string]::IsNullOrWhiteSpace([string]$metadata.Version)) {
+        throw 'candidate version metadata unavailable.'
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$metadata.BuildId)) {
+        throw 'candidate build_id metadata unavailable.'
+    }
+    if ([string]$metadata.Version -cne $ExpectedVersion) {
+        throw "candidate version mismatch: expected $ExpectedVersion actual $($metadata.Version)"
+    }
+    if ([string]$metadata.BuildId -cne $ExpectedBuildId) {
+        throw "candidate build_id mismatch: expected $ExpectedBuildId actual $($metadata.BuildId)"
+    }
+
+    [pscustomobject]@{
+        matched = $true
+        resolved_exe = $resolved
+        install_directory = Split-Path -Parent $resolved
+        expected_sha256 = $expectedSha
+        actual_sha256 = $actualSha
+        expected_version = $ExpectedVersion
+        actual_version = [string]$metadata.Version
+        expected_build_id = $ExpectedBuildId
+        actual_build_id = [string]$metadata.BuildId
+        metadata_source = [string]$metadata.Source
+    }
+}
+
 function Get-DeckPipeProcessInventory {
     @(Get-CimInstance -ClassName Win32_Process | Select-Object ProcessId, ParentProcessId, Name, ExecutablePath)
 }
@@ -68,29 +209,82 @@ function Get-DeckPipePortOwner {
     return [int]$connection.OwningProcess
 }
 
-function Wait-DeckPipePort {
+function Test-DeckPipeLoopbackAddress {
+    param([AllowNull()][string]$Address)
+
+    if ([string]::IsNullOrWhiteSpace($Address)) { return $false }
+    if ($Address -in @('::1', '127.0.0.1', 'localhost')) { return $true }
+    return [bool]($Address -match '^127\.')
+}
+
+function Get-DeckPipeLoopbackListeners {
+    @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+        Where-Object { Test-DeckPipeLoopbackAddress -Address ([string]$_.LocalAddress) } |
+        Select-Object @{ Name = 'LocalAddress'; Expression = { [string]$_.LocalAddress } },
+            @{ Name = 'LocalPort'; Expression = { [int]$_.LocalPort } },
+            @{ Name = 'OwningProcess'; Expression = { [int]$_.OwningProcess } })
+}
+
+function Select-DeckPipeOwnedLoopbackListener {
     param(
-        [Parameter(Mandatory)][string]$HostName,
-        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][int]$RootProcessId,
+        [Parameter(Mandatory)][object[]]$Processes,
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Listeners
+    )
+
+    $ownedProcessIds = @(Get-DeckPipeDescendantProcessIds -RootProcessId $RootProcessId -Processes $Processes)
+    $owned = @($Listeners | Where-Object {
+        [int]$_.OwningProcess -in $ownedProcessIds -and
+        (Test-DeckPipeLoopbackAddress -Address ([string]$_.LocalAddress))
+    })
+    if ($owned.Count -eq 0) {
+        throw 'owned loopback listener was not found for the launched DeckPipe process tree.'
+    }
+    if ($owned.Count -gt 1) {
+        throw 'multiple owned loopback listeners were found for the launched DeckPipe process tree.'
+    }
+    return $owned[0]
+}
+
+function Wait-DeckPipeOwnedLoopbackListener {
+    param(
+        [Parameter(Mandatory)][int]$RootProcessId,
         [Parameter(Mandatory)][int]$TimeoutSeconds
     )
 
     $watch = [Diagnostics.Stopwatch]::StartNew()
+    $lastError = $null
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
-        $client = [Net.Sockets.TcpClient]::new()
+        $client = $null
         try {
-            $pending = $client.ConnectAsync($HostName, $Port)
+            $inventory = Get-DeckPipeProcessInventory
+            $listener = Select-DeckPipeOwnedLoopbackListener `
+                -RootProcessId $RootProcessId `
+                -Processes $inventory `
+                -Listeners @(Get-DeckPipeLoopbackListeners)
+            $hostName = if ([string]$listener.LocalAddress -eq '::1') { '::1' } else { '127.0.0.1' }
+            $client = [Net.Sockets.TcpClient]::new()
+            $pending = $client.ConnectAsync($hostName, [int]$listener.LocalPort)
             if ($pending.Wait(250) -and $client.Connected) {
-                return [math]::Round($watch.Elapsed.TotalMilliseconds, 1)
+                return [pscustomobject]@{
+                    BaseUri = [uri]::new("http://127.0.0.1:$([int]$listener.LocalPort)")
+                    PortReadyMs = [math]::Round($watch.Elapsed.TotalMilliseconds, 1)
+                    Listener = $listener
+                }
             }
         } catch {
-            # The sidecar is still starting.
+            $lastError = $_.Exception.Message
         } finally {
-            $client.Dispose()
+            if ($null -ne $client) { $client.Dispose() }
         }
         Start-Sleep -Milliseconds 100
     }
-    throw "DeckPipe port did not become ready within $TimeoutSeconds seconds."
+    if ([string]::IsNullOrWhiteSpace($lastError)) {
+        throw "DeckPipe owned loopback listener did not become ready within $TimeoutSeconds seconds."
+    }
+    throw $lastError
 }
 
 function Wait-DeckPipeWindowHandle {
@@ -501,6 +695,65 @@ function Get-DeckPipeBackupCount {
     return @(Get-ChildItem -LiteralPath $directory -Filter 'master.db.deckpipe-backup-*' -File -ErrorAction SilentlyContinue).Count
 }
 
+function New-DeckPipeIsolatedProfile {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('deckpipe-isolated-qa-' + [guid]::NewGuid().ToString('N'))
+    $appData = Join-Path $root 'AppData\Roaming'
+    $localAppData = Join-Path $root 'AppData\Local'
+    $deckPipeData = Join-Path $appData 'DeckPipe'
+    $rekordboxData = Join-Path $appData 'Pioneer\rekordbox'
+    $music = Join-Path $root 'Music'
+    foreach ($directory in @($deckPipeData, $rekordboxData, $localAppData, $music)) {
+        [IO.Directory]::CreateDirectory($directory) | Out-Null
+    }
+    $configPath = Join-Path $deckPipeData 'config.local.json'
+    $fixtureConfig = [ordered]@{
+        music_root = $music
+        wav_mode = 'source'
+        numbering = $true
+        sc_sources = @()
+        local_sources = @()
+    }
+    [IO.File]::WriteAllText(
+        $configPath,
+        (($fixtureConfig | ConvertTo-Json -Depth 5) + "`n"),
+        [Text.UTF8Encoding]::new($false))
+
+    [pscustomobject]@{
+        Root = $root
+        AppData = $appData
+        LocalAppData = $localAppData
+        ConfigPath = $configPath
+        DatabasePath = Join-Path $rekordboxData 'master.db'
+    }
+}
+
+function New-DeckPipeLiveProfilePaths {
+    if ([string]::IsNullOrWhiteSpace($env:APPDATA)) {
+        throw 'APPDATA is not available for installed QA.'
+    }
+    [pscustomobject]@{
+        ConfigPath = Join-Path $env:APPDATA 'DeckPipe\config.local.json'
+        DatabasePath = Join-Path $env:APPDATA 'Pioneer\rekordbox\master.db'
+    }
+}
+
+function Assert-DeckPipeIsolationRoot {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $resolvedIsolation = [IO.Path]::GetFullPath($Path)
+    $resolvedTempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    $isExpectedIsolationPath = $resolvedIsolation.StartsWith(
+        $resolvedTempBase, [StringComparison]::OrdinalIgnoreCase) -and
+        [IO.Path]::GetFileName($resolvedIsolation).StartsWith(
+            'deckpipe-isolated-qa-', [StringComparison]::OrdinalIgnoreCase)
+    if (-not $isExpectedIsolationPath) {
+        throw 'Refusing to remove an unexpected isolation directory.'
+    }
+    return $resolvedIsolation
+}
+
 function Stop-DeckPipeOwnedProcesses {
     param(
         [Parameter(Mandatory)][int[]]$CandidateProcessIds,
@@ -525,6 +778,83 @@ if (-not (Test-Path -LiteralPath $budgetPath -PathType Leaf)) {
 $budget = Get-Content -LiteralPath $budgetPath -Raw | ConvertFrom-Json
 $endpoints = @(Get-DeckPipeReadOnlyEndpoints)
 
+if (-not [string]::IsNullOrWhiteSpace($SelfTestContract)) {
+    switch ($SelfTestContract) {
+        'listener-owned' {
+            $listener = Select-DeckPipeOwnedLoopbackListener `
+                -RootProcessId 100 `
+                -Processes @(
+                    [pscustomobject]@{ ProcessId = 100; ParentProcessId = 0 },
+                    [pscustomobject]@{ ProcessId = 101; ParentProcessId = 100 }
+                ) `
+                -Listeners @([pscustomobject]@{ LocalAddress = '127.0.0.1'; LocalPort = 53123; OwningProcess = 101 })
+            Write-Host "SELFTEST_JSON $(ConvertTo-Json ([ordered]@{ port = [int]$listener.LocalPort; owner = [int]$listener.OwningProcess }) -Compress)"
+            return
+        }
+        'listener-none' {
+            Select-DeckPipeOwnedLoopbackListener `
+                -RootProcessId 100 `
+                -Processes @([pscustomobject]@{ ProcessId = 100; ParentProcessId = 0 }) `
+                -Listeners @() | Out-Null
+            return
+        }
+        'listener-multiple' {
+            Select-DeckPipeOwnedLoopbackListener `
+                -RootProcessId 100 `
+                -Processes @(
+                    [pscustomobject]@{ ProcessId = 100; ParentProcessId = 0 },
+                    [pscustomobject]@{ ProcessId = 101; ParentProcessId = 100 },
+                    [pscustomobject]@{ ProcessId = 102; ParentProcessId = 101 }
+                ) `
+                -Listeners @(
+                    [pscustomobject]@{ LocalAddress = '127.0.0.1'; LocalPort = 53123; OwningProcess = 101 },
+                    [pscustomobject]@{ LocalAddress = '::1'; LocalPort = 53124; OwningProcess = 102 }
+                ) | Out-Null
+            return
+        }
+        'listener-unowned' {
+            Select-DeckPipeOwnedLoopbackListener `
+                -RootProcessId 100 `
+                -Processes @([pscustomobject]@{ ProcessId = 100; ParentProcessId = 0 }) `
+                -Listeners @([pscustomobject]@{ LocalAddress = '127.0.0.1'; LocalPort = 53123; OwningProcess = 999 }) | Out-Null
+            return
+        }
+        'identity' {
+            Assert-DeckPipeCandidateIdentity -Path $ExePath | Out-Null
+            Write-Host 'SELFTEST_LAUNCH would-launch'
+            return
+        }
+        'isolated-preflight' {
+            $identity = Assert-DeckPipeCandidateIdentity -Path $ExePath
+            if (-not $IsolatedUi) {
+                throw 'isolated-preflight self-test requires IsolatedUi.'
+            }
+            $profile = New-DeckPipeIsolatedProfile
+            try {
+                $configBeforeSelfTest = Get-DeckPipeFileSnapshot -Path $profile.ConfigPath
+                $databaseBeforeSelfTest = Get-DeckPipeFileSnapshot -Path $profile.DatabasePath
+                $backupCountBeforeSelfTest = Get-DeckPipeBackupCount -DatabasePath $profile.DatabasePath
+                Write-Host "SELFTEST_JSON $(ConvertTo-Json ([ordered]@{
+                    launch_allowed = $true
+                    isolated = $true
+                    isolated_root = [string]$profile.Root
+                    config_path = [string]$profile.ConfigPath
+                    database_path = [string]$profile.DatabasePath
+                    backup_count = [int]$backupCountBeforeSelfTest
+                    config_exists = [bool]$configBeforeSelfTest.Exists
+                    database_exists = [bool]$databaseBeforeSelfTest.Exists
+                    identity = $identity
+                }) -Depth 8 -Compress)"
+            } finally {
+                if (Test-Path -LiteralPath $profile.Root -PathType Container) {
+                    [IO.Directory]::Delete((Assert-DeckPipeIsolationRoot -Path $profile.Root), $true)
+                }
+            }
+            return
+        }
+    }
+}
+
 if ($ValidateOnly) {
     foreach ($endpoint in $endpoints) {
         Assert-DeckPipeReadOnlyRequest -Method $endpoint.Method -Path $endpoint.Path | Out-Null
@@ -534,11 +864,9 @@ if ($ValidateOnly) {
     return
 }
 
-if (-not (Test-Path -LiteralPath $ExePath -PathType Leaf)) {
-    throw "DeckPipe executable was not found: $ExePath"
-}
-$resolvedExe = (Resolve-Path -LiteralPath $ExePath).Path
-$installDirectory = Split-Path -Parent $resolvedExe
+$candidateIdentity = Assert-DeckPipeCandidateIdentity -Path $ExePath
+$resolvedExe = [string]$candidateIdentity.resolved_exe
+$installDirectory = [string]$candidateIdentity.install_directory
 
 $checks = [Collections.Generic.List[object]]::new()
 $requestLog = [Collections.Generic.List[object]]::new()
@@ -557,9 +885,6 @@ $reportedVersion = $null
 $playlistTitles = @()
 $uiNormal = $null
 $uiMinimum = $null
-$userAppData = $env:APPDATA
-$configPath = Join-Path $userAppData 'DeckPipe\config.local.json'
-$databasePath = Join-Path $userAppData 'Pioneer\rekordbox\master.db'
 $isolatedRoot = $null
 $isolatedAppData = $null
 $isolatedLocalAppData = $null
@@ -568,9 +893,22 @@ $isolatedConfigBefore = $null
 $isolatedConfigUnchanged = $null
 $isolationDirectoryRemoved = -not $IsolatedUi
 $isolatedTabInteractions = 0
+$profilePaths = $null
+if ($IsolatedUi) {
+    $profilePaths = New-DeckPipeIsolatedProfile
+    $isolatedRoot = [string]$profilePaths.Root
+    $isolatedAppData = [string]$profilePaths.AppData
+    $isolatedLocalAppData = [string]$profilePaths.LocalAppData
+    $isolatedConfigPath = [string]$profilePaths.ConfigPath
+} else {
+    $profilePaths = New-DeckPipeLiveProfilePaths
+}
+$configPath = [string]$profilePaths.ConfigPath
+$databasePath = [string]$profilePaths.DatabasePath
 $configBefore = Get-DeckPipeFileSnapshot -Path $configPath
 $databaseBefore = Get-DeckPipeFileSnapshot -Path $databasePath
 $backupCountBefore = Get-DeckPipeBackupCount -DatabasePath $databasePath
+$isolatedConfigBefore = if ($IsolatedUi) { $configBefore } else { $null }
 
 function Add-RunCheck {
     param([string]$Id, [string]$Status, [string]$Message, [AllowNull()]$Data = $null)
@@ -578,37 +916,12 @@ function Add-RunCheck {
 }
 
 try {
-    if ($IsolatedUi) {
-        $isolatedRoot = Join-Path ([IO.Path]::GetTempPath()) ('deckpipe-isolated-qa-' + [guid]::NewGuid().ToString('N'))
-        $isolatedAppData = Join-Path $isolatedRoot 'AppData\Roaming'
-        $isolatedLocalAppData = Join-Path $isolatedRoot 'AppData\Local'
-        $isolatedDeckPipeData = Join-Path $isolatedAppData 'DeckPipe'
-        $isolatedMusic = Join-Path $isolatedRoot 'Music'
-        foreach ($directory in @($isolatedDeckPipeData, $isolatedLocalAppData, $isolatedMusic)) {
-            [IO.Directory]::CreateDirectory($directory) | Out-Null
-        }
-        $isolatedConfigPath = Join-Path $isolatedDeckPipeData 'config.local.json'
-        $fixtureConfig = [ordered]@{
-            music_root = $isolatedMusic
-            wav_mode = 'source'
-            numbering = $true
-            sc_sources = @()
-            local_sources = @()
-        }
-        [IO.File]::WriteAllText(
-            $isolatedConfigPath,
-            (($fixtureConfig | ConvertTo-Json -Depth 5) + "`n"),
-            [Text.UTF8Encoding]::new($false))
-        $isolatedConfigBefore = Get-DeckPipeFileSnapshot -Path $isolatedConfigPath
-    }
-
     $inventory = Get-DeckPipeProcessInventory
     $alreadyRunning = @($inventory | Where-Object {
         Test-DeckPipeProcessPathOwned -ProcessPath $_.ExecutablePath -InstallDirectory $installDirectory
     })
-    $portOwnerBefore = Get-DeckPipePortOwner -Port $BaseUri.Port
-    if ($alreadyRunning.Count -gt 0 -or $null -ne $portOwnerBefore) {
-        throw 'Installed QA preflight found an active DeckPipe process or occupied port.'
+    if ($alreadyRunning.Count -gt 0) {
+        throw 'Installed QA preflight found an active DeckPipe process from the candidate directory.'
     }
 
     $launchWatch = [Diagnostics.Stopwatch]::StartNew()
@@ -623,7 +936,9 @@ try {
     } else {
         $shellProcess = Start-Process -FilePath $resolvedExe -PassThru -WindowStyle Normal
     }
-    $portReadyMs = Wait-DeckPipePort -HostName $BaseUri.Host -Port $BaseUri.Port -TimeoutSeconds $StartupTimeoutSeconds
+    $listenerReady = Wait-DeckPipeOwnedLoopbackListener -RootProcessId $shellProcess.Id -TimeoutSeconds $StartupTimeoutSeconds
+    $BaseUri = $listenerReady.BaseUri
+    $portReadyMs = [double]$listenerReady.PortReadyMs
     $window = Wait-DeckPipeWindowHandle -Process $shellProcess -TimeoutSeconds $StartupTimeoutSeconds
     $windowHandle = $window.Handle
     $windowReadyMs = [math]::Round($launchWatch.Elapsed.TotalMilliseconds, 1)
@@ -635,99 +950,33 @@ try {
         -Message $(if ($startupWithinBudget) { 'installed shell and sidecar became ready' } else { 'installed startup exceeded its budget' }) `
         -Data ([ordered]@{ port_ready_ms = $portReadyMs; window_ready_ms = $windowReadyMs })
 
-    $httpHandler = [Net.Http.HttpClientHandler]::new()
-    $httpHandler.UseProxy = $false
-    $httpClient = [Net.Http.HttpClient]::new($httpHandler)
-    $httpClient.Timeout = [TimeSpan]::FromSeconds(60)
-    try {
-        $results = @{}
-        foreach ($endpoint in $endpoints) {
-            $measurement = Invoke-DeckPipeMeasuredGet -Client $httpClient -Endpoint $endpoint -RootUri $BaseUri -SampleCount $Samples
-            $requestLog.Add([pscustomobject]@{ method = 'GET'; path = $endpoint.Path })
-            $unexpectedStatusCount = @($measurement.StatusCodes | Where-Object { $_ -ne $endpoint.ExpectedStatus }).Count
-            $endpointMetrics[$endpoint.Path] = [ordered]@{
-                expected_status = $endpoint.ExpectedStatus
-                unexpected_status_count = $unexpectedStatusCount
-                response_bytes = $measurement.ResponseBytes
-                min_ms = $measurement.Metrics.Min
-                median_ms = $measurement.Metrics.Median
-                p95_ms = $measurement.Metrics.P95
-                max_ms = $measurement.Metrics.Max
-                payload = $measurement.Summary
-            }
-            $results[$endpoint.Path] = [pscustomobject]@{
-                ExpectedStatus = $measurement.ExpectedStatus
-                StatusCodes = $measurement.StatusCodes
-                ResponseBytes = $measurement.ResponseBytes
-                ContentType = $measurement.ContentType
-                ParseOk = $measurement.ParseOk
-                Metrics = $measurement.Metrics
-                Summary = $measurement.Summary
-            }
-            if ($endpoint.Path -eq '/api/playlists') {
-                $playlistTitles = @($measurement.Payload | ForEach-Object { [string](Get-PropertyValue -InputObject $_ -Name 'title') })
-            }
-            if ($endpoint.Path -eq '/api/config') {
-                $configSensitiveFieldCount = Get-DeckPipeSensitiveFieldCount -InputObject $measurement.Payload
-            }
-        }
+    $reportedVersion = [string]$candidateIdentity.actual_version
+    $versionPass = $reportedVersion -eq [string]$budget.target_version -and
+        [string]$candidateIdentity.actual_build_id -eq $ExpectedBuildId
+    Add-RunCheck -Id 'A2' -Status $(if ($versionPass) { 'pass' } else { 'fail' }) `
+        -Message $(if ($versionPass) { 'candidate identity matches the QA target before launch' } else { 'candidate identity differs from the QA target' }) `
+        -Data ([ordered]@{
+            expected_version = [string]$ExpectedVersion
+            actual_version = [string]$candidateIdentity.actual_version
+            expected_build_id = [string]$ExpectedBuildId
+            actual_build_id = [string]$candidateIdentity.actual_build_id
+            expected_sha256 = [string]$candidateIdentity.expected_sha256
+            actual_sha256 = [string]$candidateIdentity.actual_sha256
+            metadata_source = [string]$candidateIdentity.metadata_source
+        })
 
-        $versionResult = $results['/api/version']
-        $reportedVersion = [string]$versionResult.Summary.reported_version
-        $versionPass = @($versionResult.StatusCodes | Where-Object { $_ -ne 200 }).Count -eq 0 -and
-            $reportedVersion -eq [string]$budget.target_version
-        Add-RunCheck -Id 'A2' -Status $(if ($versionPass) { 'pass' } else { 'fail' }) `
-            -Message $(if ($versionPass) { 'installed version matches the QA target' } else { 'installed version differs from the QA target' }) `
-            -Data ([ordered]@{ reported_version = $reportedVersion; expected_version = [string]$budget.target_version })
-
-        $rootResult = $results['/']
-        $rootPass = @($rootResult.StatusCodes | Where-Object { $_ -ne 200 }).Count -eq 0 -and
-            $rootResult.ParseOk -and -not $rootResult.Summary.utf8_replacement_detected
-        Add-RunCheck -Id 'A3' -Status $(if ($rootPass) { 'pass' } else { 'fail' }) `
-            -Message $(if ($rootPass) { 'root document is readable UTF-8 HTML' } else { 'root document failed status or UTF-8 checks' }) `
-            -Data ([ordered]@{ response_bytes = $rootResult.ResponseBytes; content_type = $rootResult.ContentType })
-
-        $configResult = $results['/api/config']
-        $configPass = @($configResult.StatusCodes | Where-Object { $_ -ne 200 }).Count -eq 0 -and
-            $configResult.ParseOk -and $configSensitiveFieldCount -eq 0
-        Add-RunCheck -Id 'A4' -Status $(if ($configPass) { 'pass' } else { 'fail' }) `
-            -Message $(if ($configPass) { 'configuration endpoint exposes status fields only' } else { 'configuration endpoint exposed an unexpected sensitive field or invalid response' }) `
-            -Data ([ordered]@{ unexpected_sensitive_field_count = $configSensitiveFieldCount; state = $configResult.Summary })
-
-        $missingResult = $results['/__deckpipe_qa_missing__']
-        $missingPass = @($missingResult.StatusCodes | Where-Object { $_ -ne 404 }).Count -eq 0
-        Add-RunCheck -Id 'A5' -Status $(if ($missingPass) { 'pass' } else { 'fail' }) `
-            -Message $(if ($missingPass) { 'unknown route returns 404' } else { 'unknown route did not consistently return 404' })
-
-        foreach ($flow in @(
-            [pscustomobject]@{ Id = 'B1'; Path = '/api/playlists'; Label = 'Deezer playlist listing' },
-            [pscustomobject]@{ Id = 'B2'; Path = '/api/sc/sources'; Label = 'SoundCloud source listing' },
-            [pscustomobject]@{ Id = 'B4'; Path = '/api/rb/status'; Label = 'Rekordbox read-only status' },
-            [pscustomobject]@{ Id = 'B5'; Path = '/api/errors'; Label = 'error listing' }
-        )) {
-            $result = $results[$flow.Path]
-            $pass = @($result.StatusCodes | Where-Object { $_ -ne 200 }).Count -eq 0 -and $result.ParseOk
-            Add-RunCheck -Id $flow.Id -Status $(if ($pass) { 'pass' } else { 'fail' }) `
-                -Message $(if ($pass) { "$($flow.Label) returned a parseable response" } else { "$($flow.Label) failed its response contract" }) `
-                -Data $result.Summary
-        }
-
-        $apiBudgetFailures = [Collections.Generic.List[string]]::new()
-        foreach ($endpoint in $endpoints) {
-            $path = [string]$endpoint.Path
-            $limitProperty = $budget.api_median_ms.PSObject.Properties[$path]
-            if ($null -eq $limitProperty) { continue }
-            $median = [double]$endpointMetrics[$path].median_ms
-            $limit = [double]$limitProperty.Value
-            if ($median -gt $limit) { $apiBudgetFailures.Add($path) }
-            $performance["api$path median_ms"] = $median
-        }
-        Add-RunCheck -Id 'D2' -Status $(if ($apiBudgetFailures.Count -eq 0) { 'pass' } else { 'fail' }) `
-            -Message $(if ($apiBudgetFailures.Count -eq 0) { 'all read-only endpoint medians are within budget' } else { "$($apiBudgetFailures.Count) endpoint medians exceed budget" }) `
-            -Data ([ordered]@{ over_budget_count = $apiBudgetFailures.Count; over_budget_paths = $apiBudgetFailures.ToArray() })
-    } finally {
-        $httpClient.Dispose()
-        $httpHandler.Dispose()
+    foreach ($flow in @(
+        [pscustomobject]@{ Id = 'A3'; Message = 'root document direct HTTP sampling requires the in-memory bearer token and is not run by installed QA' },
+        [pscustomobject]@{ Id = 'A4'; Message = 'configuration direct HTTP sampling requires the in-memory bearer token and is not run by installed QA' },
+        [pscustomobject]@{ Id = 'A5'; Message = 'unknown-route direct HTTP sampling requires the in-memory bearer token and is not run by installed QA' },
+        [pscustomobject]@{ Id = 'B1'; Message = 'Deezer playlist direct HTTP sampling requires the in-memory bearer token and is not run by installed QA' },
+        [pscustomobject]@{ Id = 'B2'; Message = 'SoundCloud source direct HTTP sampling requires the in-memory bearer token and is not run by installed QA' },
+        [pscustomobject]@{ Id = 'B4'; Message = 'Rekordbox status direct HTTP sampling requires the in-memory bearer token and is not run by installed QA' },
+        [pscustomobject]@{ Id = 'B5'; Message = 'error listing direct HTTP sampling requires the in-memory bearer token and is not run by installed QA' },
+        [pscustomobject]@{ Id = 'D2'; Message = 'API median performance checks are skipped because installed QA has no token bypass' }
+    )) {
+        Add-RunCheck -Id $flow.Id -Status 'skipped' -Message $flow.Message `
+            -Data ([ordered]@{ reason = 'bearer-token-memory-only'; base_uri = [string]$BaseUri })
     }
 
     $uiNameSearch = New-DeckPipeUnicodeString -CodePoints @(0x041F, 0x043E, 0x0438, 0x0441, 0x043A)
@@ -854,7 +1103,11 @@ try {
             $graceDeadline = [DateTime]::UtcNow.AddSeconds(8)
             while ([DateTime]::UtcNow -lt $graceDeadline) {
                 $alive = @(Get-Process -Id $capturedProcessIds -ErrorAction SilentlyContinue)
-                if ($alive.Count -eq 0 -and $null -eq (Get-DeckPipePortOwner -Port $BaseUri.Port)) { break }
+                $portClosedDuringGrace = $true
+                if ($null -ne $BaseUri) {
+                    $portClosedDuringGrace = $null -eq (Get-DeckPipePortOwner -Port $BaseUri.Port)
+                }
+                if ($alive.Count -eq 0 -and $portClosedDuringGrace) { break }
                 Start-Sleep -Milliseconds 250
             }
             $ownedAlive = @((Get-DeckPipeProcessInventory) | Where-Object {
@@ -866,14 +1119,16 @@ try {
                 Stop-DeckPipeOwnedProcesses -CandidateProcessIds @($ownedAlive.ProcessId) -InstallDirectory $installDirectory | Out-Null
                 Start-Sleep -Milliseconds 700
             }
-            $portOwnerAfterStop = Get-DeckPipePortOwner -Port $BaseUri.Port
-            if ($null -ne $portOwnerAfterStop) {
-                $portProcess = (Get-DeckPipeProcessInventory | Where-Object { [int]$_.ProcessId -eq $portOwnerAfterStop } | Select-Object -First 1)
-                if ($null -ne $portProcess -and
-                    (Test-DeckPipeProcessPathOwned -ProcessPath $portProcess.ExecutablePath -InstallDirectory $installDirectory)) {
-                    Stop-DeckPipeOwnedProcesses -CandidateProcessIds @($portOwnerAfterStop) -InstallDirectory $installDirectory | Out-Null
-                    $orphanDetected = $true
-                    Start-Sleep -Milliseconds 700
+            if ($null -ne $BaseUri) {
+                $portOwnerAfterStop = Get-DeckPipePortOwner -Port $BaseUri.Port
+                if ($null -ne $portOwnerAfterStop) {
+                    $portProcess = (Get-DeckPipeProcessInventory | Where-Object { [int]$_.ProcessId -eq $portOwnerAfterStop } | Select-Object -First 1)
+                    if ($null -ne $portProcess -and
+                        (Test-DeckPipeProcessPathOwned -ProcessPath $portProcess.ExecutablePath -InstallDirectory $installDirectory)) {
+                        Stop-DeckPipeOwnedProcesses -CandidateProcessIds @($portOwnerAfterStop) -InstallDirectory $installDirectory | Out-Null
+                        $orphanDetected = $true
+                        Start-Sleep -Milliseconds 700
+                    }
                 }
             }
         } catch {
@@ -881,9 +1136,13 @@ try {
         }
     }
 
-    $cleanupPortClosed = $null -eq (Get-DeckPipePortOwner -Port $BaseUri.Port)
+    $cleanupPortClosed = $true
+    if ($null -ne $BaseUri) {
+        $cleanupPortClosed = $null -eq (Get-DeckPipePortOwner -Port $BaseUri.Port)
+    }
     $lingeringOwned = @((Get-DeckPipeProcessInventory) | Where-Object {
-        Test-DeckPipeProcessPathOwned -ProcessPath $_.ExecutablePath -InstallDirectory $installDirectory
+        [int]$_.ProcessId -in @($capturedProcessIds) -and
+        (Test-DeckPipeProcessPathOwned -ProcessPath $_.ExecutablePath -InstallDirectory $installDirectory)
     })
     $configAfter = Get-DeckPipeFileSnapshot -Path $configPath
     $databaseAfter = Get-DeckPipeFileSnapshot -Path $databasePath
@@ -944,8 +1203,12 @@ try {
         target = [ordered]@{
             product = 'DeckPipe'
             version = $reportedVersion
+            build_id = [string]$candidateIdentity.actual_build_id
+            expected_version = [string]$ExpectedVersion
+            expected_build_id = [string]$ExpectedBuildId
             executable = [IO.Path]::GetFileName($resolvedExe)
-            executable_sha256 = (Get-FileHash -LiteralPath $resolvedExe -Algorithm SHA256).Hash.ToUpperInvariant()
+            executable_sha256 = [string]$candidateIdentity.actual_sha256
+            expected_executable_sha256 = [string]$candidateIdentity.expected_sha256
             mode = $(if ($IsolatedUi) { 'isolated-ui' } else { 'installed-read-only' })
         }
         safety = [ordered]@{
