@@ -627,6 +627,94 @@ class DurableJobJournalTests(unittest.TestCase):
         self.assertEqual("interrupted", flip["outcome"])
         self.assertIn("restart", flip["terminal_error"]["code"])
 
+    def test_initialize_rejects_same_root_worker_after_queue_pop_before_running_without_mutating_state(self) -> None:
+        jobs = self.jobs
+        before_running = threading.Event()
+        release_running = threading.Event()
+        calls: list[str] = []
+        calls_lock = threading.Lock()
+        original_mark_running = jobs.mark_running
+
+        def blocked_mark_running(job_id: str, **kwargs) -> None:
+            before_running.set()
+            self.assertTrue(release_running.wait(1))
+            original_mark_running(job_id, **kwargs)
+
+        def fake_process(_job, _pl_dir, track, *_args):
+            with calls_lock:
+                calls.append(f"{track.get('provider', 'deezer')}:{track['id']}")
+            return True, "", "flac"
+
+        jobs.initialize(self.data_root, start_worker=False)
+        with (
+            patch.object(jobs, "mark_running", side_effect=blocked_mark_running),
+            patch.object(jobs, "playlist_dir", return_value=Path(self.tmp.name) / "playlist"),
+            patch.object(jobs, "_process_track", side_effect=fake_process),
+        ):
+            job_id = jobs.enqueue("playlist", "Playlist", [_track("1")], mode="append", start_worker=True)
+            self.assertTrue(before_running.wait(1))
+            before_generation = jobs._worker_generation
+            before_worker = jobs._worker_thread
+            before_journal = jobs._journal_path
+            before_queue = list(jobs._queue)
+            before_job = jobs.get_job(job_id)
+
+            with self.assertRaises(RuntimeError):
+                jobs.initialize(self.data_root, start_worker=True)
+
+            self.assertEqual(before_generation, jobs._worker_generation)
+            self.assertIs(before_worker, jobs._worker_thread)
+            self.assertEqual(before_journal, jobs._journal_path)
+            self.assertEqual(before_queue, jobs._queue)
+            self.assertEqual(before_job, jobs.get_job(job_id))
+
+            release_running.set()
+            deadline = time.time() + 1
+            while time.time() < deadline and jobs.get_job(job_id)["state"] != "done":
+                threading.Event().wait(0.01)
+
+        self.assertEqual(["deezer:1"], calls)
+        job = jobs.get_job(job_id)
+        self.assertEqual("done", job["state"])
+        self.assertEqual("succeeded", job["outcome"])
+        self.assertEqual(1, job["done"])
+        self.assertEqual([], jobs._queue)
+
+    def test_initialize_cleans_dirty_completed_job_tracks_in_primary_and_backup(self) -> None:
+        jobs = self.jobs
+        marker = "generated-token-" + uuid.uuid4().hex
+        jobs.initialize(self.data_root, start_worker=False)
+        job_id = jobs.enqueue("playlist", "Playlist", [_track("1")], mode="append", start_worker=False)
+        jobs.mark_running(job_id)
+        jobs.mark_item_complete(job_id, _track("1"), ok=True, error="", quality="flac")
+        jobs.mark_terminal(job_id, outcome="succeeded")
+        journal = self.data_root / "jobs.json"
+        backup = self.data_root / "jobs.json.bak"
+
+        dirty = _read_json(journal)
+        dirty["jobs"][job_id]["tracks"][0]["credential"] = marker
+        dirty["jobs"][job_id]["tracks"][0]["nested"] = {"oauth_token": marker}
+        serialized = json.dumps(dirty, ensure_ascii=False, indent=2) + "\n"
+        journal.write_text(serialized, encoding="utf-8")
+        backup.write_text(serialized, encoding="utf-8")
+
+        reloaded = importlib.reload(jobs)
+        reloaded.initialize(self.data_root, start_worker=False)
+
+        for snapshot in (reloaded.get_job(job_id), reloaded.list_jobs()[0]):
+            encoded = json.dumps(snapshot, ensure_ascii=False)
+            self.assertNotIn(marker, encoded)
+            self.assertNotIn("oauth_token", encoded)
+            self.assertNotIn("credential", encoded)
+
+        for path in (journal, backup):
+            raw = _read_json(path)
+            self.assertEqual(raw, reloaded._validate_journal(raw))
+            serialized = path.read_text(encoding="utf-8")
+            self.assertNotIn(marker, serialized)
+            self.assertNotIn("oauth_token", serialized)
+            self.assertNotIn("credential", serialized)
+
     def test_job_journal_persists_once_per_logical_transition_and_keeps_terminal_error(self) -> None:
         jobs = self.jobs
         self.assertTrue(hasattr(jobs, "initialize"), "jobs.initialize must explicitly bind a data root")

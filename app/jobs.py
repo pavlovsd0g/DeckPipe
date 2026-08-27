@@ -37,6 +37,7 @@ _real_atomic_write_json = atomic_write_json
 _worker_thread: threading.Thread | None = None
 _worker_generation = 0
 _worker_stop = threading.Event()
+_active_worker_item: tuple[int, str] | None = None
 
 _VALID_STATES = {"queued", "running", "done"}
 _VALID_OUTCOMES = {"pending", "succeeded", "partial_failure", "failed", "interrupted"}
@@ -113,30 +114,44 @@ def _validate_journal(payload: object) -> dict:
 
 def initialize(data_root: Path | None = None, *, start_worker: bool = True, write_json=None) -> None:
     global _initialized, _journal_path, _start_worker_default, _write_json, _jobs, _queue
-    global _worker_started, _worker_generation, _worker_stop, _worker_thread
+    global _worker_started, _worker_generation, _worker_stop, _worker_thread, _active_worker_item
     if data_root is None:
         raise RuntimeError("DeckPipe jobs require an explicit data root")
     journal_path = Path(data_root) / "jobs.json"
     with _lock:
+        current_worker_active = (
+            _active_worker_item is not None
+            and _active_worker_item[0] == _worker_generation
+        )
         if (
             _initialized
             and _journal_path == journal_path
             and _worker_thread is not None
             and _worker_thread.is_alive()
-            and (_queue or any(job.get("state") == "running" for job in _jobs.values()))
+            and (_queue or current_worker_active or any(job.get("state") == "running" for job in _jobs.values()))
         ):
             raise RuntimeError("DeckPipe jobs for this data root are busy")
         _worker_stop.set()
         _worker_generation += 1
         _worker_stop = threading.Event()
         _worker_thread = None
+        _active_worker_item = None
         _worker_started = False
         writer = write_json or atomic_write_json
         _worker_started = False
+        load_canonicalized = False
+
+        def validate_loaded_journal(raw: object) -> dict:
+            nonlocal load_canonicalized
+            clean = _validate_journal(raw)
+            if clean != raw:
+                load_canonicalized = True
+            return clean
+
         payload, recovered = atomic_load_json(
             journal_path,
             default={"version": JOURNAL_VERSION, "jobs": {}},
-            validator=_validate_journal,
+            validator=validate_loaded_journal,
             backup=True,
             return_recovered=True,
         )
@@ -169,8 +184,13 @@ def initialize(data_root: Path | None = None, *, start_worker: bool = True, writ
                         "message": "Job interrupted by restart and was not resumed",
                     }
                     changed = True
-        if changed:
-            writer(journal_path, {"version": JOURNAL_VERSION, "jobs": loaded_jobs}, validator=_validate_journal, backup=not recovered)
+        if changed or load_canonicalized:
+            writer(
+                journal_path,
+                {"version": JOURNAL_VERSION, "jobs": loaded_jobs},
+                validator=_validate_journal,
+                backup=load_canonicalized or not recovered,
+            )
         _journal_path = journal_path
         _start_worker_default = start_worker
         _write_json = writer
@@ -787,11 +807,14 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
 
 
 def _worker(generation: int, stop_event: threading.Event):
+    global _active_worker_item
     while not stop_event.is_set():
         with _lock:
             if generation != _worker_generation:
                 return
             item = _queue.pop(0) if _queue else None
+            if item is not None:
+                _active_worker_item = (generation, item)
         if item is None:
             time.sleep(1)
             continue
@@ -837,6 +860,10 @@ def _worker(generation: int, stop_event: threading.Event):
                 )
             except Exception:
                 pass
+        finally:
+            with _lock:
+                if _active_worker_item == (generation, job_id):
+                    _active_worker_item = None
 
 
 def retry_track(playlist_id: str, playlist_title: str, track: dict) -> str:
