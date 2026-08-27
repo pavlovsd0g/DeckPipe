@@ -47,7 +47,7 @@ function Assert-GitSourceRevision {
     param([string]$Revision, [string]$Context)
     $value = if ($null -eq $Revision) { '' } else { [string]$Revision }
     $value = $value.Trim()
-    if ($value -notmatch '^[0-9a-f]{40}$') {
+    if ($value -cnotmatch '^[0-9a-f]{40}$') {
         throw "source provenance BLOCKED: $Context did not contain a full lowercase revision"
     }
     return $value
@@ -78,23 +78,97 @@ function Read-GitMetadataFirstLine {
 function Test-SafeGitRefName {
     param([string]$RefName)
     if ([string]::IsNullOrWhiteSpace($RefName)) { return $false }
-    if ([IO.Path]::IsPathRooted($RefName)) { return $false }
-    if ($RefName -match '^[A-Za-z]:|\\|:|(^|/)\.\.?(/|$)|//') { return $false }
+    $name = [string]$RefName
+    if ($name -cne $name.Trim()) { return $false }
+    if ($name -eq '@') { return $false }
+    if ($name.IndexOf('\') -ge 0) { return $false }
+    if ($name -match '[\x00-\x20\x7f~^:?*\[]') { return $false }
+    if ([IO.Path]::IsPathRooted($name)) { return $false }
+    if ($name -match '^[A-Za-z]:') { return $false }
+    if ($name -match '\.\.|@\{|//') { return $false }
+    if ($name.StartsWith('/')) { return $false }
+    if ($name.EndsWith('/')) { return $false }
+    if ($name.EndsWith('.', [StringComparison]::Ordinal)) { return $false }
+    if ($name.EndsWith('.lock', [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    $parts = @($name -split '/')
+    if ($parts.Count -lt 2) { return $false }
+    foreach ($part in $parts) {
+        if ([string]::IsNullOrEmpty($part)) { return $false }
+        if ($part -eq '.' -or $part -eq '..') { return $false }
+        if ($part.StartsWith('.', [StringComparison]::Ordinal)) { return $false }
+        if ($part.EndsWith('.', [StringComparison]::Ordinal)) { return $false }
+        if ($part.EndsWith('.lock', [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    }
     return $true
 }
 
-function Get-GitPackedRefRevision {
-    param([string]$GitDirectory, [string]$RefName)
-    $packedRefsPath = Join-Path $GitDirectory 'packed-refs'
-    if (-not (Test-Path -LiteralPath $packedRefsPath -PathType Leaf)) { return '' }
-    foreach ($line in @(Get-Content -LiteralPath $packedRefsPath)) {
-        $trimmed = ([string]$line).Trim()
-        if (-not $trimmed -or $trimmed.StartsWith('#') -or $trimmed.StartsWith('^')) { continue }
-        if ($trimmed -match '^([0-9a-f]{40})\s+(.+)$' -and $Matches[2] -eq $RefName) {
-            return (Assert-GitSourceRevision -Revision $Matches[1] -Context "packed ref $RefName")
-        }
+function Get-CaseSensitiveChildPath {
+    param(
+        [string]$Directory,
+        [string]$Name,
+        [switch]$File,
+        [switch]$DirectoryOnly
+    )
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) { return '' }
+    foreach ($entry in @(Get-ChildItem -LiteralPath $Directory -Force)) {
+        if ($entry.Name -cne $Name) { continue }
+        if ($File -and $entry.PSIsContainer) { continue }
+        if ($DirectoryOnly -and -not $entry.PSIsContainer) { continue }
+        return $entry.FullName
     }
     return ''
+}
+
+function Get-GitLooseRefRevision {
+    param([string]$GitDirectory, [string]$RefName)
+    $current = $GitDirectory
+    $parts = @($RefName -split '/')
+    for ($index = 0; $index -lt ($parts.Count - 1); $index++) {
+        $current = Get-CaseSensitiveChildPath -Directory $current -Name $parts[$index] -DirectoryOnly
+        if (-not $current) { return '' }
+    }
+    $refPath = Get-CaseSensitiveChildPath -Directory $current -Name $parts[$parts.Count - 1] -File
+    if (-not $refPath) { return '' }
+    $revision = Read-GitMetadataFirstLine -Path $refPath -Context "git ref $RefName"
+    return (Assert-GitSourceRevision -Revision $revision -Context "git ref $RefName")
+}
+
+function Get-GitPackedRefRevisions {
+    param([string]$GitDirectory, [string]$RefName)
+    $packedRefsPath = Join-Path $GitDirectory 'packed-refs'
+    if (-not (Test-Path -LiteralPath $packedRefsPath -PathType Leaf)) { return @() }
+    $revisions = @()
+    $lineNumber = 0
+    foreach ($line in @(Get-Content -LiteralPath $packedRefsPath)) {
+        $lineNumber++
+        $trimmed = ([string]$line).Trim()
+        if (-not $trimmed -or $trimmed.StartsWith('#')) { continue }
+        if ($trimmed.StartsWith('^')) {
+            if ($trimmed -cnotmatch '^\^[0-9a-f]{40}$') {
+                throw "source provenance BLOCKED: malformed packed ref line $lineNumber"
+            }
+            continue
+        }
+        if ($trimmed -cnotmatch '^([0-9a-f]{40}) ([^\s]+)$') {
+            throw "source provenance BLOCKED: malformed packed ref line $lineNumber"
+        }
+        $packedRevision = $Matches[1]
+        $packedRefName = $Matches[2]
+        if (-not (Test-SafeGitRefName $packedRefName)) {
+            throw "source provenance BLOCKED: unsafe packed ref name $packedRefName"
+        }
+        if ([string]::Equals($packedRefName, $RefName, [StringComparison]::OrdinalIgnoreCase) -and
+            -not [string]::Equals($packedRefName, $RefName, [StringComparison]::Ordinal)) {
+            throw "source provenance BLOCKED: case-confusable packed ref $packedRefName"
+        }
+        if ([string]::Equals($packedRefName, $RefName, [StringComparison]::Ordinal)) {
+            $revisions += (Assert-GitSourceRevision -Revision $packedRevision -Context "packed ref $RefName")
+        }
+    }
+    if ($revisions.Count -gt 1) {
+        throw "source provenance BLOCKED: duplicate packed ref $RefName"
+    }
+    return $revisions
 }
 
 function Get-GitRefRevision {
@@ -102,18 +176,30 @@ function Get-GitRefRevision {
     if (-not (Test-SafeGitRefName $RefName)) {
         throw "source provenance BLOCKED: unsafe git ref name $RefName"
     }
+    $uniqueGitDirectories = @()
+    $seenGitDirectories = @{}
     foreach ($gitDirectory in @($GitDirectories)) {
         if ([string]::IsNullOrWhiteSpace($gitDirectory)) { continue }
-        $refPath = Join-Path $gitDirectory ($RefName -replace '/', '\')
-        if (Test-Path -LiteralPath $refPath -PathType Leaf) {
-            $revision = Read-GitMetadataFirstLine -Path $refPath -Context "git ref $RefName"
-            return (Assert-GitSourceRevision -Revision $revision -Context "git ref $RefName")
+        $fullGitDirectory = [IO.Path]::GetFullPath([string]$gitDirectory).TrimEnd('\', '/')
+        $key = $fullGitDirectory.ToUpperInvariant()
+        if (-not $seenGitDirectories.ContainsKey($key)) {
+            $seenGitDirectories[$key] = $true
+            $uniqueGitDirectories += $fullGitDirectory
         }
     }
-    foreach ($gitDirectory in @($GitDirectories)) {
-        if ([string]::IsNullOrWhiteSpace($gitDirectory)) { continue }
-        $revision = Get-GitPackedRefRevision -GitDirectory $gitDirectory -RefName $RefName
+    foreach ($gitDirectory in @($uniqueGitDirectories)) {
+        $revision = Get-GitLooseRefRevision -GitDirectory $gitDirectory -RefName $RefName
         if ($revision) { return $revision }
+    }
+    $packedRevisions = @()
+    foreach ($gitDirectory in @($uniqueGitDirectories)) {
+        $packedRevisions += @(Get-GitPackedRefRevisions -GitDirectory $gitDirectory -RefName $RefName)
+    }
+    if ($packedRevisions.Count -gt 1) {
+        throw "source provenance BLOCKED: ambiguous packed ref $RefName"
+    }
+    if ($packedRevisions.Count -eq 1) {
+        return $packedRevisions[0]
     }
     throw "source provenance BLOCKED: git ref $RefName is unavailable"
 }
@@ -125,7 +211,7 @@ function Get-CurrentSourceRevision {
         $gitDir = [IO.Path]::GetFullPath($dotGit)
     } elseif (Test-Path -LiteralPath $dotGit -PathType Leaf) {
         $gitFile = Read-GitMetadataFirstLine -Path $dotGit -Context '.git file'
-        if ($gitFile -notmatch '^gitdir:\s*(.+)$') {
+        if ($gitFile -cnotmatch '^gitdir:\s*(.+)$') {
             throw 'source provenance BLOCKED: .git file does not point to gitdir'
         }
         $gitDir = Resolve-GitMetadataPath -BasePath $repoRoot -GitPath $Matches[1]
@@ -146,10 +232,10 @@ function Get-CurrentSourceRevision {
     }
 
     $head = Read-GitMetadataFirstLine -Path (Join-Path $gitDir 'HEAD') -Context 'HEAD'
-    if ($head -match '^[0-9a-f]{40}$') {
+    if ($head -cmatch '^[0-9a-f]{40}$') {
         return (Assert-GitSourceRevision -Revision $head -Context 'HEAD')
     }
-    if ($head -notmatch '^ref:\s*(.+)$') {
+    if ($head -cnotmatch '^ref:\s*(.+)$') {
         throw 'source provenance BLOCKED: HEAD is malformed'
     }
     $refName = [string]$Matches[1]

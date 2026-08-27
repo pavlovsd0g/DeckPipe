@@ -239,7 +239,10 @@ function New-TestGitMetadataFixture {
         [string]$Name,
         [string]$Revision,
         [switch]$Packed,
-        [switch]$LinkedWorktree
+        [switch]$LinkedWorktree,
+        [string]$RefName = 'refs/heads/main',
+        [string]$HeadContent = '',
+        [string]$PackedContent = ''
     )
     $root = Join-Path ([IO.Path]::GetTempPath()) ($Name + '-' + [guid]::NewGuid().ToString('N'))
     [IO.Directory]::CreateDirectory($root) | Out-Null
@@ -249,18 +252,30 @@ function New-TestGitMetadataFixture {
         [IO.Directory]::CreateDirectory($gitDir) | Out-Null
         Write-Utf8NoBom (Join-Path $root '.git') "gitdir: $gitDir`n"
         Write-Utf8NoBom (Join-Path $gitDir 'commondir') "..\..`n"
-        Write-Utf8NoBom (Join-Path $gitDir 'HEAD') "ref: refs/heads/main`n"
+        if ($HeadContent) {
+            Write-Utf8NoBom (Join-Path $gitDir 'HEAD') $HeadContent
+        } else {
+            Write-Utf8NoBom (Join-Path $gitDir 'HEAD') "ref: $RefName`n"
+        }
         $refRoot = $common
     } else {
         $gitDir = Join-Path $root '.git'
         [IO.Directory]::CreateDirectory($gitDir) | Out-Null
-        Write-Utf8NoBom (Join-Path $gitDir 'HEAD') "ref: refs/heads/main`n"
+        if ($HeadContent) {
+            Write-Utf8NoBom (Join-Path $gitDir 'HEAD') $HeadContent
+        } else {
+            Write-Utf8NoBom (Join-Path $gitDir 'HEAD') "ref: $RefName`n"
+        }
         $refRoot = $gitDir
     }
     if ($Packed) {
-        Write-Utf8NoBom (Join-Path $refRoot 'packed-refs') "# pack-refs with: peeled fully-peeled sorted`n$Revision refs/heads/main`n"
+        if ($PackedContent) {
+            Write-Utf8NoBom (Join-Path $refRoot 'packed-refs') $PackedContent
+        } else {
+            Write-Utf8NoBom (Join-Path $refRoot 'packed-refs') "# pack-refs with: peeled fully-peeled sorted`n$Revision $RefName`n"
+        }
     } else {
-        $refPath = Join-Path $refRoot 'refs\heads\main'
+        $refPath = Join-Path $refRoot ($RefName -replace '/', '\')
         Write-Utf8NoBom $refPath "$Revision`n"
     }
     return $root
@@ -468,11 +483,13 @@ It 'reads current source revision from loose packed and linked worktree git meta
     $cases = @(
         @{ Name = 'loose'; Revision = '1111111111111111111111111111111111111111'; Packed = $false; Linked = $false },
         @{ Name = 'packed'; Revision = '2222222222222222222222222222222222222222'; Packed = $true; Linked = $false },
-        @{ Name = 'linked-packed'; Revision = '3333333333333333333333333333333333333333'; Packed = $true; Linked = $true }
+        @{ Name = 'linked-packed'; Revision = '3333333333333333333333333333333333333333'; Packed = $true; Linked = $true },
+        @{ Name = 'detached'; Revision = '4444444444444444444444444444444444444444'; Packed = $false; Linked = $false; HeadContent = "4444444444444444444444444444444444444444`n" }
     )
     $originalRepoRoot = $script:RepoRoot
     foreach ($case in $cases) {
-        $fixture = New-TestGitMetadataFixture -Name "deckpipe-git-$($case.Name)" -Revision $case.Revision -Packed:([bool]$case.Packed) -LinkedWorktree:([bool]$case.Linked)
+        $headContent = if ($case.ContainsKey('HeadContent')) { [string]$case.HeadContent } else { '' }
+        $fixture = New-TestGitMetadataFixture -Name "deckpipe-git-$($case.Name)" -Revision $case.Revision -Packed:([bool]$case.Packed) -LinkedWorktree:([bool]$case.Linked) -HeadContent $headContent
         try {
             $script:RepoRoot = $fixture
             Assert-Equal (Get-CurrentSourceRevision) $case.Revision "metadata revision mismatch for $($case.Name)"
@@ -480,6 +497,131 @@ It 'reads current source revision from loose packed and linked worktree git meta
             $script:RepoRoot = $originalRepoRoot
             [IO.Directory]::Delete($fixture, $true)
         }
+    }
+}
+
+It 'blocks uppercase git revisions in detached loose and packed metadata' {
+    . (Join-Path $repoRoot 'release\verify.ps1')
+    $uppercase = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    $cases = @(
+        @{ Name = 'detached-uppercase'; Packed = $false; HeadContent = "$uppercase`n" },
+        @{ Name = 'loose-uppercase'; Packed = $false; HeadContent = '' },
+        @{ Name = 'packed-uppercase'; Packed = $true; HeadContent = '' }
+    )
+    $originalRepoRoot = $script:RepoRoot
+    foreach ($case in $cases) {
+        $fixture = New-TestGitMetadataFixture -Name "deckpipe-git-$($case.Name)" -Revision $uppercase -Packed:([bool]$case.Packed) -HeadContent ([string]$case.HeadContent)
+        try {
+            $script:RepoRoot = $fixture
+            Assert-Throws { Get-CurrentSourceRevision | Out-Null } 'source provenance BLOCKED|lowercase'
+        } finally {
+            $script:RepoRoot = $originalRepoRoot
+            [IO.Directory]::Delete($fixture, $true)
+        }
+    }
+}
+
+It 'matches git refs case-sensitively across loose and packed metadata' {
+    . (Join-Path $repoRoot 'release\verify.ps1')
+    $revision = '5555555555555555555555555555555555555555'
+    $cases = @(
+        @{ Name = 'loose-case-confusable'; Packed = $false },
+        @{ Name = 'packed-case-confusable'; Packed = $true }
+    )
+    $originalRepoRoot = $script:RepoRoot
+    foreach ($case in $cases) {
+        $fixture = New-TestGitMetadataFixture -Name "deckpipe-git-$($case.Name)" -Revision $revision -Packed:([bool]$case.Packed) -RefName 'refs/heads/main' -HeadContent "ref: refs/heads/Main`n"
+        try {
+            $script:RepoRoot = $fixture
+            Assert-Throws { Get-CurrentSourceRevision | Out-Null } 'source provenance BLOCKED|unavailable|case'
+        } finally {
+            $script:RepoRoot = $originalRepoRoot
+            [IO.Directory]::Delete($fixture, $true)
+        }
+    }
+}
+
+It 'blocks duplicate ambiguous and malformed packed refs' {
+    . (Join-Path $repoRoot 'release\verify.ps1')
+    $revisionOne = '6666666666666666666666666666666666666666'
+    $revisionTwo = '7777777777777777777777777777777777777777'
+    $validPacked = "# pack-refs with: peeled fully-peeled sorted`n$revisionOne refs/heads/main`n"
+    $cases = @(
+        @{
+            Name = 'duplicate-target'
+            PackedContent = "# pack-refs with: peeled fully-peeled sorted`n$revisionOne refs/heads/main`n$revisionTwo refs/heads/main`n"
+        },
+        @{
+            Name = 'malformed-before-target'
+            PackedContent = "# pack-refs with: peeled fully-peeled sorted`nnot-a-revision refs/heads/other`n$revisionOne refs/heads/main`n"
+        },
+        @{
+            Name = 'malformed-peeled-line'
+            PackedContent = "# pack-refs with: peeled fully-peeled sorted`n$revisionOne refs/tags/v1`n^not-a-revision`n$revisionTwo refs/heads/main`n"
+        },
+        @{
+            Name = 'case-confusable-target'
+            PackedContent = "# pack-refs with: peeled fully-peeled sorted`n$revisionOne refs/heads/Main`n"
+        }
+    )
+    $originalRepoRoot = $script:RepoRoot
+    foreach ($case in $cases) {
+        $fixture = New-TestGitMetadataFixture -Name "deckpipe-git-$($case.Name)" -Revision $revisionOne -Packed -PackedContent $case.PackedContent
+        try {
+            $script:RepoRoot = $fixture
+            Assert-Throws { Get-CurrentSourceRevision | Out-Null } 'source provenance BLOCKED|duplicate|ambiguous|malformed|unavailable'
+        } finally {
+            $script:RepoRoot = $originalRepoRoot
+            [IO.Directory]::Delete($fixture, $true)
+        }
+    }
+
+    $linkedFixture = New-TestGitMetadataFixture -Name 'deckpipe-git-linked-ambiguous-packed' -Revision $revisionOne -Packed -LinkedWorktree -PackedContent $validPacked
+    try {
+        $script:RepoRoot = $linkedFixture
+        $worktreeGitDir = Join-Path $linkedFixture 'common.git\worktrees\fixture'
+        Write-Utf8NoBom (Join-Path $worktreeGitDir 'packed-refs') "# pack-refs with: peeled fully-peeled sorted`n$revisionTwo refs/heads/main`n"
+        Assert-Throws { Get-CurrentSourceRevision | Out-Null } 'source provenance BLOCKED|duplicate|ambiguous'
+    } finally {
+        $script:RepoRoot = $originalRepoRoot
+        [IO.Directory]::Delete($linkedFixture, $true)
+    }
+}
+
+It 'blocks symbolic git ref names rejected by check-ref-format rules' {
+    . (Join-Path $repoRoot 'release\verify.ps1')
+    $gitDir = Join-Path ([IO.Path]::GetTempPath()) ('deckpipe-git-ref-format-' + [guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($gitDir) | Out-Null
+    $unsafeNames = @(
+        'refs/heads/main.lock',
+        'refs/heads/.main',
+        'refs/heads/main.',
+        'refs/heads/main bad',
+        ("refs/heads/main" + [char]1 + "bad"),
+        'refs/heads/main~bad',
+        'refs/heads/main^bad',
+        'refs/heads/main:bad',
+        'refs/heads/main?bad',
+        'refs/heads/main*bad',
+        'refs/heads/main[bad',
+        'refs\heads\main',
+        'refs/heads/main..bad',
+        'refs/heads/main@{bad',
+        'refs/heads//main',
+        '/refs/heads/main',
+        '../refs/heads/main',
+        'refs/heads/../main',
+        'refs/heads/main/',
+        'refs',
+        '@'
+    )
+    try {
+        foreach ($name in $unsafeNames) {
+            Assert-False (Test-SafeGitRefName $name) "Unsafe ref name accepted by predicate: $name"
+            Assert-Throws { Get-GitRefRevision -GitDirectories @($gitDir) -RefName $name | Out-Null } 'source provenance BLOCKED|unsafe'
+        }
+    } finally {
+        [IO.Directory]::Delete($gitDir, $true)
     }
 }
 
