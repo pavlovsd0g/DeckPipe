@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from . import jobs, library
 from .deezer_client import (
     CONFIG_PATH,
+    ROOT,
     SECRET_STORE_PATH,
     get_deezer_arl,
     get_session,
@@ -34,6 +35,7 @@ async def run_startup_migrations() -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await run_startup_migrations()
+    jobs.initialize(ROOT)
     yield
 
 
@@ -759,6 +761,7 @@ async def api_errors():
         playlists = []
     entries = [(p["id"], p["title"], "deezer") for p in playlists]
     entries += [(_sc_key(s["id"]), s["title"], "sc") for s in _sc_sources()]
+    entries += [(f"local:{s['id']}", s["title"], "local") for s in _local_sources()]
 
     for key, title, provider in entries:
         pl_dir = library.playlist_dir(key, title)

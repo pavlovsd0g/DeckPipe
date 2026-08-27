@@ -24,5 +24,19 @@
     "/api/sc/sources": 1048576,
     "/api/rb/status": 1048576,
     "/api/errors": 2097152
+  },
+  "library_scan": {
+    "max_ms": {
+      "missing_scan": 2500,
+      "adoption_scan": 2500,
+      "warm_sidecar_scan": 500
+    },
+    "complexity": {
+      "max_enumerations_per_scan": 1,
+      "max_normalized_stems_per_scan": 1000,
+      "max_candidate_checks_missing": 1000,
+      "max_candidate_checks_adoption": 5000,
+      "max_candidate_checks_warm": 1000
+    }
   }
 }

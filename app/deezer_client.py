@@ -8,7 +8,6 @@ import re
 import subprocess
 import sys
 import time
-import uuid
 from pathlib import Path
 
 import requests
@@ -19,6 +18,8 @@ from mutagen.mp3 import MP3 as MutagenMP3
 from mutagen.mp4 import MP4 as MutagenMP4
 from mutagen.wave import WAVE as MutagenWAVE
 from mutagen.oggopus import OggOpus as MutagenOpus
+
+from .atomic_io import atomic_write_json, cleanup_owned_stages, make_staged_path
 
 _MUTAGEN_BY_EXT = {".flac": MutagenFLAC, ".mp3": MutagenMP3, ".m4a": MutagenMP4,
                    ".aac": MutagenMP4, ".mp4": MutagenMP4, ".wav": MutagenWAVE,
@@ -69,20 +70,7 @@ def save_config(cfg: dict):
     reserved = sorted(field for field in SECRET_CONFIG_FIELDS if field in cfg)
     if reserved:
         raise ValueError("config.local.json cannot store credential fields")
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = CONFIG_PATH.with_name(f".{CONFIG_PATH.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with tmp.open("w", encoding="utf-8", newline="\n") as handle:
-            json.dump(cfg, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, CONFIG_PATH)
-    finally:
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
+    atomic_write_json(CONFIG_PATH, cfg, backup=False)
 
 
 def _secure_store():
@@ -163,21 +151,28 @@ class DeezerSession:
             try:
                 url = self.media_url(infos["TRACK_TOKEN"], q)
                 ext = "flac" if q == "FLAC" else "mp3"
-                fpath = out_dir / f"{sanitize_filename(artist + ' - ' + title)}.{ext}"
+                final_path = out_dir / f"{sanitize_filename(artist + ' - ' + title)}.{ext}"
+                fpath = make_staged_path(final_path)
                 key = _blowfish_key(track_id)
-                with self.s.get(url, stream=True, timeout=180) as r:
-                    r.raise_for_status()
-                    i = 0
-                    with open(fpath, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=2048):
-                            if not chunk:
-                                continue
-                            if i % 3 == 0 and len(chunk) == 2048:
-                                chunk = Blowfish.new(
-                                    key, Blowfish.MODE_CBC,
-                                    b"\x00\x01\x02\x03\x04\x05\x06\x07").decrypt(chunk)
-                            f.write(chunk)
-                            i += 1
+                try:
+                    with self.s.get(url, stream=True, timeout=180) as r:
+                        r.raise_for_status()
+                        i = 0
+                        with open(fpath, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=2048):
+                                if not chunk:
+                                    continue
+                                if i % 3 == 0 and len(chunk) == 2048:
+                                    chunk = Blowfish.new(
+                                        key, Blowfish.MODE_CBC,
+                                        b"\x00\x01\x02\x03\x04\x05\x06\x07").decrypt(chunk)
+                                f.write(chunk)
+                                i += 1
+                            f.flush()
+                            os.fsync(f.fileno())
+                except Exception:
+                    cleanup_owned_stages(fpath)
+                    raise
                 return fpath, q, infos
             except Exception as e:
                 last_err = e

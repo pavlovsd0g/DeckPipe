@@ -9,6 +9,7 @@ import requests
 import yt_dlp
 import imageio_ffmpeg
 
+from .atomic_io import is_partial_path, make_staged_path
 from .deezer_client import sanitize_filename, get_soundcloud_oauth
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
@@ -304,12 +305,13 @@ def download_track(track: dict, out_dir: Path):
     out_dir.mkdir(parents=True, exist_ok=True)
     base = sanitize_filename(f"{track['artist']} - {track['title']}" if track.get("artist")
                              else track["title"])
+    staged_template = make_staged_path(out_dir / (base + ".download")).with_suffix(".%(ext)s")
     opts = {
         "quiet": True, "no_warnings": True, "noplaylist": True,
         # предпочитаем progressive MP3 (точная длительность, чистый контейнер),
         # затем AAC 160k (HLS — возможен сдвиг длительности на неск. секунд)
         "format": "http_mp3_1_0/hls_mp3_1_0/hls_aac_160k/bestaudio/best",
-        "outtmpl": str(out_dir / (base + ".%(ext)s")),
+        "outtmpl": str(staged_template),
         "ffmpeg_location": FFMPEG,
         "postprocessor_args": ["-movflags", "+faststart"],
     }
@@ -320,6 +322,7 @@ def download_track(track: dict, out_dir: Path):
         fpath = Path(y.prepare_filename(info))
     # yt-dlp может поменять расширение после пост-обработки
     if not fpath.exists():
-        cands = sorted(out_dir.glob(base + ".*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        cands = sorted([p for p in out_dir.glob(base + "*") if is_partial_path(p)],
+                       key=lambda p: p.stat().st_mtime, reverse=True)
         fpath = cands[0]
     return fpath, fpath.suffix.lstrip(".").lower(), float(info.get("duration") or 0), info

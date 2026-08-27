@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -112,10 +113,22 @@ class PlaylistScanIsolationTests(unittest.TestCase):
 
 
 class ErrorListingCoverageTests(unittest.TestCase):
-    @unittest.expectedFailure
     def test_local_playlist_errors_are_included_in_global_error_listing(self) -> None:
-        """Desired B5 contract; current endpoint only walks Deezer and SC sources."""
-        from app import main
+        old_token = os.environ.get("DECKPIPE_API_TOKEN")
+        old_port = os.environ.get("DECKPIPE_BOUND_PORT")
+        os.environ["DECKPIPE_API_TOKEN"] = "isolated-core-test-token"
+        os.environ["DECKPIPE_BOUND_PORT"] = "8123"
+        try:
+            from app import main
+        finally:
+            if old_token is None:
+                os.environ.pop("DECKPIPE_API_TOKEN", None)
+            else:
+                os.environ["DECKPIPE_API_TOKEN"] = old_token
+            if old_port is None:
+                os.environ.pop("DECKPIPE_BOUND_PORT", None)
+            else:
+                os.environ["DECKPIPE_BOUND_PORT"] = old_port
 
         async def no_deezer_playlists() -> list[dict[str, object]]:
             return []
@@ -151,6 +164,8 @@ class ErrorListingCoverageTests(unittest.TestCase):
                 errors = asyncio.run(main.api_errors())
 
             self.assertEqual(1, len(errors))
+            self.assertEqual("local", errors[0]["provider"])
+            self.assertEqual("local:fixture", errors[0]["playlist_key"])
 
 
 if __name__ == "__main__":

@@ -1,16 +1,21 @@
 # -*- coding: utf-8 -*-
-"""Локальная библиотека: пути, sidecar-файлы, статусы треков."""
-import json
+from __future__ import annotations
+
 import re
 import time
 import unicodedata
+from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 
+from .atomic_io import atomic_load_json, atomic_write_json, file_lock, is_partial_path
 from .deezer_client import load_config, save_config, sanitize_filename
 
 SIDECAR_NAME = ".deckpipe.json"
 DEFAULT_ROOT = Path.home() / "Music" / "DeckPipe"
-AUDIO_EXTS = (".flac", ".mp3", ".wav", ".aiff", ".m4a")
+AUDIO_EXTS = (".flac", ".mp3", ".wav", ".aiff", ".m4a", ".aac", ".opus", ".ogg")
+
+_last_scan_counters = {"enumerations": 0, "normalized_stems": 0, "candidate_checks": 0}
 
 
 def music_root() -> Path:
@@ -25,7 +30,6 @@ def set_music_root(path: str):
 
 
 def playlist_dir(playlist_id: str, title: str = "") -> Path:
-    """Путь папки плейлиста: кастомный (bindings) или MUSIC_ROOT/<title>."""
     cfg = load_config()
     bindings = cfg.get("bindings", {})
     if playlist_id in bindings:
@@ -40,39 +44,69 @@ def bind_playlist(playlist_id: str, path: str):
 
 
 def sidecar_path(pl_dir: Path) -> Path:
-    return pl_dir / SIDECAR_NAME
+    return Path(pl_dir) / SIDECAR_NAME
+
+
+def track_key(track_id: object, provider: str | None = None) -> str:
+    provider = provider or "deezer"
+    raw = str(track_id)
+    if provider == "deezer":
+        return raw
+    if raw.startswith(f"{provider}:"):
+        return raw
+    return f"{provider}:{raw}"
+
+
+def _validate_sidecar(payload: object) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("invalid sidecar")
+    tracks = payload.get("tracks", {})
+    if not isinstance(tracks, dict):
+        raise ValueError("invalid sidecar")
+    normalized = dict(payload)
+    normalized["tracks"] = {}
+    for key, entry in tracks.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            raise ValueError("invalid sidecar")
+        normalized["tracks"][key] = dict(entry)
+    return normalized
 
 
 def load_sidecar(pl_dir: Path) -> dict:
-    p = sidecar_path(pl_dir)
-    if p.exists():
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {"tracks": {}}
+    path = sidecar_path(pl_dir)
+    if not path.exists() and not Path(f"{path}.bak").exists():
+        return {"tracks": {}}
+    return atomic_load_json(
+        path,
+        default={"tracks": {}},
+        validator=_validate_sidecar,
+        backup=True,
+    )
 
 
 def save_sidecar(pl_dir: Path, data: dict):
-    pl_dir.mkdir(parents=True, exist_ok=True)
-    sidecar_path(pl_dir).write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    Path(pl_dir).mkdir(parents=True, exist_ok=True)
+    atomic_write_json(sidecar_path(pl_dir), data, validator=_validate_sidecar, backup=True)
 
 
 def update_track_status(pl_dir: Path, deezer_id: str, entry: dict):
-    sc = load_sidecar(pl_dir)
-    sc.setdefault("tracks", {})[str(deezer_id)] = entry
-    save_sidecar(pl_dir, sc)
+    provider = entry.get("provider", "deezer") if isinstance(entry, dict) else "deezer"
+    key = track_key(deezer_id, provider)
+    with file_lock(sidecar_path(pl_dir)):
+        sc = load_sidecar(pl_dir)
+        sc.setdefault("tracks", {})[key] = dict(entry)
+        save_sidecar(pl_dir, sc)
 
 
-# ---------- нумерация треков ----------
+def get_last_scan_counters() -> dict[str, int]:
+    return dict(_last_scan_counters)
+
 
 def digits_for(total: int) -> int:
     return 3 if total >= 100 else 2
 
 
 def strip_number_prefix(filename: str) -> str:
-    """убрать 'NN - ' / 'NN. ' из начала имени файла."""
     stem, ext = filename.rsplit(".", 1) if "." in filename else (filename, "")
     stem = re.sub(r"^\s*\d{1,3}\s*[-._)]\s*", "", stem)
     return f"{stem}.{ext}" if ext else stem
@@ -88,36 +122,33 @@ def numbered_name(num: int, digits: int, artist: str, title: str, ext: str) -> s
 
 
 def renumber_playlist(pl_dir: Path, ordered_ids: list, digits: int) -> int:
-    """Перенумеровывает файлы по порядку ordered_ids. Возвращает число переименований."""
-    sc = load_sidecar(pl_dir)
-    tracks = sc.get("tracks", {})
-    renamed = 0
-    for i, tid in enumerate(ordered_ids, start=1):
-        e = tracks.get(str(tid))
-        if not e or not e.get("file"):
-            continue
-        old = pl_dir / e["file"]
-        if not old.exists():
-            continue
-        new_name = f"{i:0{digits}d} - {strip_number_prefix(e['file'])}"
-        if e["file"] == new_name and e.get("position") == i:
-            continue
-        new = pl_dir / new_name
-        if new.exists() and new != old:
-            continue  # не перетираем чужой файл
-        old.rename(new)
-        e["file"] = new_name
-        e["position"] = i
-        renamed += 1
-    if renamed:
-        save_sidecar(pl_dir, sc)
-    return renamed
+    with file_lock(sidecar_path(pl_dir)):
+        sc = load_sidecar(pl_dir)
+        tracks = sc.get("tracks", {})
+        renamed = 0
+        for i, tid in enumerate(ordered_ids, start=1):
+            e = tracks.get(track_key(tid)) or tracks.get(str(tid))
+            if not e or not e.get("file") or is_partial_path(e["file"]):
+                continue
+            old = Path(pl_dir) / e["file"]
+            if not old.exists():
+                continue
+            new_name = f"{i:0{digits}d} - {strip_number_prefix(e['file'])}"
+            if e["file"] == new_name and e.get("position") == i:
+                continue
+            new = Path(pl_dir) / new_name
+            if new.exists() and new != old:
+                continue
+            old.rename(new)
+            e["file"] = new_name
+            e["position"] = i
+            renamed += 1
+        if renamed:
+            save_sidecar(pl_dir, sc)
+        return renamed
 
-
-# ---------- нормализация и нечёткое сопоставление файлов ----------
 
 def _normalize(s: str) -> str:
-    """нижний регистр, без диакритики, пунктуация -> пробел, схлопнуть пробелы."""
     s = s.replace("'", "").replace("’", "").replace("‘", "")
     s = unicodedata.normalize("NFKD", s)
     s = "".join(c for c in s if not unicodedata.combining(c))
@@ -126,101 +157,195 @@ def _normalize(s: str) -> str:
 
 
 def _strip_track_number(stem: str) -> str:
-    """убрать ведущий номер трека: '01 - X', '01. X', '1_X'."""
     return re.sub(r"^\s*\d{1,3}\s*[-._)]?\s*", "", stem)
 
 
-def match_file(track_title: str, track_artist: str, files: list) -> Path | None:
-    """Нечёткий подбор файла под трек. files: [Path]. Возвращает Path или None."""
+def _track_terms(track_title: str) -> list[str]:
     n_title = _normalize(track_title)
-    # вариант названия без скобок: 'Song (Radio Edit)' -> 'song'
+    short = _normalize(re.sub(r"[\(\[].*?[\)\]]", "", track_title))
+    return [token for token in set((n_title + " " + short).split()) if token]
+
+
+def _score_match(
+    track_title: str,
+    track_artist: str,
+    stem_norm: str,
+    same_title_count: int | None = None,
+) -> int:
+    n_title = _normalize(track_title)
     n_title_short = _normalize(re.sub(r"[\(\[].*?[\)\]]", "", track_title))
     n_artist = _normalize(track_artist)
     first_artist = _normalize(re.split(r"[,;&]| feat\.? | ft\.? | vs\.? | x ", track_artist)[0])
+    score = 0
+    if n_title and stem_norm == n_title:
+        score += 5
+    elif n_title and n_title in stem_norm:
+        score += 3
+    elif n_title_short and len(n_title_short) >= 4 and n_title_short in stem_norm:
+        score += 2
+    elif stem_norm in n_title:
+        score += 1
+    if score == 0:
+        return 0
+    if n_artist and n_artist in stem_norm:
+        score += 3
+    elif first_artist and first_artist in stem_norm:
+        score += 2
+    if score >= 5:
+        return score
+    return score if same_title_count == 1 else 0
 
+
+def match_file(track_title: str, track_artist: str, files: list) -> Path | None:
+    clean = [Path(f) for f in files if not is_partial_path(f)]
+    stems = [(f, _normalize(_strip_track_number(f.stem))) for f in clean]
+    n_title = _normalize(track_title)
+    same_count = sum(1 for _f, stem in stems if n_title and n_title in stem)
     best, best_score = None, 0
-    for f in files:
-        stem = _normalize(_strip_track_number(f.stem))
+    for f, stem in stems:
         if not stem:
             continue
-        score = 0
-        # совпадение названия
-        if n_title and stem == n_title:
-            score += 5
-        elif n_title and n_title in stem:
-            score += 3
-        elif n_title_short and len(n_title_short) >= 4 and n_title_short in stem:
-            score += 2
-        elif stem in n_title:  # файл назван короче
-            score += 1
-        if score == 0:
-            continue
-        # совпадение исполнителя — сильный буст и разрешитель неоднозначности
-        if n_artist and n_artist in stem:
-            score += 3
-        elif first_artist and first_artist in stem:
-            score += 2
+        score = _score_match(track_title, track_artist, stem, same_count)
         if score > best_score:
             best, best_score = f, score
-    # минимальный порог: название (2-3) — обязательно; без артиста берём только если кандидат один
-    if best and best_score >= 3:
-        if best_score >= 5:
-            return best
-        # без совпадения артиста — только если файл один на всё название
-        same = [f for f in files
-                if (n_title and n_title in _normalize(_strip_track_number(f.stem)))]
-        if len(same) == 1:
-            return best
-    return None
+    return best if best_score >= 3 else None
+
+
+@dataclass
+class _IndexedFile:
+    path: Path
+    resolved: Path
+    norm_stem: str
+
+
+class LibraryIndex:
+    def __init__(self, pl_dir: Path):
+        self.pl_dir = Path(pl_dir)
+        self.files: list[_IndexedFile] = []
+        self.by_token: dict[str, list[int]] = {}
+        self.enumerations = 0
+        self.normalized_stems = 0
+        self.candidate_checks = 0
+        if not self.pl_dir.exists():
+            return
+        self.enumerations = 1
+        for path in self.pl_dir.iterdir():
+            if path.suffix.lower() not in AUDIO_EXTS or is_partial_path(path):
+                continue
+            norm = _normalize(_strip_track_number(path.stem))
+            item = _IndexedFile(path=path, resolved=path.resolve(), norm_stem=norm)
+            idx = len(self.files)
+            self.files.append(item)
+            self.normalized_stems += 1
+            for token in set(norm.split()):
+                self.by_token.setdefault(token, []).append(idx)
+
+    def _same_title_count(self, title: str) -> int:
+        n_title = _normalize(title)
+        if not n_title:
+            return 0
+        terms = _track_terms(title)
+        buckets = [self.by_token[token] for token in terms if token in self.by_token]
+        indexes = set(min(buckets, key=len)) if buckets else range(len(self.files))
+        return sum(1 for idx in indexes if n_title in self.files[idx].norm_stem)
+
+    def _candidate_indexes(self, title: str) -> list[int]:
+        buckets = [self.by_token[token] for token in _track_terms(title) if token in self.by_token]
+        if not buckets:
+            return []
+        return sorted(set(min(buckets, key=len)))
+
+    def find(self, track_title: str, track_artist: str, used_files: set[Path]) -> Path | None:
+        best, best_score = None, 0
+        candidates = self._candidate_indexes(track_title)
+        same_title_count = self._same_title_count(track_title)
+        for idx in candidates:
+            item = self.files[idx]
+            if item.resolved in used_files:
+                continue
+            self.candidate_checks += 1
+            score = _score_match(track_title, track_artist, item.norm_stem, same_title_count)
+            if score > best_score:
+                best, best_score = item.path, score
+        return best if best_score >= 3 else None
+
+    def counters(self) -> dict[str, int]:
+        return {
+            "enumerations": self.enumerations,
+            "normalized_stems": self.normalized_stems,
+            "candidate_checks": self.candidate_checks,
+        }
+
+
+def _entry_for_track(sidecar_tracks: dict, t: dict) -> tuple[str, dict | None]:
+    provider = t.get("provider", "deezer")
+    key = track_key(t["id"], provider)
+    entry = sidecar_tracks.get(key)
+    if entry is None and provider == "deezer":
+        entry = sidecar_tracks.get(str(t["id"]))
+    return key, entry
 
 
 def scan_playlist(pl_dir: Path, deezer_tracks: list) -> list:
-    """Статусы треков плейлиста: ok / error / missing (+ подхват файлов без sidecar)."""
-    sc = load_sidecar(pl_dir)
-    sidecar_tracks = sc.get("tracks", {})
-    changed = False
-    result = []
-    disk_files = [f for f in pl_dir.glob("*")
-                  if f.suffix.lower() in AUDIO_EXTS] if pl_dir.exists() else []
-    used_files = set()
+    global _last_scan_counters
+    lock_context = file_lock(sidecar_path(pl_dir)) if Path(pl_dir).exists() or sidecar_path(pl_dir).exists() else nullcontext()
+    with lock_context:
+        sc = load_sidecar(pl_dir)
+        sidecar_tracks = sc.get("tracks", {})
+        changed = False
+        result = []
+        index = LibraryIndex(pl_dir)
+        used_files: set[Path] = set()
 
-    for t in deezer_tracks:
-        tid = str(t["id"])
-        entry = sidecar_tracks.get(tid)
-        if entry:
-            f = pl_dir / entry["file"]
-            if entry.get("status", "").startswith("verify_failed"):
-                status, err = "error", entry.get("error", "")
-            elif f.exists():
-                status, err = "ok", ""
-                used_files.add(f.resolve())
+        for t in deezer_tracks:
+            key, entry = _entry_for_track(sidecar_tracks, t)
+            if entry:
+                fname = entry.get("file", "")
+                f = Path(pl_dir) / fname
+                if entry.get("status", "").startswith("verify_failed"):
+                    status, err = "error", entry.get("error", "")
+                elif fname and not is_partial_path(fname) and f.exists():
+                    status, err = "ok", ""
+                    used_files.add(f.resolve())
+                else:
+                    status, err, fname = "missing", "", ""
+                    entry["status"] = "missing"
+                    entry["file"] = ""
+                    changed = True
+                fmt = entry.get("format", "")
             else:
-                status, err = "missing", ""
-                entry["status"] = "missing"
-                changed = True
-            fmt = entry.get("format", "")
-            fname = entry["file"]
-        else:
-            # подхват: ищем файл на диске нечётким матчингом
-            found = match_file(t["title"], t["artist"],
-                               [f for f in disk_files if f.resolve() not in used_files])
-            if found:
-                status, err = "ok", ""
-                fmt = found.suffix.lstrip(".").lower()
-                fname = found.name
-                used_files.add(found.resolve())
-                sidecar_tracks[tid] = {
-                    "title": t["title"], "artist": t["artist"], "file": fname,
-                    "format": fmt, "status": "ok", "downloaded_at": int(time.time()),
-                    "adopted": True,
+                found = index.find(t["title"], t["artist"], used_files)
+                if found:
+                    status, err = "ok", ""
+                    fmt = found.suffix.lstrip(".").lower()
+                    fname = found.name
+                    used_files.add(found.resolve())
+                    sidecar_tracks[key] = {
+                        "title": t["title"],
+                        "artist": t["artist"],
+                        "file": fname,
+                        "format": fmt,
+                        "status": "ok",
+                        "downloaded_at": int(time.time()),
+                        "adopted": True,
+                        "provider": t.get("provider", "deezer"),
+                    }
+                    changed = True
+                else:
+                    status, err, fmt, fname = "missing", "", "", ""
+            result.append(
+                {
+                    **t,
+                    "status": status,
+                    "error": err,
+                    "format": fmt,
+                    "file": fname,
+                    "flipped": bool(entry and entry.get("flipped_to") == "wav"),
+                    "mp3_source": bool(entry and entry.get("mp3_source")),
                 }
-                changed = True
-            else:
-                status, err, fmt, fname = "missing", "", "", ""
-        result.append({**t, "status": status, "error": err, "format": fmt, "file": fname,
-                       "flipped": bool(entry and entry.get("flipped_to") == "wav"),
-                       "mp3_source": bool(entry and entry.get("mp3_source"))})
+            )
 
-    if changed:
-        save_sidecar(pl_dir, sc)
-    return result
+        if changed:
+            save_sidecar(pl_dir, sc)
+        _last_scan_counters = index.counters()
+        return result
