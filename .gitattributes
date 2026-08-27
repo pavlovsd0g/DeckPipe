@@ -1,0 +1,9 @@
+/frontend/*.js text eol=lf
+/frontend/*.html text eol=lf
+/frontend/*.css text eol=lf
+/app/static/*.js text eol=lf
+/app/static/*.html text eol=lf
+/app/static/*.css text eol=lf
+/desktop/ui/*.js text eol=lf
+/desktop/ui/*.html text eol=lf
+/desktop/ui/*.css text eol=lf

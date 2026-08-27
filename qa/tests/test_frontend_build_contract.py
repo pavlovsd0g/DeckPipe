@@ -23,6 +23,18 @@ def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def git_blob_bytes(repo_path):
+    result = subprocess.run(
+        ["git", "show", f":{repo_path}"],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr.decode("utf-8", errors="replace"))
+    return result.stdout
+
+
 def run_frontend_transport_probe(probe_script):
     source = read_text(FRONTEND / "app.js")
     transport_only = source.split("async function loadConfig", 1)[0]
@@ -209,6 +221,44 @@ class FrontendBuildContractTests(unittest.TestCase):
                     (desktop_out / name).read_bytes(),
                     (DESKTOP_UI / name).read_bytes(),
                     f"tracked desktop/ui/{name} drifted from canonical build",
+                )
+
+    def test_generated_asset_blobs_are_archive_stable_on_windows(self):
+        expected_paths = [
+            f"frontend/{name}" for name in ASSETS
+        ] + [
+            f"app/static/{name}" for name in ASSETS
+        ] + [
+            f"desktop/ui/{name}" for name in ASSETS
+        ]
+        result = subprocess.run(
+            ["git", "check-attr", "text", "eol", "--", *expected_paths],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertTrue(result.stdout.strip(), "expected Git attributes for frontend asset paths")
+        attrs = {}
+        for line in result.stdout.splitlines():
+            path, attr, value = line.split(": ", 2)
+            attrs.setdefault(path, {})[attr] = value
+        for repo_path in expected_paths:
+            self.assertEqual(attrs[repo_path], {"text": "set", "eol": "lf"})
+
+        with tempfile.TemporaryDirectory() as td:
+            app_out, desktop_out, _ = self.run_temp_build(Path(td))
+            generated = {
+                f"app/static/{name}": (app_out / name).read_bytes() for name in ASSETS
+            } | {
+                f"desktop/ui/{name}": (desktop_out / name).read_bytes() for name in ASSETS
+            }
+            for repo_path, generated_bytes in generated.items():
+                self.assertEqual(
+                    git_blob_bytes(repo_path),
+                    generated_bytes,
+                    f"staged Git blob for {repo_path} differs from frontend/build.mjs output",
                 )
 
     def test_build_is_deterministic_across_clean_output_directories(self):
