@@ -29,8 +29,8 @@ def _fetch_cover(url: str) -> bytes | None:
         r = requests.get(url, headers=UA, timeout=20)
         if r.ok and len(r.content) > 1000:
             return r.content
-    except Exception as e:
-        log.warning("cover fetch failed: %s", e)
+    except Exception:
+        log.warning("cover fetch failed")
     return None
 
 
@@ -71,8 +71,8 @@ def write_tags(fpath: Path, meta: dict):
         elif ext in (".m4a", ".mp4", ".aac"):
             _tag_mp4(fpath, meta)
         # wav: теги не пишем — Rekordbox берёт из своей базы
-    except Exception as e:
-        log.warning("tag write failed for %s: %s", fpath, e)
+    except Exception:
+        log.warning("tag write failed")
         raise TagWriteError("metadata tagging failed") from None
 
 

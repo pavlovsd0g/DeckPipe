@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import tempfile
 import threading
+import time
 import traceback
 import unittest
 import uuid
@@ -178,9 +179,23 @@ class CrashSafeSidecarTests(unittest.TestCase):
 
         final = Path("Artist .deckpipe-stage- literal.part Song.flac")
         stage = atomic_io.make_staged_path(final)
+        upper_stage = Path("Artist.DECKPIPE-STAGE-owned.PART.flac")
 
         self.assertTrue(atomic_io.is_partial_path("TRACK.PART.FLAC"))
         self.assertEqual(final, atomic_io.final_path_from_stage(stage))
+        self.assertEqual(Path("Artist.flac"), atomic_io.final_path_from_stage(upper_stage))
+
+    def test_first_atomic_backup_write_creates_primary_and_valid_backup(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="deckpipe-atomic-first-backup-") as temporary:
+            from app import atomic_io, library
+
+            path = Path(temporary) / ".deckpipe.json"
+            payload = {"tracks": {"first": {"status": "ok", "file": "first.flac"}}}
+
+            atomic_io.atomic_write_json(path, payload, validator=library._validate_sidecar, backup=True)
+
+            self.assertEqual(payload, _read_json(path))
+            self.assertEqual(payload, _read_json(atomic_io.backup_path(path)))
 
     def test_atomic_backup_snapshot_failure_preserves_old_primary_backup_and_cleans_temps(self) -> None:
         with tempfile.TemporaryDirectory(prefix="deckpipe-atomic-backup-fail-") as temporary:
@@ -211,6 +226,99 @@ class CrashSafeSidecarTests(unittest.TestCase):
             self.assertEqual(old, _read_json(path))
             self.assertEqual(backup, _read_json(atomic_io.backup_path(path)))
             self.assertFalse([p for p in playlist.iterdir() if atomic_io.is_partial_path(p) or ".deckpipe-stage-" in p.name])
+
+    def test_atomic_primary_publish_failure_preserves_prior_state_for_first_write_and_update(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="deckpipe-atomic-primary-fail-") as temporary:
+            from app import atomic_io, library
+
+            root = Path(temporary)
+            first = root / "first.json"
+
+            def fail_primary_replace(src: Path, dst: Path) -> None:
+                if Path(dst).name == "first.json":
+                    raise OSError("primary replace failed generated-token-" + uuid.uuid4().hex)
+                os.replace(src, dst)
+
+            with patch.object(atomic_io, "replace_file", fail_primary_replace):
+                with self.assertRaises(Exception):
+                    atomic_io.atomic_write_json(
+                        first,
+                        {"tracks": {"new": {"status": "ok", "file": "new.flac"}}},
+                        validator=library._validate_sidecar,
+                        backup=True,
+                    )
+
+            self.assertFalse(first.exists())
+            self.assertFalse(atomic_io.backup_path(first).exists())
+            self.assertFalse([p for p in root.iterdir() if ".deckpipe-stage-" in p.name or atomic_io.is_partial_path(p)])
+
+            path = root / "update.json"
+            old = {"tracks": {"old": {"status": "ok", "file": "old.flac"}}}
+            atomic_io.atomic_write_json(path, old, validator=library._validate_sidecar, backup=True)
+
+            def fail_update_primary_replace(src: Path, dst: Path) -> None:
+                if Path(dst).name == "update.json":
+                    raise OSError("primary replace failed generated-token-" + uuid.uuid4().hex)
+                os.replace(src, dst)
+
+            with patch.object(atomic_io, "replace_file", fail_update_primary_replace):
+                with self.assertRaises(Exception):
+                    atomic_io.atomic_write_json(
+                        path,
+                        {"tracks": {"new": {"status": "ok", "file": "new.flac"}}},
+                        validator=library._validate_sidecar,
+                        backup=True,
+                    )
+
+            self.assertEqual(old, _read_json(path))
+            self.assertEqual(old, _read_json(atomic_io.backup_path(path)))
+            self.assertFalse([p for p in root.iterdir() if ".deckpipe-stage-" in p.name or atomic_io.is_partial_path(p)])
+
+    def test_atomic_fsync_failure_preserves_prior_state_for_first_write_and_update(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="deckpipe-atomic-fsync-fail-") as temporary:
+            from app import atomic_io, library
+
+            root = Path(temporary)
+            payload = {"tracks": {"new": {"status": "ok", "file": "new.flac"}}}
+
+            for fail_call, path_name in ((1, "first-backup-fsync.json"), (2, "first-primary-fsync.json")):
+                path = root / path_name
+                calls = {"count": 0}
+
+                def fail_fsync(_fd: int) -> None:
+                    calls["count"] += 1
+                    if calls["count"] == fail_call:
+                        raise OSError("fsync failed generated-token-" + uuid.uuid4().hex)
+                    original_fsync(_fd)
+
+                original_fsync = atomic_io.os.fsync
+                with patch.object(atomic_io.os, "fsync", fail_fsync):
+                    with self.assertRaises(Exception):
+                        atomic_io.atomic_write_json(path, payload, validator=library._validate_sidecar, backup=True)
+
+                self.assertFalse(path.exists())
+                self.assertFalse(atomic_io.backup_path(path).exists())
+
+            path = root / "update-fsync.json"
+            old = {"tracks": {"old": {"status": "ok", "file": "old.flac"}}}
+            atomic_io.atomic_write_json(path, old, validator=library._validate_sidecar, backup=True)
+            for fail_call in (1, 2):
+                calls = {"count": 0}
+
+                def fail_fsync(_fd: int) -> None:
+                    calls["count"] += 1
+                    if calls["count"] == fail_call:
+                        raise OSError("fsync failed generated-token-" + uuid.uuid4().hex)
+                    original_fsync(_fd)
+
+                original_fsync = atomic_io.os.fsync
+                with patch.object(atomic_io.os, "fsync", fail_fsync):
+                    with self.assertRaises(Exception):
+                        atomic_io.atomic_write_json(path, payload, validator=library._validate_sidecar, backup=True)
+
+                self.assertEqual(old, _read_json(path))
+                self.assertEqual(old, _read_json(atomic_io.backup_path(path)))
+            self.assertFalse([p for p in root.iterdir() if ".deckpipe-stage-" in p.name or atomic_io.is_partial_path(p)])
 
 
 class StagedPublicationTests(unittest.TestCase):
@@ -328,6 +436,29 @@ class StagedPublicationTests(unittest.TestCase):
             self.assertNotIn(secretish, combined)
             self.assertNotIn(".deckpipe-stage-", combined)
 
+    def test_tagger_log_records_generic_metadata_failure(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="deckpipe-tagger-log-") as temporary:
+            from app import tagger
+
+            stage = Path(temporary) / ("Track.deckpipe-stage-" + uuid.uuid4().hex + ".part.flac")
+            stage.write_bytes(b"synthetic")
+            secretish = "generated-token-" + uuid.uuid4().hex
+
+            def raising_tag(_path: Path, _meta: dict) -> None:
+                raise RuntimeError("mutagen failed " + str(stage) + " " + secretish)
+
+            with patch.object(tagger, "_tag_flac", raising_tag):
+                with self.assertLogs("app.tagger", level="WARNING") as captured:
+                    with self.assertRaises(tagger.TagWriteError):
+                        tagger.write_tags(stage, {"title": "T", "artist": "A", "album": "", "album_artist": "", "isrc": "", "date": "", "track_number": "", "cover": None})
+
+            logs = "\n".join(captured.output)
+            self.assertIn("tag write failed", logs)
+            self.assertNotIn(str(stage), logs)
+            self.assertNotIn(stage.name, logs)
+            self.assertNotIn(secretish, logs)
+            self.assertNotIn(".deckpipe-stage-", logs)
+
     def test_soundcloud_fallback_ignores_stale_stage_and_cleans_current_partial_on_failure(self) -> None:
         with tempfile.TemporaryDirectory(prefix="deckpipe-sc-stale-") as temporary:
             from app import soundcloud
@@ -359,6 +490,46 @@ class StagedPublicationTests(unittest.TestCase):
 
             self.assertTrue(stale.exists())
             self.assertEqual([stale], list(out_dir.iterdir()))
+
+    def test_soundcloud_fallback_uses_literal_current_prefix_and_rejects_stale_prepared_path(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="deckpipe-sc-literal-prefix-") as temporary:
+            from app import soundcloud
+
+            out_dir = Path(temporary)
+            stale = out_dir / "Artist - Brackets [demo] _.deckpipe-stage-stale.part.mp3"
+            stale.write_bytes(b"stale")
+            captured: list[str] = []
+
+            class FakeYoutubeDL:
+                def __init__(self, opts):
+                    captured.append(opts["outtmpl"])
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+                def extract_info(self, _url, download=False):
+                    self.info = {"duration": 180, "ext": "mp3", "id": "sc-1"}
+                    current = Path(captured[-1].replace("%(ext)s", "mp3"))
+                    current.write_bytes(b"current")
+                    return self.info
+
+                def prepare_filename(self, _info):
+                    return str(stale)
+
+            with patch.object(soundcloud, "sc_oauth_token", return_value=None):
+                with patch.object(soundcloud.yt_dlp, "YoutubeDL", FakeYoutubeDL):
+                    fpath, _fmt, _duration, _info = soundcloud.download_track(
+                        {**_track("sc-1", "sc"), "title": "Brackets [demo] *", "url": "https://soundcloud.example/t"},
+                        out_dir,
+                    )
+
+            self.assertNotEqual(stale, fpath)
+            self.assertTrue(stale.exists())
+            self.assertTrue(fpath.exists())
+            self.assertIn(".deckpipe-stage-", fpath.name)
 
 
 class DurableJobJournalTests(unittest.TestCase):
@@ -442,6 +613,172 @@ class DurableJobJournalTests(unittest.TestCase):
         self.assertEqual("failed", job["outcome"])
         self.assertEqual({"code": "synthetic", "message": "synthetic failed"}, job["terminal_error"])
 
+    def test_enqueue_write_failure_does_not_publish_memory_queue_or_start_worker(self) -> None:
+        jobs = self.jobs
+        jobs.initialize(self.data_root, start_worker=False)
+        journal = self.data_root / "jobs.json"
+        before_disk = _read_json(journal) if journal.exists() else None
+        starts: list[str] = []
+
+        def fail_write(_path: Path, _payload: object, **_kwargs) -> None:
+            raise RuntimeError("journal write failed generated-token-" + uuid.uuid4().hex)
+
+        jobs._write_json = fail_write
+        with patch.object(jobs, "_ensure_worker_locked", side_effect=lambda: starts.append("started")):
+            with self.assertRaises(Exception):
+                jobs.enqueue("playlist", "Playlist", [_track("1")], mode="append", start_worker=True)
+
+        self.assertEqual([], starts)
+        self.assertEqual([], jobs.list_jobs())
+        self.assertEqual([], jobs._queue)
+        self.assertEqual(before_disk, _read_json(journal) if journal.exists() else None)
+
+    def test_progress_and_terminal_write_failures_keep_memory_and_disk_unchanged(self) -> None:
+        jobs = self.jobs
+        jobs.initialize(self.data_root, start_worker=False)
+        job_id = jobs.enqueue("playlist", "Playlist", [_track("1")], mode="append", start_worker=False)
+        jobs.mark_running(job_id)
+        before_progress = jobs.get_job(job_id)
+        before_disk = _read_json(self.data_root / "jobs.json")
+
+        def fail_write(_path: Path, _payload: object, **_kwargs) -> None:
+            raise RuntimeError("journal write failed generated-token-" + uuid.uuid4().hex)
+
+        jobs._write_json = fail_write
+        with self.assertRaises(Exception):
+            jobs.mark_item_complete(job_id, _track("1"), ok=False, error="raw " + str(self.data_root), quality="")
+        self.assertEqual(before_progress, jobs.get_job(job_id))
+        self.assertEqual(before_disk, _read_json(self.data_root / "jobs.json"))
+
+        jobs._write_json = jobs._real_atomic_write_json
+        jobs.mark_item_complete(job_id, _track("1"), ok=False, error="synthetic failed", quality="")
+        before_terminal = jobs.get_job(job_id)
+        before_disk = _read_json(self.data_root / "jobs.json")
+        jobs._write_json = fail_write
+        with self.assertRaises(Exception):
+            jobs.mark_terminal(job_id, outcome="failed", error={"code": "failed", "message": str(self.data_root)})
+        self.assertEqual(before_terminal, jobs.get_job(job_id))
+        self.assertEqual(before_disk, _read_json(self.data_root / "jobs.json"))
+
+    def test_invalid_terminal_outcome_and_duplicate_progress_do_not_write(self) -> None:
+        jobs = self.jobs
+        writes: list[object] = []
+
+        def recorder(path: Path, payload: object, **kwargs) -> None:
+            writes.append(json.loads(json.dumps(payload)))
+            jobs._real_atomic_write_json(path, payload, **kwargs)
+
+        jobs.initialize(self.data_root, start_worker=False, write_json=recorder)
+        job_id = jobs.enqueue("playlist", "Playlist", [_track("1")], mode="append", start_worker=False)
+        jobs.mark_running(job_id)
+        jobs.mark_item_complete(job_id, _track("1"), ok=True, error="", quality="flac")
+        count_after_first_progress = len(writes)
+        before_duplicate = jobs.get_job(job_id)
+        jobs.mark_item_complete(job_id, _track("1"), ok=False, error="duplicate", quality="")
+        self.assertEqual(count_after_first_progress, len(writes))
+        self.assertEqual(before_duplicate, jobs.get_job(job_id))
+
+        before_invalid = jobs.get_job(job_id)
+        with self.assertRaises(Exception):
+            jobs.mark_terminal(job_id, outcome="nonsense")
+        self.assertEqual(before_invalid, jobs.get_job(job_id))
+        self.assertEqual(count_after_first_progress, len(writes))
+
+    def test_start_worker_false_reinitialize_stops_stale_worker_from_consuming_new_queue(self) -> None:
+        jobs = self.jobs
+        old_root = self.data_root / "old"
+        new_root = self.data_root / "new"
+        calls: list[str] = []
+        sleeper_ready = threading.Event()
+        release_sleep = threading.Event()
+
+        def fake_sleep(_seconds: float) -> None:
+            sleeper_ready.set()
+            release_sleep.wait(0.01)
+
+        def fake_process(*_args, **_kwargs):
+            calls.append("processed")
+            return True, "", "flac"
+
+        jobs.initialize(old_root, start_worker=False)
+        with (
+            patch.object(jobs.time, "sleep", fake_sleep),
+            patch.object(jobs, "playlist_dir", return_value=Path(self.tmp.name) / "playlist"),
+            patch.object(jobs, "_process_track", side_effect=fake_process),
+        ):
+            with jobs._lock:
+                jobs._ensure_worker_locked()
+            self.assertTrue(sleeper_ready.wait(1))
+            jobs.initialize(new_root, start_worker=False)
+            job_id = jobs.enqueue("playlist", "Playlist", [_track("1")], mode="append", start_worker=False)
+            release_sleep.set()
+            threading.Event().wait(0.05)
+
+        self.assertEqual([], calls)
+        self.assertEqual("queued", jobs.get_job(job_id)["state"])
+        self.assertEqual([job_id], jobs._queue)
+
+    def test_reinitialize_does_not_let_old_inflight_worker_mutate_new_journal(self) -> None:
+        jobs = self.jobs
+        old_root = self.data_root / "old-inflight"
+        new_root = self.data_root / "new-inflight"
+        entered = threading.Event()
+        release = threading.Event()
+
+        def fake_process(*_args, **_kwargs):
+            entered.set()
+            release.wait(1)
+            return True, "", "flac"
+
+        jobs.initialize(old_root, start_worker=False)
+        with (
+            patch.object(jobs, "playlist_dir", return_value=Path(self.tmp.name) / "playlist"),
+            patch.object(jobs, "_process_track", side_effect=fake_process),
+        ):
+            old_id = jobs.enqueue("playlist", "Playlist", [_track("1")], mode="append", start_worker=True)
+            self.assertTrue(entered.wait(1))
+            jobs.initialize(new_root, start_worker=False)
+            new_id = jobs.enqueue("playlist", "Playlist", [_track("2")], mode="append", start_worker=False)
+            release.set()
+            threading.Event().wait(0.05)
+
+        self.assertIsNone(jobs.get_job(old_id))
+        self.assertEqual("queued", jobs.get_job(new_id)["state"])
+        self.assertEqual([], jobs.get_job(new_id)["results"])
+
+    def test_worker_exception_persists_only_public_error_text(self) -> None:
+        jobs = self.jobs
+        jobs.initialize(self.data_root, start_worker=False)
+        with tempfile.TemporaryDirectory(prefix="deckpipe-worker-sanitize-") as temporary:
+            playlist = Path(temporary) / "playlist"
+            playlist.mkdir()
+            secretish = "generated-token-" + uuid.uuid4().hex
+            stage_name = "Track.deckpipe-stage-owned.part.flac"
+            processed = threading.Event()
+
+            def raising_process(*_args, **_kwargs):
+                processed.set()
+                raise RuntimeError("raw failure " + str(playlist / stage_name) + " " + secretish)
+
+            with (
+                patch.object(jobs, "playlist_dir", return_value=playlist),
+                patch.object(jobs, "_process_track", side_effect=raising_process),
+            ):
+                job_id = jobs.enqueue("playlist", "Playlist", [_track("1")], mode="append", start_worker=True)
+                self.assertTrue(processed.wait(1))
+                deadline = time.time() + 1
+                while time.time() < deadline and jobs.get_job(job_id)["state"] != "done":
+                    threading.Event().wait(0.01)
+
+            job = jobs.get_job(job_id)
+            persisted = json.dumps(_read_json(self.data_root / "jobs.json"), ensure_ascii=False)
+            combined = json.dumps(job, ensure_ascii=False) + persisted
+            self.assertEqual("done", job["state"])
+            self.assertNotIn(str(playlist), combined)
+            self.assertNotIn(stage_name, combined)
+            self.assertNotIn(secretish, combined)
+            self.assertNotIn(".deckpipe-stage-", combined)
+
     def test_progress_requires_running_and_provider_qualified_results_do_not_collide(self) -> None:
         jobs = self.jobs
         jobs.initialize(self.data_root, start_worker=False)
@@ -487,6 +824,91 @@ class DurableJobJournalTests(unittest.TestCase):
             self.assertEqual("succeeded", job["outcome"])
             self.assertEqual("reconciled", job["results"][0]["quality"])
             self.assertEqual([], reloaded.pending_track_ids(job_id))
+
+    def test_restart_reconciles_duplicate_provider_once_and_same_raw_id_per_provider(self) -> None:
+        jobs = self.jobs
+        jobs.initialize(self.data_root, start_worker=False)
+        with tempfile.TemporaryDirectory(prefix="deckpipe-reconcile-dedupe-") as temporary:
+            from app import library
+
+            playlist = Path(temporary) / "playlist"
+            playlist.mkdir()
+            dz = playlist / "Deezer Artist - Same.flac"
+            sc = playlist / "SC Artist - Same.mp3"
+            dz.write_bytes(b"ready")
+            sc.write_bytes(b"ready")
+            library.save_sidecar(
+                playlist,
+                {
+                    "tracks": {
+                        "1": {"status": "ok", "file": dz.name, "provider": "deezer", "title": "Same"},
+                        "sc:1": {"status": "ok", "file": sc.name, "provider": "sc", "title": "Same"},
+                    }
+                },
+            )
+            tracks = [_track("1", "deezer"), _track("1", "deezer"), _track("1", "sc")]
+            with patch.object(jobs, "playlist_dir", return_value=playlist):
+                job_id = jobs.enqueue("playlist", "Playlist", tracks, mode="append", start_worker=False)
+                reloaded = importlib.reload(jobs)
+                with patch.object(reloaded, "playlist_dir", return_value=playlist):
+                    reloaded.initialize(self.data_root, start_worker=False)
+
+            job = reloaded.get_job(job_id)
+            self.assertEqual("done", job["state"])
+            self.assertEqual(2, job["done"])
+            self.assertEqual(["deezer:1", "sc:1"], [item["key"] for item in job["results"]])
+
+    def test_malformed_nested_journal_recovers_valid_backup(self) -> None:
+        jobs = self.jobs
+        jobs.initialize(self.data_root, start_worker=False)
+        valid_id = jobs.enqueue("playlist", "Playlist", [_track("1")], mode="append", start_worker=False)
+        journal = self.data_root / "jobs.json"
+        backup = self.data_root / "jobs.json.bak"
+        valid_backup = backup.read_bytes()
+        malformed_cases = [
+            {"version": 1, "jobs": {"bad": {"id": "bad", "state": "queued", "outcome": "pending", "tracks": [], "results": []}}},
+            {"version": 1, "jobs": {"bad": {"id": "bad", "playlist_id": "p", "title": "t", "state": "queued", "outcome": "pending", "mode": "append", "created_at": 1, "total": 1, "done": 2, "failed": 0, "tracks": [], "results": [], "current": None, "terminal_error": None}}},
+            {"version": 1, "jobs": {"bad": {"id": "bad", "playlist_id": "p", "title": "t", "state": "done", "outcome": "pending", "mode": "append", "created_at": 1, "total": 1, "done": 0, "failed": 0, "tracks": [], "results": [], "current": None, "terminal_error": None}}},
+            {"version": 1, "jobs": {"bad": {"id": "bad", "playlist_id": "p", "title": "t", "state": "queued", "outcome": "pending", "mode": "append", "created_at": 1, "total": 1, "done": 0, "failed": 0, "tracks": [{"id": "", "title": "t"}], "results": [], "current": None, "terminal_error": None}}},
+            {
+                "version": 1,
+                "jobs": {
+                    "bad": {
+                        "id": "bad",
+                        "playlist_id": "p",
+                        "title": "t",
+                        "state": "done",
+                        "outcome": "failed",
+                        "mode": "append",
+                        "created_at": 1,
+                        "total": 1,
+                        "done": 1,
+                        "failed": 1,
+                        "tracks": [{"id": "1", "title": "t", "provider": "deezer"}],
+                        "results": [
+                            {
+                                "id": "1",
+                                "provider": "bad/provider",
+                                "key": "1",
+                                "title": "t",
+                                "ok": False,
+                                "error": "",
+                                "quality": "",
+                            }
+                        ],
+                        "current": None,
+                        "terminal_error": {"code": "failed"},
+                    }
+                },
+            },
+        ]
+
+        for payload in malformed_cases:
+            journal.write_text(json.dumps(payload), encoding="utf-8")
+            reloaded = importlib.reload(jobs)
+            reloaded.initialize(self.data_root, start_worker=False)
+            self.assertIsNotNone(reloaded.get_job(valid_id))
+            self.assertEqual(valid_backup, backup.read_bytes())
 
     def test_default_flip_entrypoints_are_disabled_until_task5(self) -> None:
         jobs = self.jobs
@@ -542,6 +964,107 @@ class DurableJobJournalTests(unittest.TestCase):
             self.assertTrue(ok)
             self.assertEqual("wav", quality)
             self.assertEqual("source.wav", observed["sidecar_at_unlink"])
+
+    def test_wav_delete_unlink_failure_keeps_ready_wav_and_source_not_deleted_flag(self) -> None:
+        jobs = self.jobs
+        with tempfile.TemporaryDirectory(prefix="deckpipe-wav-delete-unlink-fail-") as temporary:
+            from app import library
+
+            playlist = Path(temporary) / "playlist"
+            playlist.mkdir()
+
+            source = playlist / "source.flac"
+            source.write_bytes(b"source")
+            wav = playlist / "source.wav"
+            wav.write_bytes(b"wav")
+            library.save_sidecar(
+                playlist,
+                {
+                    "tracks": {
+                        "1": {
+                            "status": "verify_failed_convert",
+                            "file": source.name,
+                            "source_file": source.name,
+                            "duration_actual": 180.0,
+                            "provider": "deezer",
+                        }
+                    }
+                },
+            )
+
+            def fake_unlink(self_path: Path, *args, **kwargs):
+                if self_path == source:
+                    raise PermissionError("synthetic unlink denied " + str(source))
+                return original_unlink(self_path, *args, **kwargs)
+
+            original_unlink = Path.unlink
+            with (
+                patch.object(jobs, "_wav_step", return_value=(wav, "")),
+                patch.object(jobs, "_wav_mode", return_value="wav_delete"),
+                patch.object(Path, "unlink", fake_unlink),
+            ):
+                ok, err, _quality = jobs._process_track(
+                    {"mode": "append"}, playlist, _track("1"), {"ds": None}, {"base": 0, "n": 0, "digits": 2}
+                )
+
+            self.assertTrue(ok)
+            self.assertEqual("", err)
+            entry = library.load_sidecar(playlist)["tracks"]["1"]
+            self.assertEqual("ok", entry["status"])
+            self.assertEqual(wav.name, entry["file"])
+            self.assertFalse(entry.get("source_deleted"))
+            self.assertTrue(source.exists())
+
+    def test_wav_delete_fresh_unlink_failure_keeps_completed_wav_ready(self) -> None:
+        jobs = self.jobs
+        with tempfile.TemporaryDirectory(prefix="deckpipe-wav-delete-fresh-unlink-fail-") as temporary:
+            from app import library
+
+            playlist = Path(temporary) / "playlist"
+            playlist.mkdir()
+            stage = playlist / "Artist 1 - Title 1.deckpipe-stage-owned.part.flac"
+            source = playlist / "Artist 1 - Title 1.flac"
+            wav = playlist / "Artist 1 - Title 1.wav"
+            wav.write_bytes(b"wav")
+            conversion_done = False
+
+            class FakeSession:
+                def download_track(self, _track_id, _out_dir, prefer="FLAC"):
+                    stage.write_bytes(b"source")
+                    return stage, "FLAC", {"DURATION": "180", "SNG_TITLE": "Title 1", "ART_NAME": "Artist 1"}
+
+            def fake_wav_step(fpath: Path, _actual: float):
+                nonlocal conversion_done
+                self.assertEqual(source, fpath)
+                conversion_done = True
+                return wav, ""
+
+            def fake_unlink(self_path: Path, *args, **kwargs):
+                if conversion_done and self_path == source:
+                    raise PermissionError("synthetic unlink denied " + str(source))
+                return original_unlink(self_path, *args, **kwargs)
+
+            original_unlink = Path.unlink
+            with (
+                patch.object(jobs, "get_session", return_value=FakeSession()),
+                patch.object(jobs, "verify_file", return_value=(True, "", 180.0)),
+                patch.object(jobs, "_numbering_on", return_value=False),
+                patch.object(jobs, "_wav_step", side_effect=fake_wav_step),
+                patch.object(jobs, "_wav_mode", return_value="wav_delete"),
+                patch.object(Path, "unlink", fake_unlink),
+                patch("app.tagger.write_tags", lambda _path, _meta: None),
+            ):
+                ok, err, _quality = jobs._process_track(
+                    {"mode": "append"}, playlist, _track("1"), {"ds": None}, {"base": 0, "n": 0, "digits": 2}
+                )
+
+            self.assertTrue(ok)
+            self.assertEqual("", err)
+            entry = library.load_sidecar(playlist)["tracks"]["1"]
+            self.assertEqual("ok", entry["status"])
+            self.assertEqual(wav.name, entry["file"])
+            self.assertFalse(entry.get("source_deleted"))
+            self.assertTrue(source.exists())
 
 
 if __name__ == "__main__":

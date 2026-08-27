@@ -106,7 +106,18 @@ def is_ready_entry(pl_dir: Path, entry: dict) -> bool:
     name = entry.get("file", "")
     if not isinstance(name, str) or not name or is_partial_path(name):
         return False
-    return (Path(pl_dir) / name).exists()
+    rel = Path(name)
+    if rel.is_absolute() or rel.name != name:
+        return False
+    candidate = Path(pl_dir) / rel
+    try:
+        root = Path(pl_dir).resolve()
+        resolved = candidate.resolve()
+        if resolved != root and root not in resolved.parents:
+            return False
+    except Exception:
+        return False
+    return candidate.is_file()
 
 
 def get_last_scan_counters() -> dict[str, int]:

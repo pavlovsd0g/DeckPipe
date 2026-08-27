@@ -66,8 +66,8 @@ def sc_validate(token: str) -> dict:
     """Проверяет oauth_token на /me (с ретраями при рейт-лимите)."""
     try:
         return _api_get("/me", token)
-    except Exception as e:
-        raise RuntimeError(f"токен не принят ({e})")
+    except Exception:
+        raise RuntimeError("SoundCloud token was not accepted")
 
 
 def sc_account_playlists(token: str) -> list:
@@ -154,6 +154,26 @@ def _bind_cookiejar(ytdl, opts: dict) -> None:
     jar = opts.get("cookiejar")
     if jar is not None:
         ytdl.__dict__["cookiejar"] = jar
+
+
+def _current_stage_candidates(out_dir: Path, stage_prefix: str) -> list[Path]:
+    try:
+        entries = list(Path(out_dir).iterdir())
+    except FileNotFoundError:
+        return []
+    return sorted(
+        [p for p in entries if p.name.startswith(stage_prefix) and is_partial_path(p)],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def _is_current_stage_path(path: Path, out_dir: Path, stage_prefix: str) -> bool:
+    path = Path(path)
+    try:
+        return path.parent.resolve() == Path(out_dir).resolve() and path.name.startswith(stage_prefix) and is_partial_path(path)
+    except Exception:
+        return False
 
 
 def _track_from_api(t: dict) -> dict:
@@ -323,14 +343,13 @@ def download_track(track: dict, out_dir: Path):
             info = y.extract_info(track["url"], download=True)
             fpath = Path(y.prepare_filename(info))
     except Exception:
-        cleanup_owned_stages(*out_dir.glob(stage_prefix + "*"))
+        cleanup_owned_stages(*_current_stage_candidates(out_dir, stage_prefix))
         raise RuntimeError("SoundCloud download failed") from None
     # yt-dlp может поменять расширение после пост-обработки
-    if not fpath.exists():
-        cands = sorted([p for p in out_dir.glob(stage_prefix + "*") if is_partial_path(p)],
-                       key=lambda p: p.stat().st_mtime, reverse=True)
+    if not fpath.exists() or not _is_current_stage_path(fpath, out_dir, stage_prefix):
+        cands = _current_stage_candidates(out_dir, stage_prefix)
         if not cands:
-            cleanup_owned_stages(*out_dir.glob(stage_prefix + "*"))
+            cleanup_owned_stages(*_current_stage_candidates(out_dir, stage_prefix))
             raise RuntimeError("SoundCloud download failed")
         fpath = cands[0]
     return fpath, fpath.suffix.lstrip(".").lower(), float(info.get("duration") or 0), info

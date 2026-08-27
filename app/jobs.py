@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
+import re
 import threading
 import time
 import uuid
@@ -32,6 +34,23 @@ _journal_path: Path | None = None
 _start_worker_default = True
 _write_json = atomic_write_json
 _real_atomic_write_json = atomic_write_json
+_worker_thread: threading.Thread | None = None
+_worker_generation = 0
+_worker_stop = threading.Event()
+
+_VALID_STATES = {"queued", "running", "done"}
+_VALID_OUTCOMES = {"pending", "succeeded", "partial_failure", "failed", "interrupted"}
+_TERMINAL_OUTCOMES = {"succeeded", "partial_failure", "failed", "interrupted"}
+_VALID_MODES = {"append", "playlist_order", "flip_to_wav", "flip_to_source"}
+_SAFE_PROVIDER_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_DIRTY_ERROR_RE = re.compile(
+    r"(\.deckpipe-stage-|\.part\.|generated-[A-Za-z0-9_-]*|signed-url|[A-Za-z]:[\\/]|https?://|\b(token|secret|credential|arl)\b)",
+    re.IGNORECASE,
+)
+
+
+class _StaleWorker(RuntimeError):
+    pass
 
 
 def _now():
@@ -50,45 +69,77 @@ def _validate_journal(payload: object) -> dict:
     for job_id, job in jobs.items():
         if not isinstance(job_id, str) or not isinstance(job, dict):
             raise ValueError("invalid journal")
-        if job.get("state") not in ("queued", "running", "done"):
+        clean_job = dict(job)
+        if clean_job.get("id") != job_id:
             raise ValueError("invalid journal")
-        if job.get("outcome", "pending") not in ("pending", "succeeded", "partial_failure", "failed", "interrupted"):
+        if not _safe_string(clean_job.get("playlist_id")) or not _safe_string(clean_job.get("title")):
             raise ValueError("invalid journal")
-        if not isinstance(job.get("results", []), list) or not isinstance(job.get("tracks", []), list):
+        if clean_job.get("mode") not in _VALID_MODES:
             raise ValueError("invalid journal")
-        if any(not isinstance(item, dict) for item in job.get("results", [])):
+        if clean_job.get("state") not in _VALID_STATES or clean_job.get("outcome") not in _VALID_OUTCOMES:
             raise ValueError("invalid journal")
-        if any(not isinstance(item, dict) for item in job.get("tracks", [])):
+        if clean_job["state"] == "done":
+            if clean_job["outcome"] not in _TERMINAL_OUTCOMES:
+                raise ValueError("invalid journal")
+        elif clean_job["outcome"] != "pending":
             raise ValueError("invalid journal")
-        clean["jobs"][job_id] = dict(job)
+        if not _finite_number(clean_job.get("created_at")):
+            raise ValueError("invalid journal")
+        for field in ("total", "done", "failed"):
+            if not _nonnegative_int(clean_job.get(field)):
+                raise ValueError("invalid journal")
+        if clean_job["failed"] > clean_job["done"] or clean_job["done"] > clean_job["total"]:
+            raise ValueError("invalid journal")
+        if clean_job.get("current") is not None and not isinstance(clean_job.get("current"), str):
+            raise ValueError("invalid journal")
+        tracks = clean_job.get("tracks")
+        results = clean_job.get("results")
+        if not isinstance(tracks, list) or not isinstance(results, list):
+            raise ValueError("invalid journal")
+        clean_job["tracks"] = [_validate_track_item(item) for item in tracks]
+        clean_job["results"] = [_validate_result_item(item) for item in results]
+        if clean_job["state"] == "done" and clean_job["outcome"] != "succeeded":
+            clean_job["terminal_error"] = _validate_terminal_error(clean_job.get("terminal_error"))
+        elif clean_job.get("terminal_error") is not None:
+            if clean_job["state"] != "done":
+                raise ValueError("invalid journal")
+            clean_job["terminal_error"] = _validate_terminal_error(clean_job.get("terminal_error"))
+        else:
+            clean_job["terminal_error"] = None
+        clean["jobs"][job_id] = clean_job
     return clean
 
 
 def initialize(data_root: Path | None = None, *, start_worker: bool = True, write_json=None) -> None:
-    global _initialized, _journal_path, _start_worker_default, _write_json, _jobs, _queue, _worker_started
+    global _initialized, _journal_path, _start_worker_default, _write_json, _jobs, _queue
+    global _worker_started, _worker_generation, _worker_stop, _worker_thread
     if data_root is None:
         raise RuntimeError("DeckPipe jobs require an explicit data root")
     with _lock:
-        _journal_path = Path(data_root) / "jobs.json"
-        _start_worker_default = start_worker
-        _write_json = write_json or atomic_write_json
+        _worker_stop.set()
+        _worker_generation += 1
+        _worker_stop = threading.Event()
+        _worker_thread = None
+        _worker_started = False
+        journal_path = Path(data_root) / "jobs.json"
+        writer = write_json or atomic_write_json
         _worker_started = False
         payload, recovered = atomic_load_json(
-            _journal_path,
+            journal_path,
             default={"version": JOURNAL_VERSION, "jobs": {}},
             validator=_validate_journal,
             backup=True,
             return_recovered=True,
         )
-        _jobs = {job_id: _normalize_job(job) for job_id, job in payload["jobs"].items()}
-        _queue = []
+        loaded_jobs = {job_id: _normalize_job(job) for job_id, job in payload["jobs"].items()}
+        loaded_queue = []
         changed = False
-        for job_id, job in _jobs.items():
+        for job_id, job in loaded_jobs.items():
             if job.get("state") in ("queued", "running"):
                 if job.get("mode") in IDEMPOTENT_DOWNLOAD_MODES:
-                    if _reconcile_ready_items_locked(job_id):
+                    if _reconcile_ready_items_in_jobs(loaded_jobs, job_id):
                         changed = True
-                    if not pending_track_ids(job_id):
+                    if not _pending_track_ids_from_job(job):
                         job["state"] = "done"
                         job["outcome"] = "succeeded" if job.get("failed", 0) == 0 else "partial_failure"
                         job["current"] = None
@@ -97,8 +148,8 @@ def initialize(data_root: Path | None = None, *, start_worker: bool = True, writ
                     job["state"] = "queued"
                     job["outcome"] = "pending"
                     job["current"] = None
-                    if pending_track_ids(job_id):
-                        _queue.append(job_id)
+                    if _pending_track_ids_from_job(job):
+                        loaded_queue.append(job_id)
                     changed = True
                 else:
                     job["state"] = "done"
@@ -109,11 +160,85 @@ def initialize(data_root: Path | None = None, *, start_worker: bool = True, writ
                         "message": "Job interrupted by restart and was not resumed",
                     }
                     changed = True
-        _initialized = True
         if changed:
-            _persist_locked(backup=not recovered)
+            writer(journal_path, {"version": JOURNAL_VERSION, "jobs": loaded_jobs}, validator=_validate_journal, backup=not recovered)
+        _journal_path = journal_path
+        _start_worker_default = start_worker
+        _write_json = writer
+        _jobs = loaded_jobs
+        _queue = loaded_queue
+        _initialized = True
         if start_worker and _queue:
             _ensure_worker_locked()
+
+
+def _safe_string(value: object, *, allow_empty: bool = False) -> bool:
+    return isinstance(value, str) and (allow_empty or value != "")
+
+
+def _finite_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)) and float(value) >= 0
+
+
+def _nonnegative_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _valid_provider(provider: object) -> bool:
+    return isinstance(provider, str) and bool(_SAFE_PROVIDER_RE.match(provider))
+
+
+def _validate_track_item(item: object) -> dict:
+    if not isinstance(item, dict):
+        raise ValueError("invalid journal")
+    track = dict(item)
+    if not _safe_string(str(track.get("id")) if track.get("id") is not None else None):
+        raise ValueError("invalid journal")
+    if not _safe_string(track.get("title"), allow_empty=True):
+        raise ValueError("invalid journal")
+    provider = track.get("provider", "deezer")
+    if not _valid_provider(provider):
+        raise ValueError("invalid journal")
+    track["id"] = str(track["id"])
+    track["provider"] = provider
+    for field in ("artist", "album", "url"):
+        if field in track and not isinstance(track.get(field), str):
+            raise ValueError("invalid journal")
+    return track
+
+
+def _validate_result_item(item: object) -> dict:
+    if not isinstance(item, dict):
+        raise ValueError("invalid journal")
+    result = dict(item)
+    if not _safe_string(str(result.get("id")) if result.get("id") is not None else None):
+        raise ValueError("invalid journal")
+    provider = result.get("provider", "deezer")
+    if not _valid_provider(provider):
+        raise ValueError("invalid journal")
+    key = str(result.get("key") or f"{provider}:{result.get('id')}")
+    if key != f"{provider}:{result.get('id')}":
+        raise ValueError("invalid journal")
+    if not isinstance(result.get("ok"), bool):
+        raise ValueError("invalid journal")
+    for field in ("title", "error", "quality"):
+        if not isinstance(result.get(field, ""), str):
+            raise ValueError("invalid journal")
+    result["id"] = str(result["id"])
+    result["provider"] = provider
+    result["key"] = key
+    result["error"] = _sanitize_public_text(result.get("error", ""), fallback="operation failed")
+    return result
+
+
+def _validate_terminal_error(error: object) -> dict:
+    if not isinstance(error, dict):
+        raise ValueError("invalid journal")
+    code = error.get("code")
+    message = error.get("message")
+    if not _safe_string(code) or not _safe_string(message):
+        raise ValueError("invalid journal")
+    return {"code": code, "message": _sanitize_public_text(message, fallback="Job failed")}
 
 
 def _normalize_job(job: dict) -> dict:
@@ -133,6 +258,27 @@ def _result_key(track: dict) -> str:
     return f"{track.get('provider', 'deezer')}:{track.get('id')}"
 
 
+def _sanitize_public_text(value: object, *, fallback: str) -> str:
+    text = value if isinstance(value, str) else ""
+    if not text:
+        return ""
+    if _DIRTY_ERROR_RE.search(text):
+        return fallback
+    return text
+
+
+def _sanitize_terminal_error(error: dict | None, *, outcome: str) -> dict | None:
+    if outcome == "succeeded":
+        return None
+    if not isinstance(error, dict):
+        return {"code": outcome, "message": "Job failed"}
+    code = str(error.get("code") or outcome)
+    if not _SAFE_PROVIDER_RE.match(code):
+        code = outcome
+    message = _sanitize_public_text(error.get("message", ""), fallback="Job failed") or "Job failed"
+    return {"code": code, "message": message}
+
+
 def _require_initialized() -> None:
     if not _initialized or _journal_path is None:
         raise RuntimeError("DeckPipe jobs are not initialized")
@@ -148,11 +294,29 @@ def _persist_locked(*, backup: bool = True) -> None:
     _write_json(_journal_path, payload, validator=_validate_journal, backup=backup)
 
 
+def _write_jobs_candidate_locked(candidate_jobs: dict[str, dict], *, backup: bool = True) -> None:
+    _require_initialized()
+    _write_json(_journal_path, {"version": JOURNAL_VERSION, "jobs": candidate_jobs}, validator=_validate_journal, backup=backup)
+
+
+def _publish_jobs_locked(candidate_jobs: dict[str, dict], candidate_queue: list[str] | None = None) -> None:
+    global _jobs, _queue
+    _jobs = candidate_jobs
+    if candidate_queue is not None:
+        _queue = candidate_queue
+
+
+def _check_generation_locked(generation: int | None) -> None:
+    if generation is not None and generation != _worker_generation:
+        raise _StaleWorker()
+
+
 def _ensure_worker_locked() -> None:
-    global _worker_started
-    if not _worker_started:
+    global _worker_started, _worker_thread
+    if not _worker_started or _worker_thread is None or not _worker_thread.is_alive():
         _worker_started = True
-        threading.Thread(target=_worker, daemon=True).start()
+        _worker_thread = threading.Thread(target=_worker, args=(_worker_generation, _worker_stop), daemon=True)
+        _worker_thread.start()
 
 
 def _queue_job_locked(job_id: str, *, start_worker: bool | None) -> None:
@@ -190,9 +354,16 @@ def enqueue(
         "terminal_error": None,
     }
     with _lock:
-        _jobs[job_id] = job
-        _queue_job_locked(job_id, start_worker=start_worker)
-        _persist_locked()
+        candidate_jobs = copy.deepcopy(_jobs)
+        candidate_queue = list(_queue)
+        candidate_jobs[job_id] = job
+        if job_id not in candidate_queue:
+            candidate_queue.append(job_id)
+        should_start = _start_worker_default if start_worker is None else start_worker
+        _write_jobs_candidate_locked(candidate_jobs)
+        _publish_jobs_locked(candidate_jobs, candidate_queue)
+        if should_start:
+            _ensure_worker_locked()
     return job_id
 
 
@@ -208,12 +379,20 @@ def list_jobs():
 
 def pending_track_ids(job_id: str) -> list[dict]:
     job = _jobs[job_id]
+    return _pending_track_ids_from_job(job)
+
+
+def _pending_track_ids_from_job(job: dict) -> list[dict]:
     completed = {str(item.get("key") or f"{item.get('provider', 'deezer')}:{item.get('id')}") for item in job.get("results", [])}
     return [dict(t) for t in job.get("tracks", []) if _result_key(t) not in completed]
 
 
 def _reconcile_ready_items_locked(job_id: str) -> bool:
-    job = _jobs[job_id]
+    return _reconcile_ready_items_in_jobs(_jobs, job_id)
+
+
+def _reconcile_ready_items_in_jobs(jobs_map: dict[str, dict], job_id: str) -> bool:
+    job = jobs_map[job_id]
     if job.get("mode") not in IDEMPOTENT_DOWNLOAD_MODES:
         return False
     changed = False
@@ -243,23 +422,28 @@ def _reconcile_ready_items_locked(job_id: str) -> bool:
                 }
             )
             job["done"] += 1
+            results_by_key.add(key)
             changed = True
     return changed
 
 
-def mark_running(job_id: str) -> None:
+def mark_running(job_id: str, *, _generation: int | None = None) -> None:
     with _lock:
+        _check_generation_locked(_generation)
         job = _jobs[job_id]
         if job["state"] == "done":
             raise RuntimeError("terminal job cannot run again")
         if job["state"] == "queued":
-            job["state"] = "running"
-            job["outcome"] = "pending"
-            _persist_locked()
+            candidate_jobs = copy.deepcopy(_jobs)
+            candidate_jobs[job_id]["state"] = "running"
+            candidate_jobs[job_id]["outcome"] = "pending"
+            _write_jobs_candidate_locked(candidate_jobs)
+            _publish_jobs_locked(candidate_jobs)
 
 
-def mark_item_complete(job_id: str, track: dict, *, ok: bool, error: str, quality: str) -> None:
+def mark_item_complete(job_id: str, track: dict, *, ok: bool, error: str, quality: str, _generation: int | None = None) -> None:
     with _lock:
+        _check_generation_locked(_generation)
         job = _jobs[job_id]
         if job["state"] != "running":
             raise RuntimeError("terminal job cannot accept progress")
@@ -268,35 +452,54 @@ def mark_item_complete(job_id: str, track: dict, *, ok: bool, error: str, qualit
         key = _result_key(track)
         if any(str(item.get("key") or f"{item.get('provider', 'deezer')}:{item.get('id')}") == key for item in job["results"]):
             return
-        else:
-            job["results"].append(
-                {
-                    "id": track_id,
-                    "provider": provider,
-                    "key": key,
-                    "title": track.get("title", ""),
-                    "ok": bool(ok),
-                    "error": error,
-                    "quality": quality,
-                }
-            )
-            job["done"] += 1
-            if not ok:
-                job["failed"] += 1
-        job["current"] = None
-        _persist_locked()
+        candidate_jobs = copy.deepcopy(_jobs)
+        candidate = candidate_jobs[job_id]
+        candidate["results"].append(
+            {
+                "id": track_id,
+                "provider": provider,
+                "key": key,
+                "title": track.get("title", ""),
+                "ok": bool(ok),
+                "error": _sanitize_public_text(error, fallback="operation failed"),
+                "quality": quality,
+            }
+        )
+        candidate["done"] += 1
+        if not ok:
+            candidate["failed"] += 1
+        candidate["current"] = None
+        _write_jobs_candidate_locked(candidate_jobs)
+        _publish_jobs_locked(candidate_jobs)
 
 
-def mark_terminal(job_id: str, *, outcome: str, error: dict | None = None) -> None:
+def mark_terminal(job_id: str, *, outcome: str, error: dict | None = None, _generation: int | None = None) -> None:
+    if outcome not in _TERMINAL_OUTCOMES:
+        raise RuntimeError("invalid terminal outcome")
     with _lock:
+        _check_generation_locked(_generation)
         job = _jobs[job_id]
         if job["state"] == "done":
             raise RuntimeError("terminal job cannot transition again")
-        job["state"] = "done"
-        job["outcome"] = outcome
-        job["current"] = None
-        job["terminal_error"] = copy.deepcopy(error)
-        _persist_locked()
+        candidate_jobs = copy.deepcopy(_jobs)
+        candidate = candidate_jobs[job_id]
+        candidate["state"] = "done"
+        candidate["outcome"] = outcome
+        candidate["current"] = None
+        candidate["terminal_error"] = _sanitize_terminal_error(copy.deepcopy(error), outcome=outcome)
+        _write_jobs_candidate_locked(candidate_jobs)
+        _publish_jobs_locked(candidate_jobs)
+
+
+def mark_current(job_id: str, title: object, *, _generation: int | None = None) -> None:
+    with _lock:
+        _check_generation_locked(_generation)
+        if job_id not in _jobs or _jobs[job_id].get("state") != "running":
+            return
+        candidate_jobs = copy.deepcopy(_jobs)
+        candidate_jobs[job_id]["current"] = title if isinstance(title, str) else None
+        _write_jobs_candidate_locked(candidate_jobs)
+        _publish_jobs_locked(candidate_jobs)
 
 
 def _set_track(pl_dir, tid, **kw):
@@ -336,7 +539,7 @@ def _wav_step(fpath: Path, reference_duration: float):
             return None, _public_error("conversion")
         final = publish_staged_file(stage, final_path_from_stage(stage))
         return final, ""
-    except Exception as e:
+    except Exception:
         cleanup_owned_stages(stage)
         return None, _public_error("conversion")
 
@@ -356,6 +559,17 @@ def _public_error(kind: str) -> str:
     }.get(kind, "operation failed")
 
 
+def _publish_wav_delete_state(pl_dir: Path, tid: str, source: Path, provider: str, entry: dict) -> None:
+    next_entry = dict(entry)
+    next_entry["provider"] = provider
+    _set_track(pl_dir, tid, **next_entry, source_deleted=False)
+    try:
+        source.unlink(missing_ok=True)
+    except Exception:
+        return
+    _set_track(pl_dir, tid, source_deleted=True, provider=provider)
+
+
 def _process_track(job, pl_dir, t, ds_holder, counter):
     from .tagger import write_tags, _meta_from_deezer, _meta_from_sc
 
@@ -371,11 +585,18 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
             src_actual = prev.get("duration_actual") or expected
             wav, werr = _wav_step(src, src_actual)
             if wav:
-                _set_track(pl_dir, tid, file=wav.name, format="wav",
-                           status="ok", error="", converted_at=_now(),
-                           source_deleted=_wav_mode() == "wav_delete", provider=provider)
                 if _wav_mode() == "wav_delete":
-                    src.unlink(missing_ok=True)
+                    _publish_wav_delete_state(
+                        pl_dir,
+                        tid,
+                        src,
+                        provider,
+                        {"file": wav.name, "format": "wav", "status": "ok", "error": "", "converted_at": _now()},
+                    )
+                else:
+                    _set_track(pl_dir, tid, file=wav.name, format="wav",
+                               status="ok", error="", converted_at=_now(),
+                               source_deleted=False, provider=provider)
                 return True, "", "wav"
             _set_track(pl_dir, tid, status="verify_failed_convert", error=werr, provider=provider)
             return False, werr, "wav"
@@ -420,7 +641,7 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
                 ok, err = True, ""
                 break
             err = _public_error("validation")
-        except Exception as e:
+        except Exception:
             err = _public_error("download")
 
     if not ok or stage_path is None:
@@ -436,7 +657,7 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
     try:
         final_path, num = _final_download_path(pl_dir, t, stage_path, job, counter)
         published = publish_staged_file(stage_path, final_path)
-    except Exception as e:
+    except Exception:
         cleanup_owned_stages(stage_path)
         _set_track(pl_dir, tid, title=t["title"], artist=t["artist"], file="",
                    format=str(quality).lower(), status="verify_failed_download",
@@ -459,12 +680,27 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
             _set_track(pl_dir, tid, **base_entry, file=published.name, format=src_format,
                        source_file=source_file_name, status="verify_failed_convert", error=werr)
             return False, werr, quality
-        _set_track(pl_dir, tid, **base_entry, file=wav.name, format="wav",
-                   source_file=source_file_name,
-                   source_deleted=_wav_mode() == "wav_delete",
-                   status="ok", error="", converted_at=_now())
         if _wav_mode() == "wav_delete":
-            published.unlink(missing_ok=True)
+            _publish_wav_delete_state(
+                pl_dir,
+                tid,
+                published,
+                provider,
+                {
+                    **base_entry,
+                    "file": wav.name,
+                    "format": "wav",
+                    "source_file": source_file_name,
+                    "status": "ok",
+                    "error": "",
+                    "converted_at": _now(),
+                },
+            )
+        else:
+            _set_track(pl_dir, tid, **base_entry, file=wav.name, format="wav",
+                       source_file=source_file_name,
+                       source_deleted=False,
+                       status="ok", error="", converted_at=_now())
         return True, "", "wav"
 
     _set_track(pl_dir, tid, **base_entry, file=published.name, format=src_format,
@@ -472,17 +708,20 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
     return True, "", quality
 
 
-def _worker():
-    while True:
+def _worker(generation: int, stop_event: threading.Event):
+    while not stop_event.is_set():
         with _lock:
+            if generation != _worker_generation:
+                return
             item = _queue.pop(0) if _queue else None
         if item is None:
             time.sleep(1)
             continue
         job_id = item
         try:
-            mark_running(job_id)
+            mark_running(job_id, _generation=generation)
             with _lock:
+                _check_generation_locked(generation)
                 job = _jobs[job_id]
                 tracks = pending_track_ids(job_id)
                 job_snapshot = copy.deepcopy(job)
@@ -493,25 +732,31 @@ def _worker():
             counter = {"base": max_position(load_sidecar(pl_dir).get("tracks", {})),
                        "n": 0, "digits": 3 if pl_total >= 100 else 2}
             for t in tracks:
-                with _lock:
-                    _jobs[job_id]["current"] = t.get("title")
-                    _persist_locked()
+                mark_current(job_id, t.get("title"), _generation=generation)
                 try:
                     ok, err, quality = _process_track(job_snapshot, pl_dir, t, ds_holder, counter)
-                except Exception as e:
-                    ok, err, quality = False, f"internal error: {e}", ""
-                mark_item_complete(job_id, t, ok=ok, error=err, quality=quality)
+                except Exception:
+                    ok, err, quality = False, _public_error("download"), ""
+                mark_item_complete(job_id, t, ok=ok, error=err, quality=quality, _generation=generation)
             with _lock:
+                _check_generation_locked(generation)
                 failed = _jobs[job_id]["failed"]
                 total = _jobs[job_id]["total"]
             outcome = "succeeded" if failed == 0 else "failed" if failed == total else "partial_failure"
             mark_terminal(job_id, outcome=outcome, error=None if outcome == "succeeded" else {
                 "code": outcome,
                 "message": "One or more tracks failed",
-            })
-        except Exception as e:
+            }, _generation=generation)
+        except _StaleWorker:
+            return
+        except Exception:
             try:
-                mark_terminal(job_id, outcome="failed", error={"code": "worker_fatal", "message": str(e)})
+                mark_terminal(
+                    job_id,
+                    outcome="failed",
+                    error={"code": "worker_fatal", "message": "Worker failed"},
+                    _generation=generation,
+                )
             except Exception:
                 pass
 
@@ -554,8 +799,10 @@ def enqueue_flip(
         "workers": workers,
     }
     with _lock:
-        _jobs[job_id] = job
-        _persist_locked()
+        candidate_jobs = copy.deepcopy(_jobs)
+        candidate_jobs[job_id] = job
+        _write_jobs_candidate_locked(candidate_jobs)
+        _publish_jobs_locked(candidate_jobs)
     should_start = _start_worker_default if start_worker is None else start_worker
     if should_start:
         threading.Thread(target=_flip_worker, args=(job_id, to_wav, workers), daemon=True).start()
@@ -615,15 +862,15 @@ def _flip_worker(job_id: str, to_wav: bool, workers: int):
 
                     ref = float(MutagenFile(str(src)).info.length)
                     stage = convert_to_wav(src)
-                    v_ok, v_err, _ = verify_file(stage, ref, tolerance=0.5)
+                    v_ok, _v_err, _ = verify_file(stage, ref, tolerance=0.5)
                     if not v_ok:
                         cleanup_owned_stages(stage)
-                        return tid, None, v_err
+                        return tid, None, _public_error("conversion")
                     wav = publish_staged_file(stage, final_path_from_stage(stage))
                     return tid, wav, ""
-                except Exception as ex:
+                except Exception:
                     cleanup_owned_stages(stage)
-                    return tid, None, str(ex)
+                    return tid, None, _public_error("conversion")
 
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 for tid, wav, err in ex.map(_conv, plan):
@@ -679,10 +926,10 @@ def _flip_worker(job_id: str, to_wav: bool, workers: int):
                 job["backup"] = str(backup)
                 job["rb_updated"] = rb_updated
                 _persist_locked()
-        except Exception as ex:
+        except Exception:
             db.rollback()
             with _lock:
-                job["error"] = f"master.db write failed: {ex}"
+                job["error"] = "master.db write failed"
                 _persist_locked()
         finally:
             db.close()
@@ -694,5 +941,5 @@ def _flip_worker(job_id: str, to_wav: bool, workers: int):
             "code": outcome,
             "message": "One or more flip items failed",
         })
-    except Exception as e:
-        mark_terminal(job_id, outcome="failed", error={"code": "worker_fatal", "message": str(e)})
+    except Exception:
+        mark_terminal(job_id, outcome="failed", error={"code": "worker_fatal", "message": "Worker failed"})

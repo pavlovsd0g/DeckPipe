@@ -146,7 +146,6 @@ class DeezerSession:
         infos = self.gw("song.getData", SNG_ID=track_id)
         title, artist = infos["SNG_TITLE"], infos["ART_NAME"]
         order = [prefer] + [q for q in QUALITIES if q != prefer]
-        last_err = None
         for q in order:
             if int(infos.get(FILESIZE_KEY[q], "0") or 0) == 0:
                 continue
@@ -176,9 +175,9 @@ class DeezerSession:
                     cleanup_owned_stages(fpath)
                     raise
                 return fpath, q, infos
-            except Exception as e:
-                last_err = e
-        raise RuntimeError(f"не удалось скачать ни в одном качестве: {last_err}")
+            except Exception:
+                pass
+        raise RuntimeError("download failed")
 
 
 def _blowfish_key(track_id: str) -> bytes:
@@ -233,12 +232,12 @@ def verify_file(fpath: Path, expected_duration: int, tolerance: float = 2.0):
             return False, f"неизвестный формат {fpath.suffix}", 0.0
         mf = cls(str(fpath))
         actual = float(mf.info.length)
-    except Exception as e:
-        return False, f"файл не читается: {e}", 0.0
+    except Exception:
+        return False, "media validation failed", 0.0
     r = subprocess.run([FFMPEG, "-v", "error", "-i", str(fpath), "-f", "null", "-"],
                        capture_output=True, text=True)
     if r.returncode != 0 or r.stderr.strip():
-        return False, f"ошибки декодирования: {r.stderr.strip()[:200]}", actual
+        return False, "media validation failed", actual
     if abs(actual - expected_duration) > tolerance:
         return False, f"длительность {actual:.1f}c != ожидаемая ~{expected_duration}c (обрезан?)", actual
     return True, "", actual

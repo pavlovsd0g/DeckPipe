@@ -131,6 +131,19 @@ def _write_json_payload(path: Path, payload: object, *, replace: Callable[[Path,
             pass
 
 
+def _replace_json_payload(path: Path, payload: object, *, replace: Callable[[Path, Path], None]) -> None:
+    _write_json_payload(path, payload, replace=replace)
+
+
+def _remove_path(path: Path) -> None:
+    try:
+        Path(path).unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        raise AtomicIOError("atomic JSON write failed") from None
+
+
 def _read_json(path: Path, validator: JsonValidator | None) -> object:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -151,18 +164,38 @@ def atomic_write_json(
     replace = replace or replace_file
     candidate = validator(copy.deepcopy(payload)) if validator else payload
     with file_lock(path):
+        if not backup:
+            _replace_json_payload(path, candidate, replace=replace)
+            return
+
         previous = None
-        if backup:
-            if path.exists():
-                try:
-                    previous = _read_json(path, validator)
-                except AtomicIOError:
-                    bak = backup_path(path)
-                    if bak.exists():
-                        previous = _read_json(bak, validator)
-            if previous is not None:
-                _write_json_payload(backup_path(path), previous, replace=replace)
-        _write_json_payload(path, candidate, replace=replace)
+        bak = backup_path(path)
+        if path.exists():
+            try:
+                previous = _read_json(path, validator)
+            except AtomicIOError:
+                if bak.exists():
+                    previous = _read_json(bak, validator)
+
+        if previous is None:
+            try:
+                _replace_json_payload(bak, candidate, replace=replace)
+                _replace_json_payload(path, candidate, replace=replace)
+            except Exception:
+                _remove_path(path)
+                _remove_path(bak)
+                raise AtomicIOError("atomic JSON write failed") from None
+            return
+
+        _replace_json_payload(bak, previous, replace=replace)
+        try:
+            _replace_json_payload(path, candidate, replace=replace)
+        except Exception:
+            try:
+                _replace_json_payload(path, previous, replace=replace)
+            except Exception:
+                pass
+            raise AtomicIOError("atomic JSON write failed") from None
 
 
 def backup_path(path: Path) -> Path:
@@ -211,14 +244,14 @@ def is_partial_path(path_or_name: Path | str) -> bool:
 def final_path_from_stage(stage_path: Path) -> Path:
     path = Path(stage_path)
     name = path.name
-    marker = name.rfind(STAGING_MARKER)
+    marker = name.lower().rfind(STAGING_MARKER)
     if marker < 0:
         return path
     return path.with_name(name[:marker] + path.suffix)
 
 
 def fsync_file(path: Path) -> None:
-    with Path(path).open("rb") as handle:
+    with Path(path).open("r+b") as handle:
         os.fsync(handle.fileno())
 
 

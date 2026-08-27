@@ -162,6 +162,28 @@ class PlaylistScanIsolationTests(unittest.TestCase):
             self.assertFalse(library.is_ready_entry(playlist, {"status": "ok", "file": "Upper.PART.FLAC"}))
             self.assertFalse(library.is_ready_entry(playlist, {"status": "ok", "file": ""}))
 
+    def test_ready_entry_requires_regular_file_inside_playlist(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="deckpipe-ready-entry-strict-") as temporary:
+            root = Path(temporary)
+            playlist = root / "playlist"
+            playlist.mkdir()
+            (playlist / "Final.flac").write_bytes(b"ok")
+            (playlist / "Directory.flac").mkdir()
+            escape = root / "outside.flac"
+            escape.write_bytes(b"outside")
+
+            self.assertTrue(library.is_ready_entry(playlist, {"status": "ok", "file": "Final.flac"}))
+            self.assertFalse(library.is_ready_entry(playlist, {"status": "ok", "file": "../outside.flac"}))
+            self.assertFalse(library.is_ready_entry(playlist, {"status": "ok", "file": str(escape)}))
+            self.assertFalse(library.is_ready_entry(playlist, {"status": "ok", "file": "Directory.flac"}))
+            try:
+                symlink = playlist / "escape.flac"
+                symlink.symlink_to(escape)
+            except OSError:
+                symlink = None
+            if symlink is not None:
+                self.assertFalse(library.is_ready_entry(playlist, {"status": "ok", "file": symlink.name}))
+
 
 class ErrorListingCoverageTests(unittest.TestCase):
     def test_local_playlist_errors_are_included_in_global_error_listing(self) -> None:

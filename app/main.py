@@ -45,6 +45,10 @@ STATIC = Path(__file__).parent / "static"
 APP_VERSION = "0.5.0"
 
 
+def _public_api_error(service: str) -> str:
+    return f"{service}: operation failed"
+
+
 @app.get("/api/version")
 def api_version():
     return {"version": APP_VERSION}
@@ -163,8 +167,8 @@ def api_config():
     try:
         ds = get_session()
         user = {"id": ds.user["USER_ID"], "email": ds.user.get("EMAIL")}
-    except Exception as e:
-        user = {"error": str(e)}
+    except Exception:
+        user = {"error": "Deezer login is not configured"}
     return {"music_root": str(library.music_root()), "arl_set": bool(get_deezer_arl()),
             "wav_mode": cfg.get("wav_mode", "source"),
             "numbering": cfg.get("numbering", True),
@@ -193,7 +197,7 @@ def api_set_config(c: ConfigIn):
 async def api_playlists():
     try:
         pls = await fetch_playlists()
-    except Exception as e:
+    except Exception:
         return []  # нет логина/сети — пустой список, вход через кнопку в шапке
     for p in pls:
         pl_dir = library.playlist_dir(p["id"], p["title"])
@@ -336,8 +340,8 @@ def api_sc_sources():
 def api_sc_add(body: ScSourceIn):
     try:
         data = soundcloud.resolve(body.url)
-    except Exception as e:
-        raise HTTPException(400, f"не удалось разобрать URL: {e}")
+    except Exception:
+        raise HTTPException(400, "SoundCloud URL could not be resolved")
     sources = _sc_sources()
     if any(s["id"] == data["id"] for s in sources):
         raise HTTPException(409, "этот источник уже добавлен")
@@ -362,8 +366,8 @@ def api_sc_tracks(source_id: str):
         raise HTTPException(404, "источник не найден")
     try:
         data = soundcloud.resolve(src["url"], use_cache=False)
-    except Exception as e:
-        raise HTTPException(502, f"SoundCloud: {str(e)[:300]}")
+    except Exception:
+        raise HTTPException(502, _public_api_error("SoundCloud"))
     pl_dir = library.playlist_dir(_sc_key(source_id), src["title"])
     return {"path": str(pl_dir), "tracks": library.scan_playlist(pl_dir, data["tracks"])}
 
@@ -448,8 +452,8 @@ def api_login_deezer_password(body: LoginPasswordIn):
     from .deezer_client import login_with_password, _session_cache
     try:
         ds, arl = login_with_password(body.email.strip(), body.password)
-    except Exception as e:
-        raise HTTPException(401, str(e))
+    except Exception:
+        raise HTTPException(401, "Deezer login failed")
     set_deezer_arl(arl)
     _session_cache["session"] = ds
     _session_cache["arl"] = arl
@@ -461,8 +465,8 @@ def api_login_deezer(body: LoginDeezerIn):
     from .deezer_client import DeezerSession, _session_cache
     try:
         ds = DeezerSession(body.arl.strip())
-    except Exception as e:
-        raise HTTPException(401, f"ARL не принят: {e}")
+    except Exception:
+        raise HTTPException(401, "Deezer ARL was not accepted")
     set_deezer_arl(body.arl.strip())
     _session_cache["session"] = None  # сброс кеша сессии
     return {"id": ds.user["USER_ID"], "email": ds.user.get("EMAIL")}
@@ -473,8 +477,8 @@ def api_login_sc(body: LoginScIn):
     token = body.oauth_token.strip()
     try:
         user = soundcloud.sc_validate(token)
-    except Exception as e:
-        raise HTTPException(401, f"oauth_token не принят: {e}")
+    except Exception:
+        raise HTTPException(401, "SoundCloud OAuth token was not accepted")
     set_soundcloud_oauth(token)
     cfg = load_config()
     cfg["sc_username"] = user.get("username", "")
@@ -523,8 +527,8 @@ def api_sc_sync_account(force: bool = False):
     try:
         me = soundcloud.sc_validate(token)
         account = soundcloud.sc_account_playlists(token)
-    except Exception as e:
-        raise HTTPException(503, f"SoundCloud недоступен: {e}")
+    except Exception:
+        raise HTTPException(503, _public_api_error("SoundCloud"))
     likes_url = f"https://soundcloud.com/{me.get('permalink', 'you')}/likes"
     items = [{"id": "likes", "title": "❤ Лайки", "url": likes_url, "count": me.get("likes_count", 0)}]
     items += account
@@ -655,8 +659,8 @@ async def api_dz_add(body: DzAddIn):
         _cache["playlists"] = (0, None)
         _cache["tracks"].pop(body.playlist_id, None)
         return {"ok": True, "added": len(body.track_ids)}
-    except Exception as e:
-        raise HTTPException(502, f"deezer: {e}")
+    except Exception:
+        raise HTTPException(502, _public_api_error("Deezer"))
 
 
 @app.post("/api/deezer/playlist/create")
@@ -672,8 +676,8 @@ async def api_dz_create(body: DzCreateIn):
                                                 track_ids=[str(i) for i in body.track_ids])
         _cache["playlists"] = (0, None)
         return {"ok": True, "id": pid, "title": body.title}
-    except Exception as e:
-        raise HTTPException(502, f"deezer: {e}")
+    except Exception:
+        raise HTTPException(502, _public_api_error("Deezer"))
 
 
 @app.get("/api/deezer/album/{album_id}")
@@ -694,8 +698,8 @@ def api_sc_resolve_tracks(url: str):
     """Треки сета/страницы SC для скачивания из поиска."""
     try:
         data = soundcloud.resolve(url)
-    except Exception as e:
-        raise HTTPException(502, f"SoundCloud: {e}")
+    except Exception:
+        raise HTTPException(502, _public_api_error("SoundCloud"))
     return [{**t, "provider": "sc"} for t in data["tracks"]]
 
 
@@ -709,8 +713,8 @@ def api_rb_status():
     if out["db_exists"] and not out["running"]:
         try:
             out["playlists"] = rb.get_rb_playlists()
-        except Exception as e:
-            out["error"] = str(e)
+        except Exception:
+            out["error"] = "Rekordbox status unavailable"
     return out
 
 
@@ -723,12 +727,6 @@ class RbSyncIn(BaseModel):
 def api_rb_sync(body: RbSyncIn):
     """Синк локального плейлиста (ок-треки по порядку) в Rekordbox."""
     raise HTTPException(409, "Rekordbox mutation is disabled until Task 5")
-    pl_dir = library.playlist_dir(body.playlist_key, body.playlist_title)
-    sc = library.load_sidecar(pl_dir)
-    entries = [e for e in sc.get("tracks", {}).values() if library.is_ready_entry(pl_dir, e)]
-    entries.sort(key=lambda e: (int(e.get("position") or 10 ** 6), e["file"].lower()))
-    if not entries:
-        raise HTTPException(400, "в плейлисте нет скачанных треков (✔)")
 
 
 class FlipIn(BaseModel):
