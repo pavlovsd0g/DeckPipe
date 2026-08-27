@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-backend-connection"
+description = "Allows the main window to read the in-memory backend connection once per launch"
+commands = { allow = ["backend_connection"] }

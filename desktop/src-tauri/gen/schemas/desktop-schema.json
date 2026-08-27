@@ -387,6 +387,12 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "Allows the main window to read the in-memory backend connection once per launch",
+          "type": "string",
+          "const": "allow-backend-connection",
+          "markdownDescription": "Allows the main window to read the in-memory backend connection once per launch"
+        },
+        {
           "description": "Разрешает команду service_login (окно логина с подхватом cookie)",
           "type": "string",
           "const": "allow-service-login",

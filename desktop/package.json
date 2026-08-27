@@ -4,7 +4,7 @@
   "version": "0.5.0",
   "scripts": {
     "tauri": "tauri",
-    "build": "tauri build"
+    "build": "npm --prefix .. run build:frontend && tauri build"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"
