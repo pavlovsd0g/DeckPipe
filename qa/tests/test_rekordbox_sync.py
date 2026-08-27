@@ -1215,28 +1215,111 @@ class RekordboxApiAndFlipGateTests(unittest.TestCase):
         else:
             os.environ["DECKPIPE_BOUND_PORT"] = self.old_port
 
-    def test_env_and_confirmation_token_gate_matrix(self) -> None:
+    def test_api_apply_preserves_intent_and_lets_coordinator_reject_unauthorized_before_adapter_open(self) -> None:
+        playlist = self.root / "playlist"
+        playlist.mkdir()
+        ready = playlist / "ready.flac"
+        ready.write_bytes(b"ready")
+        from app import library
+
+        library.save_sidecar(
+            playlist,
+            {
+                "tracks": {
+                    "1": {
+                        "provider": "deezer",
+                        "title": "Ready",
+                        "artist": "Artist",
+                        "album": "Album",
+                        "duration_expected": 10,
+                        "position": 1,
+                        "file": ready.name,
+                        "status": "ok",
+                    }
+                }
+            },
+        )
         body = self.main.RbSyncIn(playlist_key="local:fixture", playlist_title="Fixture")
-        observed = []
-        for env_value, token, expected_apply in [
-            (None, None, False),
-            ("1", None, False),
-            (None, self.rb.APPLY_CONFIRMATION_TOKEN, False),
-            ("1", self.rb.APPLY_CONFIRMATION_TOKEN, True),
-        ]:
-            if env_value is None:
-                os.environ.pop("DECKPIPE_RB_EXPERIMENTAL", None)
-            else:
-                os.environ["DECKPIPE_RB_EXPERIMENTAL"] = env_value
-            with patch.object(self.main, "_desired_tracks_for_rekordbox", return_value=[]), patch.object(
-                self.main.rb,
-                "sync_playlist",
-                return_value={"dry_run": not expected_apply, "applied": expected_apply, "reconciled": expected_apply, "unresolved": [], "backup_id": None, "error": None, "plan": {}},
-            ) as sync:
-                result = self.main.api_rb_sync(body, dry_run=False, confirmation_token=token)
-            observed.append(result["applied"])
-            self.assertEqual(expected_apply, sync.call_args.kwargs["dry_run"] is False)
-        self.assertEqual([False, False, False, True], observed)
+        cases = [
+            (None, None, "apply_not_confirmed", 0),
+            ("1", None, "apply_not_confirmed", 0),
+            (None, self.rb.APPLY_CONFIRMATION_TOKEN, "apply_not_confirmed", 0),
+            ("1", self.rb.APPLY_CONFIRMATION_TOKEN, None, 2),
+        ]
+
+        with patch.object(self.main.library, "playlist_dir", return_value=playlist):
+            for env_value, token, expected_error, expected_adapter_calls in cases:
+                with self.subTest(env_value=env_value, token=bool(token)):
+                    if env_value is None:
+                        os.environ.pop("DECKPIPE_RB_EXPERIMENTAL", None)
+                    else:
+                        os.environ["DECKPIPE_RB_EXPERIMENTAL"] = env_value
+                    shared: dict = {}
+                    adapters: list[FakeRekordboxAdapter] = []
+
+                    def adapter_factory():
+                        adapter = FakeRekordboxAdapter(self.root / "api-apply", [], shared=shared)
+                        adapters.append(adapter)
+                        return adapter
+
+                    with patch.object(self.main.rb, "_PyrekordboxAdapter", side_effect=adapter_factory):
+                        result = self.main.api_rb_sync(body, dry_run=False, confirmation_token=token)
+
+                    self.assertFalse(result["dry_run"])
+                    self.assertEqual(expected_error, result["error"]["code"] if result["error"] else None)
+                    self.assertEqual(expected_adapter_calls, len(adapters))
+                    if expected_error is None:
+                        self.assertTrue(result["applied"])
+                        self.assertEqual(1, adapters[0].begin_count)
+                        self.assertEqual(1, adapters[0].commit_count)
+                        self.assertTrue(adapters[0].closed)
+                        self.assertTrue(adapters[1].closed)
+                    else:
+                        self.assertFalse(result["applied"])
+
+    def test_api_explicit_dry_run_opens_read_only_adapter_and_stays_dry_run(self) -> None:
+        playlist = self.root / "playlist-dry-run"
+        playlist.mkdir()
+        ready = playlist / "ready.flac"
+        ready.write_bytes(b"ready")
+        from app import library
+
+        library.save_sidecar(
+            playlist,
+            {
+                "tracks": {
+                    "1": {
+                        "provider": "deezer",
+                        "title": "Ready",
+                        "artist": "Artist",
+                        "album": "Album",
+                        "duration_expected": 10,
+                        "position": 1,
+                        "file": ready.name,
+                        "status": "ok",
+                    }
+                }
+            },
+        )
+        body = self.main.RbSyncIn(playlist_key="local:fixture", playlist_title="Fixture")
+        adapters: list[FakeRekordboxAdapter] = []
+
+        def adapter_factory():
+            adapter = FakeRekordboxAdapter(self.root / "api-dry-run", [])
+            adapters.append(adapter)
+            return adapter
+
+        os.environ.pop("DECKPIPE_RB_EXPERIMENTAL", None)
+        with patch.object(self.main.library, "playlist_dir", return_value=playlist), patch.object(self.main.rb, "_PyrekordboxAdapter", side_effect=adapter_factory):
+            result = self.main.api_rb_sync(body, dry_run=True, confirmation_token=self.rb.APPLY_CONFIRMATION_TOKEN)
+
+        self.assertTrue(result["dry_run"])
+        self.assertFalse(result["applied"])
+        self.assertIsNone(result["error"])
+        self.assertEqual(1, len(adapters))
+        self.assertEqual(["snapshot", "close"], adapters[0].events)
+        self.assertEqual(0, adapters[0].begin_count)
+        self.assertEqual(0, adapters[0].commit_count)
 
     def test_api_dry_run_uses_only_ready_regular_in_root_files_and_structured_schema(self) -> None:
         playlist = self.root / "playlist"
