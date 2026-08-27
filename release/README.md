@@ -2,7 +2,15 @@
 
 This directory contains the Windows release evidence tooling for DeckPipe 0.6.0.
 
-`version.json` is the canonical source for the release version and build ID. Package metadata, Tauri metadata, the FastAPI version endpoint, bug reports, artifact names, checksum manifests, and SBOM output must resolve to this file.
+`version.json` is the canonical source for the release version and opaque build ID. The build ID is stable release metadata, not source provenance. `release/build.ps1` records the exact current `git rev-parse HEAD` as `source_revision` in `release-evidence.json` at build time, and artifact names include both the build ID and source revision.
+
+`release-evidence.json` is the machine-consumable candidate binding contract:
+
+- `version`, `build_id`, and full 40-character `source_revision`.
+- `artifacts[]` entries with relative `path`, `type` (`exe`, `msi`, or `installer`), and `sha256`.
+- `signing.status` and `timestamp.status`, each `PASS` only after explicit thumbprint signing and RFC3161 timestamp verification.
+- `SHA256SUMS.txt` hashes every staged file except itself, including `release-evidence.json`, `sbom.spdx.json`, and every artifact.
+- `sbom.spdx.json` is SPDX 2.3 and must describe the same artifact/evidence set through `DOCUMENT DESCRIBES Package` and `Package CONTAINS File` relationships.
 
 Current status:
 

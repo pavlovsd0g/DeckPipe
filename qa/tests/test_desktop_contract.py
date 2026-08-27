@@ -270,7 +270,10 @@ class DesktopContractTests(unittest.TestCase):
 
                 status, payload = request_json(f"{base}/api/version")
                 self.assertEqual(200, status)
-                self.assertEqual({"version": "0.5.0"}, payload)
+                self.assertEqual(
+                    {"version": "0.6.0", "build_id": "0.6.0+20260827.050713.6456dba254a6"},
+                    payload,
+                )
 
                 status, payload = request_json(f"{base}/api/jobs")
                 self.assertEqual(401, status)

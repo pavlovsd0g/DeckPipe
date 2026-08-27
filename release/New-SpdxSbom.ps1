@@ -33,30 +33,65 @@ function Write-Utf8NoBom {
     [IO.File]::WriteAllText($Path, $Text, [Text.UTF8Encoding]::new($false))
 }
 
+function Get-SpdxId {
+    param([string]$RelativePath, [string]$Checksum)
+    $bytes = [Text.Encoding]::UTF8.GetBytes($RelativePath + [char]0 + $Checksum)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = (($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '')
+        return "SPDXRef-File-$($hash.Substring(0, 32))"
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Assert-NoForbiddenPath {
+    param([string]$RelativePath)
+    $normalized = ($RelativePath -replace '\\', '/')
+    if ($normalized -match '(^|/)(config\.local\.json|cookies?\.txt|master\.db)$') { throw "forbidden SBOM input: $RelativePath" }
+    if ($normalized -match '(?i)(credential|secret|token|cookie|profile|appdata|localappdata|rekordbox|master\.db|\.sqlite|\.db$|\.media$)') {
+        throw "forbidden SBOM input: $RelativePath"
+    }
+    if ($normalized -match '^[A-Za-z]:|^/|(^|/)\.\.(/|$)') { throw "path traversal in SBOM input: $RelativePath" }
+    return $normalized
+}
+
 $inputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InputDirectory)
 $version = Get-Content -LiteralPath $VersionJsonPath -Raw | ConvertFrom-Json
 $outputFullPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
 
-$forbiddenPatterns = @('config.local.json', '*.secure.json', '*.sqlite', '*.db', '*.cookie', '*.cookies', '*credential*', '*secret*', '*token*')
-foreach ($pattern in $forbiddenPatterns) {
-    $hit = Get-ChildItem -LiteralPath $inputPath -Recurse -Force -File -Filter $pattern -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -ne $hit) { throw "forbidden SBOM input: $($hit.Name)" }
-}
-
 $files = @()
-$allFiles = Get-ChildItem -LiteralPath $inputPath -Recurse -Force -File |
-    Where-Object { $_.FullName -ne $outputFullPath } |
-    Sort-Object FullName
+$relationships = @([ordered]@{
+    spdxElementId = 'SPDXRef-DOCUMENT'
+    relationshipType = 'DESCRIBES'
+    relatedSpdxElement = 'SPDXRef-Package-DeckPipe'
+})
+$seenPaths = @{}
+$seenIds = @{}
+$allFiles = @(Get-ChildItem -LiteralPath $inputPath -Recurse -Force -File |
+    Where-Object { $_.FullName -ne $outputFullPath -and $_.Name -ne 'SHA256SUMS.txt' } |
+    Sort-Object FullName)
 foreach ($file in $allFiles) {
     $relative = $file.FullName.Substring($inputPath.Length).TrimStart('\') -replace '\\', '/'
+    $relative = Assert-NoForbiddenPath $relative
+    $pathKey = $relative.ToLowerInvariant()
+    if ($seenPaths.ContainsKey($pathKey)) { throw "duplicate or case-confusable SBOM path: $relative" }
+    $seenPaths[$pathKey] = $true
     $checksum = Get-Sha256 $file.FullName
-    $fileId = 'SPDXRef-File-' + (($relative -replace '[^A-Za-z0-9.-]', '-') -replace '-+', '-')
+    $fileId = Get-SpdxId -RelativePath $relative -Checksum $checksum
+    if ($seenIds.ContainsKey($fileId)) { throw "duplicate SPDXID: $fileId" }
+    $seenIds[$fileId] = $true
     $files += [ordered]@{
         SPDXID = $fileId
         fileName = $relative
         checksums = @([ordered]@{ algorithm = 'SHA256'; checksumValue = $checksum })
         licenseConcluded = 'NOASSERTION'
         copyrightText = 'NOASSERTION'
+    }
+    $relationships += [ordered]@{
+        spdxElementId = 'SPDXRef-Package-DeckPipe'
+        relationshipType = 'CONTAINS'
+        relatedSpdxElement = $fileId
     }
 }
 
@@ -81,11 +116,7 @@ $sbom = [ordered]@{
         copyrightText = 'NOASSERTION'
     })
     files = $files
-    relationships = @([ordered]@{
-        spdxElementId = 'SPDXRef-DOCUMENT'
-        relationshipType = 'DESCRIBES'
-        relatedSpdxElement = 'SPDXRef-Package-DeckPipe'
-    })
+    relationships = $relationships
 }
 
 Write-Utf8NoBom $outputFullPath ($sbom | ConvertTo-Json -Depth 10)

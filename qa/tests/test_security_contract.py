@@ -120,7 +120,10 @@ class SecurityContractTests(unittest.TestCase):
             self.assertEqual(200, status, path)
             self.assertNotIn(SENTINEL_TOKEN.encode("utf-8"), body)
         status, _headers, body = request("GET", "/api/version")
-        self.assertEqual({"version": "0.5.0"}, json.loads(body.decode("utf-8")))
+        self.assertEqual(
+            {"version": "0.6.0", "build_id": "0.6.0+20260827.050713.6456dba254a6"},
+            json.loads(body.decode("utf-8")),
+        )
 
     def test_framework_documentation_surfaces_are_disabled(self) -> None:
         for path in ("/docs", "/redoc", "/openapi.json"):
