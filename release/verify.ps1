@@ -46,7 +46,6 @@ function Read-CanonicalVersion {
 function Assert-GitSourceRevision {
     param([string]$Revision, [string]$Context)
     $value = if ($null -eq $Revision) { '' } else { [string]$Revision }
-    $value = $value.Trim()
     if ($value -cnotmatch '^[0-9a-f]{40}$') {
         throw "source provenance BLOCKED: $Context did not contain a full lowercase revision"
     }
@@ -72,7 +71,7 @@ function Read-GitMetadataFirstLine {
     if ($lines.Count -eq 0 -or [string]::IsNullOrWhiteSpace([string]$lines[0])) {
         throw "source provenance BLOCKED: $Context is empty"
     }
-    return ([string]$lines[0]).Trim()
+    return [string]$lines[0]
 }
 
 function Test-SafeGitRefName {
@@ -138,18 +137,28 @@ function Get-GitPackedRefRevisions {
     $packedRefsPath = Join-Path $GitDirectory 'packed-refs'
     if (-not (Test-Path -LiteralPath $packedRefsPath -PathType Leaf)) { return @() }
     $revisions = @()
+    $seenPackedRefNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $previousRefName = ''
+    $previousHadPeeled = $false
     $lineNumber = 0
     foreach ($line in @(Get-Content -LiteralPath $packedRefsPath)) {
         $lineNumber++
-        $trimmed = ([string]$line).Trim()
-        if (-not $trimmed -or $trimmed.StartsWith('#')) { continue }
-        if ($trimmed.StartsWith('^')) {
-            if ($trimmed -cnotmatch '^\^[0-9a-f]{40}$') {
+        $packedLine = [string]$line
+        if ($packedLine -eq '' -or $packedLine.StartsWith('#')) { continue }
+        if ($packedLine.StartsWith('^')) {
+            if (-not $previousRefName) {
+                throw "source provenance BLOCKED: orphan packed ref peeled line $lineNumber"
+            }
+            if ($previousHadPeeled) {
+                throw "source provenance BLOCKED: repeated packed ref peeled line $lineNumber"
+            }
+            if ($packedLine -cnotmatch '^\^[0-9a-f]{40}$') {
                 throw "source provenance BLOCKED: malformed packed ref line $lineNumber"
             }
+            $previousHadPeeled = $true
             continue
         }
-        if ($trimmed -cnotmatch '^([0-9a-f]{40}) ([^\s]+)$') {
+        if ($packedLine -cnotmatch '^([0-9a-f]{40}) ([^\s]+)$') {
             throw "source provenance BLOCKED: malformed packed ref line $lineNumber"
         }
         $packedRevision = $Matches[1]
@@ -157,6 +166,11 @@ function Get-GitPackedRefRevisions {
         if (-not (Test-SafeGitRefName $packedRefName)) {
             throw "source provenance BLOCKED: unsafe packed ref name $packedRefName"
         }
+        if (-not $seenPackedRefNames.Add($packedRefName)) {
+            throw "source provenance BLOCKED: duplicate packed ref $packedRefName"
+        }
+        $previousRefName = $packedRefName
+        $previousHadPeeled = $false
         if ([string]::Equals($packedRefName, $RefName, [StringComparison]::OrdinalIgnoreCase) -and
             -not [string]::Equals($packedRefName, $RefName, [StringComparison]::Ordinal)) {
             throw "source provenance BLOCKED: case-confusable packed ref $packedRefName"
@@ -187,9 +201,16 @@ function Get-GitRefRevision {
             $uniqueGitDirectories += $fullGitDirectory
         }
     }
+    $looseRevisions = @()
     foreach ($gitDirectory in @($uniqueGitDirectories)) {
         $revision = Get-GitLooseRefRevision -GitDirectory $gitDirectory -RefName $RefName
-        if ($revision) { return $revision }
+        if ($revision) { $looseRevisions += $revision }
+    }
+    if ($looseRevisions.Count -gt 1) {
+        throw "source provenance BLOCKED: ambiguous loose ref $RefName"
+    }
+    if ($looseRevisions.Count -eq 1) {
+        return $looseRevisions[0]
     }
     $packedRevisions = @()
     foreach ($gitDirectory in @($uniqueGitDirectories)) {

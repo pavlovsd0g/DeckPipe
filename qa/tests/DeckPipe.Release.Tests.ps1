@@ -521,6 +521,33 @@ It 'blocks uppercase git revisions in detached loose and packed metadata' {
     }
 }
 
+It 'rejects whitespace-padded git object ids without normalization' {
+    . (Join-Path $repoRoot 'release\verify.ps1')
+    $revision = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    $cases = @(
+        @{ Name = 'detached-leading-space'; Packed = $false; HeadContent = " $revision`n" },
+        @{ Name = 'detached-trailing-space'; Packed = $false; HeadContent = "$revision `n" },
+        @{ Name = 'loose-leading-space'; Packed = $false; Revision = " $revision" },
+        @{ Name = 'loose-trailing-space'; Packed = $false; Revision = "$revision " },
+        @{ Name = 'packed-leading-space'; Packed = $true; PackedContent = "# pack-refs with: peeled fully-peeled sorted`n $revision refs/heads/main`n" },
+        @{ Name = 'packed-trailing-space'; Packed = $true; PackedContent = "# pack-refs with: peeled fully-peeled sorted`n$revision refs/heads/main `n" }
+    )
+    $originalRepoRoot = $script:RepoRoot
+    foreach ($case in $cases) {
+        $fixtureRevision = if ($case.ContainsKey('Revision')) { [string]$case.Revision } else { $revision }
+        $headContent = if ($case.ContainsKey('HeadContent')) { [string]$case.HeadContent } else { '' }
+        $packedContent = if ($case.ContainsKey('PackedContent')) { [string]$case.PackedContent } else { '' }
+        $fixture = New-TestGitMetadataFixture -Name "deckpipe-git-$($case.Name)" -Revision $fixtureRevision -Packed:([bool]$case.Packed) -HeadContent $headContent -PackedContent $packedContent
+        try {
+            $script:RepoRoot = $fixture
+            Assert-Throws { Get-CurrentSourceRevision | Out-Null } 'source provenance BLOCKED|lowercase|malformed'
+        } finally {
+            $script:RepoRoot = $originalRepoRoot
+            [IO.Directory]::Delete($fixture, $true)
+        }
+    }
+}
+
 It 'matches git refs case-sensitively across loose and packed metadata' {
     . (Join-Path $repoRoot 'release\verify.ps1')
     $revision = '5555555555555555555555555555555555555555'
@@ -538,6 +565,45 @@ It 'matches git refs case-sensitively across loose and packed metadata' {
             $script:RepoRoot = $originalRepoRoot
             [IO.Directory]::Delete($fixture, $true)
         }
+    }
+}
+
+It 'blocks multiple loose git ref candidates across linked git directories' {
+    . (Join-Path $repoRoot 'release\verify.ps1')
+    $revisionOne = '8888888888888888888888888888888888888888'
+    $revisionTwo = '9999999999999999999999999999999999999999'
+    $cases = @(
+        @{ Name = 'same-revision'; WorktreeRevision = $revisionOne; CommonRevision = $revisionOne },
+        @{ Name = 'different-revision'; WorktreeRevision = $revisionTwo; CommonRevision = $revisionOne }
+    )
+    $originalRepoRoot = $script:RepoRoot
+    foreach ($case in $cases) {
+        $fixture = New-TestGitMetadataFixture -Name "deckpipe-git-linked-loose-$($case.Name)" -Revision $case.CommonRevision -LinkedWorktree
+        try {
+            $script:RepoRoot = $fixture
+            $worktreeGitDir = Join-Path $fixture 'common.git\worktrees\fixture'
+            Write-Utf8NoBom (Join-Path $worktreeGitDir 'refs\heads\main') "$($case.WorktreeRevision)`n"
+            Assert-Throws { Get-CurrentSourceRevision | Out-Null } 'source provenance BLOCKED|ambiguous|duplicate|loose'
+        } finally {
+            $script:RepoRoot = $originalRepoRoot
+            [IO.Directory]::Delete($fixture, $true)
+        }
+    }
+}
+
+It 'uses one loose git ref ahead of packed refs with git precedence' {
+    . (Join-Path $repoRoot 'release\verify.ps1')
+    $looseRevision = 'abcdefabcdefabcdefabcdefabcdefabcdefabcd'
+    $packedRevision = '1234567890abcdef1234567890abcdef12345678'
+    $fixture = New-TestGitMetadataFixture -Name 'deckpipe-git-loose-over-packed' -Revision $packedRevision -Packed
+    $originalRepoRoot = $script:RepoRoot
+    try {
+        Write-Utf8NoBom (Join-Path $fixture '.git\refs\heads\main') "$looseRevision`n"
+        $script:RepoRoot = $fixture
+        Assert-Equal (Get-CurrentSourceRevision) $looseRevision
+    } finally {
+        $script:RepoRoot = $originalRepoRoot
+        [IO.Directory]::Delete($fixture, $true)
     }
 }
 
@@ -562,6 +628,18 @@ It 'blocks duplicate ambiguous and malformed packed refs' {
         @{
             Name = 'case-confusable-target'
             PackedContent = "# pack-refs with: peeled fully-peeled sorted`n$revisionOne refs/heads/Main`n"
+        },
+        @{
+            Name = 'orphan-peeled-line'
+            PackedContent = "# pack-refs with: peeled fully-peeled sorted`n^$revisionTwo`n$revisionOne refs/heads/main`n"
+        },
+        @{
+            Name = 'repeated-peeled-line'
+            PackedContent = "# pack-refs with: peeled fully-peeled sorted`n$revisionTwo refs/tags/v1`n^$revisionOne`n^$revisionTwo`n$revisionOne refs/heads/main`n"
+        },
+        @{
+            Name = 'duplicate-nontarget-record'
+            PackedContent = "# pack-refs with: peeled fully-peeled sorted`n$revisionTwo refs/tags/v1`n$revisionOne refs/tags/v1`n$revisionOne refs/heads/main`n"
         }
     )
     $originalRepoRoot = $script:RepoRoot
