@@ -378,9 +378,45 @@ class RekordboxSyncCoordinatorTests(unittest.TestCase):
                 observed.append(result["applied"])
                 self.assertEqual(expected_code, result["error"]["code"] if result["error"] else None)
                 self.assertEqual(0 if expected_code else 1, adapter.begin_count)
-                self.assertGreaterEqual(adapter.close_count, 1)
+                self.assertEqual(0 if expected_code else 1, adapter.close_count)
         self.assertEqual([False, False, False, True], observed)
         os.environ["DECKPIPE_RB_EXPERIMENTAL"] = "1"
+
+    def test_unauthorized_apply_returns_before_constructing_adapter(self) -> None:
+        desired, _current = self.base_desired_current()
+        os.environ.pop("DECKPIPE_RB_EXPERIMENTAL", None)
+        calls = []
+
+        def forbidden_factory():
+            calls.append("called")
+            return FakeRekordboxAdapter(self.root / "adapter-unauthorized", [])
+
+        result = self.rb.sync_playlist("Playlist", desired, dry_run=False, adapter_factory=forbidden_factory, confirmation_token=self.rb.APPLY_CONFIRMATION_TOKEN)
+
+        self.assertEqual([], calls)
+        self.assertFalse(result["dry_run"])
+        self.assertEqual("apply_not_confirmed", result["error"]["code"])
+        self.assertNotRegex(json.dumps(result, ensure_ascii=False), r"[A-Z]:\\|secret|private")
+        os.environ["DECKPIPE_RB_EXPERIMENTAL"] = "1"
+
+    def test_adapter_open_failures_are_structured_for_dry_run_and_apply_without_raw_paths(self) -> None:
+        desired, _current = self.base_desired_current()
+
+        def failing_factory():
+            raise RuntimeError("adapter open leaked C:\\Users\\secret\\master.db")
+
+        for dry_run, token in [(True, None), (False, self.rb.APPLY_CONFIRMATION_TOKEN)]:
+            with self.subTest(dry_run=dry_run):
+                try:
+                    result = self.rb.sync_playlist("Playlist", desired, dry_run=dry_run, adapter_factory=failing_factory, confirmation_token=token)
+                except RuntimeError as exc:
+                    self.fail(f"sync_playlist leaked adapter-open exception: {exc}")
+
+                self.assertEqual(dry_run, result["dry_run"])
+                self.assertFalse(result["applied"])
+                self.assertFalse(result["reconciled"])
+                self.assertEqual("adapter_open_failed", result["error"]["code"])
+                self.assertNotRegex(json.dumps(result, ensure_ascii=False), r"[A-Z]:\\|secret|private")
 
     def test_apply_acquires_lock_before_authoritative_snapshot_and_status_backup(self) -> None:
         desired, current = self.base_desired_current()
@@ -563,6 +599,89 @@ class RekordboxSyncCoordinatorTests(unittest.TestCase):
                 self.assertNotRegex(json.dumps(result, ensure_ascii=False), r"[A-Z]:\\|secret|private")
                 self.assertTrue(all(handle.closed for handle in shared["handles"]))
 
+    def test_lock_write_failure_returns_structured_failure_and_removes_owned_lock(self) -> None:
+        desired, current = self.base_desired_current()
+        adapter = FakeRekordboxAdapter(self.root / "adapter-lock-write-fail", current)
+        opened_fds: list[int] = []
+        closed_fds: list[int] = []
+        real_open = self.rb.os.open
+        real_close = self.rb.os.close
+
+        def tracking_open(path, flags, mode=0o777):
+            fd = real_open(path, flags, mode)
+            opened_fds.append(fd)
+            return fd
+
+        def tracking_close(fd):
+            closed_fds.append(fd)
+            return real_close(fd)
+
+        with (
+            patch.object(self.rb.os, "open", side_effect=tracking_open),
+            patch.object(self.rb.os, "close", side_effect=tracking_close),
+            patch.object(self.rb.os, "write", side_effect=OSError("write leaked C:\\Users\\secret\\mutation.lock")),
+        ):
+            try:
+                result = self.rb.sync_playlist("Playlist", desired, dry_run=False, adapter_factory=self.adapter_factory(adapter), confirmation_token=self.rb.APPLY_CONFIRMATION_TOKEN)
+            except OSError as exc:
+                self.fail(f"sync_playlist leaked lock exception: {exc}")
+
+        self.assertEqual("lock_failed", result["error"]["code"])
+        self.assertFalse(result["applied"])
+        self.assertTrue(adapter.closed)
+        self.assertEqual(opened_fds, closed_fds)
+        self.assertFalse(adapter.lock_path.exists())
+        self.assertNotRegex(json.dumps(result, ensure_ascii=False), r"[A-Z]:\\|secret|private")
+
+    def test_lock_mkdir_open_and_context_enter_failures_are_structured_and_close_adapter(self) -> None:
+        desired, current = self.base_desired_current()
+
+        cases = [
+            ("mkdir", lambda: patch.object(self.rb.Path, "mkdir", side_effect=OSError("mkdir leaked C:\\Users\\secret\\mutation.lock"))),
+            ("open", lambda: patch.object(self.rb.os, "open", side_effect=OSError("open leaked C:\\Users\\secret\\mutation.lock"))),
+            ("enter", None),
+        ]
+
+        for name, patch_factory in cases:
+            with self.subTest(name=name):
+                adapter = FakeRekordboxAdapter(self.root / f"adapter-lock-{name}-fail", current)
+                if name == "enter":
+                    class BrokenLock:
+                        def __init__(self):
+                            self.exited = False
+
+                        def __enter__(self):
+                            raise OSError("enter leaked C:\\Users\\secret\\mutation.lock")
+
+                        def __exit__(self, *_args):
+                            self.exited = True
+
+                    lock = BrokenLock()
+                    patcher = patch.object(self.rb, "_exclusive_create_lock", return_value=lock)
+                else:
+                    lock = None
+                    patcher = patch_factory()
+
+                with patcher:
+                    try:
+                        result = self.rb.sync_playlist(
+                            "Playlist",
+                            desired,
+                            dry_run=False,
+                            adapter_factory=self.adapter_factory(adapter),
+                            confirmation_token=self.rb.APPLY_CONFIRMATION_TOKEN,
+                        )
+                    except OSError as exc:
+                        self.fail(f"sync_playlist leaked lock exception: {exc}")
+
+                self.assertEqual("lock_failed", result["error"]["code"])
+                self.assertFalse(result["applied"])
+                self.assertTrue(adapter.closed)
+                self.assertFalse(adapter.lock_path.exists())
+                self.assertNotRegex(json.dumps(result, ensure_ascii=False), r"[A-Z]:\\|secret|private")
+                if lock is not None:
+                    self.assertFalse(lock.exited)
+
     def test_missing_playlist_default_creates_inside_transaction_false_fails_without_mutation(self) -> None:
         desired, _current = self.base_desired_current()
         create_shared = {"playlist_exists": False}
@@ -677,6 +796,8 @@ class RekordboxAdapterMutationContractTests(unittest.TestCase):
                 self.deleted = []
                 self.commits = 0
                 self.used_forbidden_helper = False
+                self.artists = []
+                self.albums = []
 
             def get_playlist(self):
                 return [playlist]
@@ -687,6 +808,25 @@ class RekordboxAdapterMutationContractTests(unittest.TestCase):
             def get_playlist_songs(self, **kwargs):
                 self._assert_playlist(kwargs)
                 return Query(songs)
+
+            def get_artist(self, **kwargs):
+                return Query(self.artists).filter_by(**kwargs)
+
+            def get_album(self, **kwargs):
+                return Query(self.albums).filter_by(**kwargs)
+
+            def add_artist(self, name, **_kwargs):
+                artist = SimpleNamespace(ID=f"artist-{len(self.artists) + 1}", Name=name)
+                self.artists.append(artist)
+                return artist
+
+            def add_album(self, name, artist=None, **_kwargs):
+                if artist is None:
+                    raise AssertionError("add_album must receive the resolved artist")
+                artist_id = artist if isinstance(artist, str) else artist.ID
+                album = SimpleNamespace(ID=f"album-{len(self.albums) + 1}", Name=name, AlbumArtistID=artist_id)
+                self.albums.append(album)
+                return album
 
             def read_anlz_files(self, content):
                 return {Path(f"C:/anlz/{content.ID}.DAT"): SimpleNamespace(set_path=lambda value: self._stage_path(content, value), save=lambda _path: (_ for _ in ()).throw(AssertionError("ANLZ saved during apply")))}
@@ -858,8 +998,11 @@ class RekordboxAdapterMutationContractTests(unittest.TestCase):
                 self.artists.append(artist)
                 return artist
 
-            def add_album(self, name, **_kwargs):
-                album = SimpleNamespace(ID=f"album-{len(self.albums) + 1}", Name=name)
+            def add_album(self, name, artist=None, **_kwargs):
+                if artist is None:
+                    raise AssertionError("add_album must receive the resolved artist")
+                artist_id = artist if isinstance(artist, str) else artist.ID
+                album = SimpleNamespace(ID=f"album-{len(self.albums) + 1}", Name=name, AlbumArtistID=artist_id)
                 self.albums.append(album)
                 return album
 
@@ -941,6 +1084,110 @@ class RekordboxAdapterMutationContractTests(unittest.TestCase):
         self.assertEqual([(add_media, {"Title": "Add New", "ArtistID": "artist-3", "AlbumID": "album-3", "Commnt": "deezer:add", "Length": 444})], adapter.db.add_content_calls)
         self.assertEqual([Path("C:/anlz/rb-keep.DAT")], sorted(adapter._staged_anlz))
         self.assertEqual(0, adapter.db.commits)
+
+    def test_apply_operations_uses_non_null_empty_artist_album_rows_and_preserves_empty_snapshot_strings(self) -> None:
+        playlist = SimpleNamespace(ID="pl1", Name="Playlist", Attribute=0)
+
+        class Query(list):
+            def filter_by(self, **kwargs):
+                return Query([item for item in self if all(getattr(item, key) == value for key, value in kwargs.items())])
+
+            def one_or_none(self):
+                if len(self) > 1:
+                    raise AssertionError("expected one or none")
+                return self[0] if self else None
+
+        class StrictMetadataDb:
+            def __init__(self):
+                self.artists = []
+                self.albums = []
+                self.contents = []
+                self.songs = []
+                self.add_content_calls = []
+
+            def get_playlist(self):
+                return [playlist]
+
+            def get_playlist_songs(self, **_kwargs):
+                return list(self.songs)
+
+            def get_content(self):
+                return list(self.contents)
+
+            def get_artist(self, **kwargs):
+                return Query(self.artists).filter_by(**kwargs)
+
+            def get_album(self, **kwargs):
+                return Query(self.albums).filter_by(**kwargs)
+
+            def add_artist(self, name, **_kwargs):
+                artist = SimpleNamespace(ID=f"artist-{len(self.artists) + 1}", Name=name)
+                self.artists.append(artist)
+                return artist
+
+            def add_album(self, name, artist=None, **_kwargs):
+                if artist is None:
+                    raise AssertionError("add_album must receive the resolved artist")
+                artist_id = artist if isinstance(artist, str) else artist.ID
+                album = SimpleNamespace(ID=f"album-{len(self.albums) + 1}", Name=name, AlbumArtistID=artist_id)
+                self.albums.append(album)
+                return album
+
+            def add_content(self, path, **kwargs):
+                if kwargs.get("ArtistID") is None or kwargs.get("AlbumID") is None:
+                    raise AssertionError("content IDs must be non-null")
+                self.add_content_calls.append((Path(path), dict(kwargs)))
+                artist = next(item for item in self.artists if item.ID == kwargs["ArtistID"])
+                album = next(item for item in self.albums if item.ID == kwargs["AlbumID"])
+                content = SimpleNamespace(
+                    ID=f"content-{len(self.contents) + 1}",
+                    FolderPath=str(path),
+                    OrgFolderPath=str(path),
+                    FileNameL=Path(path).name,
+                    FileNameS=Path(path).name,
+                    FileSize=Path(path).stat().st_size,
+                    FileType=11,
+                    Artist=artist,
+                    ArtistID=artist.ID,
+                    Album=album,
+                    AlbumID=album.ID,
+                    Title=kwargs["Title"],
+                    Commnt=kwargs["Commnt"],
+                    Length=kwargs["Length"],
+                )
+                self.contents.append(content)
+                return content
+
+            def read_anlz_files(self, _content):
+                return {}
+
+            def delete(self, _instance):
+                pass
+
+            def add(self, instance):
+                self.songs.append(instance)
+
+        adapter = self.rb._PyrekordboxAdapter.__new__(self.rb._PyrekordboxAdapter)
+        adapter.db = StrictMetadataDb()
+        adapter.db_path = Path("C:/fake/master.db")
+        adapter._staged_anlz = {}
+        media = self.root / "empty.wav"
+        media.write_bytes(b"empty")
+        plan = {
+            "_playlist_name": "Playlist",
+            "_create_missing": True,
+            "desired_resolved": [track("deezer:empty", "", "", "", 0, 1, media)],
+        }
+
+        adapter.apply_operations(plan)
+        snapshot = adapter.snapshot_playlist("Playlist")
+
+        self.assertEqual("", snapshot[0]["title"])
+        self.assertEqual("", snapshot[0]["artist"])
+        self.assertEqual("", snapshot[0]["album"])
+        self.assertEqual("artist-1", adapter.db.add_content_calls[0][1]["ArtistID"])
+        self.assertEqual("album-1", adapter.db.add_content_calls[0][1]["AlbumID"])
+        self.assertEqual("artist-1", adapter.db.albums[0].AlbumArtistID)
 
 
 class RekordboxApiAndFlipGateTests(unittest.TestCase):
@@ -1035,6 +1282,24 @@ class RekordboxApiAndFlipGateTests(unittest.TestCase):
         self.assertEqual("deezer:1", desired[0]["provider_id"])
         self.assertEqual(str(ready), desired[0]["path"])
         self.assertEqual({"dry_run", "applied", "reconciled", "unresolved", "backup_id", "error", "plan"}, set(result))
+
+    def test_api_rb_sync_passes_through_structured_adapter_open_failure(self) -> None:
+        body = self.main.RbSyncIn(playlist_key="local:fixture", playlist_title="Fixture")
+        structured = {
+            "dry_run": True,
+            "applied": False,
+            "reconciled": False,
+            "unresolved": [],
+            "backup_id": None,
+            "error": {"code": "adapter_open_failed", "message": "Rekordbox sync failed"},
+            "plan": {"counts": {"desired": 0}},
+        }
+
+        with patch.object(self.main, "_desired_tracks_for_rekordbox", return_value=[]), patch.object(self.main.rb, "sync_playlist", return_value=structured):
+            result = self.main.api_rb_sync(body)
+
+        self.assertEqual(structured["error"], result["error"])
+        self.assertTrue(result["dry_run"])
 
     def test_default_flip_fails_closed_and_explicit_flip_uses_reconciled_callback_for_sidecar_advance(self) -> None:
         from app import jobs, library

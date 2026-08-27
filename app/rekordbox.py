@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from contextlib import contextmanager
@@ -182,6 +183,7 @@ def plan_playlist_sync(desired: list[dict], current: list[dict] | None = None) -
 @contextmanager
 def _exclusive_create_lock(lock_path: Path) -> Iterator[bool | None]:
     path = Path(lock_path)
+    fd = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
@@ -193,9 +195,20 @@ def _exclusive_create_lock(lock_path: Path) -> Iterator[bool | None]:
         return
     try:
         os.write(fd, str(os.getpid()).encode("ascii", errors="ignore"))
+    except Exception:
+        os.close(fd)
+        fd = None
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        yield None
+        return
+    try:
         yield True
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
         try:
             path.unlink()
         except FileNotFoundError:
@@ -250,9 +263,9 @@ def _public_plan(plan: dict) -> dict:
     return public
 
 
-def _failure(code: str, *, plan: dict, backup: dict | None = None) -> dict:
+def _failure(code: str, *, plan: dict, backup: dict | None = None, dry_run: bool = False) -> dict:
     return {
-        "dry_run": False,
+        "dry_run": dry_run,
         "applied": False,
         "reconciled": False,
         "unresolved": plan.get("unresolved", []),
@@ -344,35 +357,45 @@ def sync_playlist(
     on_reconciled: Callable[[dict], None] | None = None,
 ) -> dict:
     adapter_factory = adapter_factory or _PyrekordboxAdapter
-    adapter = adapter_factory()
+    plan: dict = plan_playlist_sync(ordered_files, [])
+    if not dry_run and not _apply_authorized(confirmation_token):
+        return _failure("apply_not_confirmed", plan=plan)
+    try:
+        adapter = adapter_factory()
+    except Exception:
+        return _failure("adapter_open_failed", plan=plan, dry_run=dry_run)
     reopened = None
     backup = None
     current: list[dict] = []
-    plan: dict = plan_playlist_sync(ordered_files, [])
     try:
         if dry_run:
             try:
                 current = adapter.snapshot_playlist(pl_name)
             except Exception:
                 _close_quietly(adapter)
-                return _failure("snapshot_failed", plan=plan)
+                return _failure("snapshot_failed", plan=plan, dry_run=True)
             plan = plan_playlist_sync(ordered_files, current)
             _close_quietly(adapter)
             return {"dry_run": True, "applied": False, "reconciled": False, "unresolved": plan["unresolved"], "backup_id": None, "backup": None, "plan": plan, "error": None}
-        if not _apply_authorized(confirmation_token):
-            _close_quietly(adapter)
-            return _failure("apply_not_confirmed", plan=plan)
         try:
             lock_path = adapter.mutation_lock_path()
         except Exception:
             _close_quietly(adapter)
             return _failure("lock_failed", plan=plan)
-        with _exclusive_create_lock(lock_path) as acquired:
+        lock_context = _exclusive_create_lock(lock_path)
+        try:
+            acquired = lock_context.__enter__()
+        except Exception:
+            _close_quietly(adapter)
+            return _failure("lock_failed", plan=plan)
+        try:
             if acquired is None:
                 _close_quietly(adapter)
+                adapter = None
                 return _failure("lock_failed", plan=plan)
             if not acquired:
                 _close_quietly(adapter)
+                adapter = None
                 return _failure("concurrent_apply", plan=plan)
             try:
                 current = adapter.snapshot_playlist(pl_name)
@@ -492,6 +515,8 @@ def sync_playlist(
             finally:
                 _close_quietly(reopened)
                 _close_quietly(adapter)
+        finally:
+            lock_context.__exit__(*sys.exc_info())
     except Exception:
         _close_quietly(reopened)
         _close_quietly(adapter)
@@ -531,6 +556,13 @@ class _PyrekordboxAdapter:
     def list_playlists(self) -> list:
         return [{"id": str(p.ID), "name": p.Name, "count": len(p.Songs)} for p in self.db.get_playlist() if p.Attribute == 0]
 
+    def _related_name(self, content, relationship_name: str, fallback_name: str) -> str:
+        related = getattr(content, relationship_name, None)
+        if related is not None and hasattr(related, "Name"):
+            return str(getattr(related, "Name") or "")
+        fallback = getattr(content, fallback_name, "")
+        return fallback if isinstance(fallback, str) else ""
+
     def snapshot_playlist(self, playlist_name: str) -> list[dict]:
         contents = {}
         for content in self.db.get_content():
@@ -538,8 +570,8 @@ class _PyrekordboxAdapter:
             contents[str(getattr(content, "ID", ""))] = {
                 "provider_id": provider_id,
                 "title": str(getattr(content, "Title", "") or ""),
-                "artist": str(getattr(getattr(content, "Artist", None), "Name", "") or getattr(content, "Artist", "") or ""),
-                "album": str(getattr(getattr(content, "Album", None), "Name", "") or getattr(content, "Album", "") or ""),
+                "artist": self._related_name(content, "Artist", "Artist"),
+                "album": self._related_name(content, "Album", "Album"),
                 "duration": int(getattr(content, "Length", 0) or 0),
                 "position": 0,
                 "path": str(getattr(content, "FolderPath", "") or ""),
@@ -658,21 +690,22 @@ class _PyrekordboxAdapter:
     def _album_by_name(self, name: str):
         return self._one_or_none(self.db.get_album(Name=name))
 
-    def _resolve_artist_id(self, name: str) -> str | None:
-        if not name:
-            return None
+    def _resolve_artist(self, name: str):
         artist = self._artist_by_name(name)
         if artist is None:
             artist = self.db.add_artist(name=name)
-        return str(artist.ID)
+        return artist
 
-    def _resolve_album_id(self, name: str) -> str | None:
-        if not name:
-            return None
+    def _resolve_album(self, name: str, artist):
         album = self._album_by_name(name)
         if album is None:
-            album = self.db.add_album(name=name)
-        return str(album.ID)
+            album = self.db.add_album(name=name, artist=artist)
+        return album
+
+    def _resolve_metadata_ids(self, artist_name: str, album_name: str) -> tuple[str, str]:
+        artist = self._resolve_artist(artist_name)
+        album = self._resolve_album(album_name, artist)
+        return str(artist.ID), str(album.ID)
 
     def _file_type_value(self, path: Path) -> int | None:
         from pyrekordbox.db6.tables import FileType
@@ -684,8 +717,7 @@ class _PyrekordboxAdapter:
 
     def _create_content(self, desired: dict):
         path = Path(desired["path"])
-        artist_id = self._resolve_artist_id(str(desired["artist"]))
-        album_id = self._resolve_album_id(str(desired["album"]))
+        artist_id, album_id = self._resolve_metadata_ids(str(desired["artist"]), str(desired["album"]))
         return self.db.add_content(
             path,
             Title=desired["title"],
@@ -705,10 +737,11 @@ class _PyrekordboxAdapter:
             content.Commnt = desired["provider_id"]
         elif hasattr(content, "Comments"):
             content.Comments = desired["provider_id"]
+        artist_id, album_id = self._resolve_metadata_ids(str(desired["artist"]), str(desired["album"]))
         if hasattr(content, "ArtistID"):
-            content.ArtistID = self._resolve_artist_id(str(desired["artist"]))
+            content.ArtistID = artist_id
         if hasattr(content, "AlbumID"):
-            content.AlbumID = self._resolve_album_id(str(desired["album"]))
+            content.AlbumID = album_id
         if old_path != new_path:
             self._stage_anlz_path_updates(content, new_path)
             content.FolderPath = new_path
