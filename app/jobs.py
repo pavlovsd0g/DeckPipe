@@ -98,6 +98,7 @@ def _validate_journal(payload: object) -> dict:
             raise ValueError("invalid journal")
         clean_job["tracks"] = [_validate_track_item(item) for item in tracks]
         clean_job["results"] = [_validate_result_item(item) for item in results]
+        _validate_job_coherence(clean_job)
         if clean_job["state"] == "done" and clean_job["outcome"] != "succeeded":
             clean_job["terminal_error"] = _validate_terminal_error(clean_job.get("terminal_error"))
         elif clean_job.get("terminal_error") is not None:
@@ -115,13 +116,21 @@ def initialize(data_root: Path | None = None, *, start_worker: bool = True, writ
     global _worker_started, _worker_generation, _worker_stop, _worker_thread
     if data_root is None:
         raise RuntimeError("DeckPipe jobs require an explicit data root")
+    journal_path = Path(data_root) / "jobs.json"
     with _lock:
+        if (
+            _initialized
+            and _journal_path == journal_path
+            and _worker_thread is not None
+            and _worker_thread.is_alive()
+            and (_queue or any(job.get("state") == "running" for job in _jobs.values()))
+        ):
+            raise RuntimeError("DeckPipe jobs for this data root are busy")
         _worker_stop.set()
         _worker_generation += 1
         _worker_stop = threading.Event()
         _worker_thread = None
         _worker_started = False
-        journal_path = Path(data_root) / "jobs.json"
         writer = write_json or atomic_write_json
         _worker_started = False
         payload, recovered = atomic_load_json(
@@ -188,47 +197,115 @@ def _valid_provider(provider: object) -> bool:
     return isinstance(provider, str) and bool(_SAFE_PROVIDER_RE.match(provider))
 
 
+def _validate_optional_track_number(track: dict, field: str) -> None:
+    if field not in track:
+        return
+    value = track.get(field)
+    if not _finite_number(value):
+        raise ValueError("invalid journal")
+    if field in {"position", "total"} and not _nonnegative_int(value):
+        raise ValueError("invalid journal")
+
+
 def _validate_track_item(item: object) -> dict:
     if not isinstance(item, dict):
         raise ValueError("invalid journal")
-    track = dict(item)
-    if not _safe_string(str(track.get("id")) if track.get("id") is not None else None):
+    raw = dict(item)
+    if not _safe_string(str(raw.get("id")) if raw.get("id") is not None else None):
         raise ValueError("invalid journal")
-    if not _safe_string(track.get("title"), allow_empty=True):
+    if not _safe_string(raw.get("title"), allow_empty=True):
         raise ValueError("invalid journal")
-    provider = track.get("provider", "deezer")
+    provider = raw.get("provider", "deezer")
     if not _valid_provider(provider):
         raise ValueError("invalid journal")
-    track["id"] = str(track["id"])
-    track["provider"] = provider
     for field in ("artist", "album", "url"):
-        if field in track and not isinstance(track.get(field), str):
+        if field in raw and not isinstance(raw.get(field), str):
             raise ValueError("invalid journal")
-    return track
+    for field in ("duration", "position", "total"):
+        _validate_optional_track_number(raw, field)
+    clean = {
+        "provider": provider,
+        "id": str(raw["id"]),
+        "title": raw["title"],
+    }
+    for field in ("artist", "album", "url"):
+        if field in raw:
+            clean[field] = raw[field]
+    for field in ("duration", "position", "total"):
+        if field in raw:
+            clean[field] = raw[field]
+    return clean
+
+
+def _canonicalize_tracks(tracks: list) -> list[dict]:
+    clean_tracks = [_validate_track_item(item) for item in tracks]
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for track in clean_tracks:
+        key = _result_key(track)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(track)
+    return unique
 
 
 def _validate_result_item(item: object) -> dict:
     if not isinstance(item, dict):
         raise ValueError("invalid journal")
-    result = dict(item)
-    if not _safe_string(str(result.get("id")) if result.get("id") is not None else None):
+    raw = dict(item)
+    if not _safe_string(str(raw.get("id")) if raw.get("id") is not None else None):
         raise ValueError("invalid journal")
-    provider = result.get("provider", "deezer")
+    provider = raw.get("provider", "deezer")
     if not _valid_provider(provider):
         raise ValueError("invalid journal")
-    key = str(result.get("key") or f"{provider}:{result.get('id')}")
-    if key != f"{provider}:{result.get('id')}":
+    track_id = str(raw["id"])
+    key = str(raw.get("key") or f"{provider}:{track_id}")
+    if key != f"{provider}:{track_id}":
         raise ValueError("invalid journal")
-    if not isinstance(result.get("ok"), bool):
+    if not isinstance(raw.get("ok"), bool):
         raise ValueError("invalid journal")
     for field in ("title", "error", "quality"):
-        if not isinstance(result.get(field, ""), str):
+        if not isinstance(raw.get(field, ""), str):
             raise ValueError("invalid journal")
-    result["id"] = str(result["id"])
-    result["provider"] = provider
-    result["key"] = key
-    result["error"] = _sanitize_public_text(result.get("error", ""), fallback="operation failed")
+    if "reconciled" in raw and not isinstance(raw["reconciled"], bool):
+        raise ValueError("invalid journal")
+    result = {
+        "provider": provider,
+        "id": track_id,
+        "key": key,
+        "title": raw.get("title", ""),
+        "ok": raw["ok"],
+        "error": _sanitize_public_text(raw.get("error", ""), fallback="operation failed"),
+        "quality": raw.get("quality", ""),
+    }
+    if "reconciled" in raw:
+        result["reconciled"] = raw["reconciled"]
     return result
+
+
+def _validate_job_coherence(job: dict) -> None:
+    track_keys = [_result_key(track) for track in job["tracks"]]
+    result_keys = [str(item["key"]) for item in job["results"]]
+    if len(set(track_keys)) != len(track_keys) or len(set(result_keys)) != len(result_keys):
+        raise ValueError("invalid journal")
+    if job.get("mode") in IDEMPOTENT_DOWNLOAD_MODES:
+        if job["total"] != len(track_keys):
+            raise ValueError("invalid journal")
+        if any(key not in set(track_keys) for key in result_keys):
+            raise ValueError("invalid journal")
+    if job["done"] != len(result_keys):
+        raise ValueError("invalid journal")
+    failed_results = sum(1 for item in job["results"] if not item["ok"])
+    if job["failed"] != failed_results:
+        raise ValueError("invalid journal")
+    if job["done"] > job["total"] or job["failed"] > job["done"]:
+        raise ValueError("invalid journal")
+    if job["state"] == "done":
+        if job["outcome"] == "succeeded" and (job["failed"] != 0 or job["done"] != job["total"]):
+            raise ValueError("invalid journal")
+        if job["outcome"] == "partial_failure" and not (0 < job["failed"] < job["total"] and job["done"] == job["total"]):
+            raise ValueError("invalid journal")
 
 
 def _validate_terminal_error(error: object) -> dict:
@@ -337,11 +414,12 @@ def enqueue(
 ) -> str:
     _require_initialized()
     job_id = uuid.uuid4().hex[:8]
+    canonical_tracks = _canonicalize_tracks(tracks)
     job = {
         "id": job_id,
         "playlist_id": playlist_id,
         "title": playlist_title,
-        "total": len(tracks),
+        "total": len(canonical_tracks),
         "done": 0,
         "failed": 0,
         "current": None,
@@ -349,7 +427,7 @@ def enqueue(
         "outcome": "pending",
         "mode": mode,
         "results": [],
-        "tracks": [dict(t) for t in tracks],
+        "tracks": canonical_tracks,
         "created_at": _now(),
         "terminal_error": None,
     }

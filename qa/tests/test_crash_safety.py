@@ -559,6 +559,46 @@ class DurableJobJournalTests(unittest.TestCase):
         self.assertEqual("queued", jobs.get_job(job_id)["state"])
         self.assertEqual([], jobs.get_job(job_id)["results"])
 
+    def test_enqueue_canonicalizes_tracks_and_never_persists_or_snapshots_unknown_fields(self) -> None:
+        jobs = self.jobs
+        jobs.initialize(self.data_root, start_worker=False)
+        dirty_track = {
+            **_track("1"),
+            "credential": "generated-token-" + uuid.uuid4().hex,
+            "nested": {"oauth_token": "generated-token-" + uuid.uuid4().hex},
+            "duration": 180.5,
+            "position": 4,
+            "total": 9,
+        }
+
+        job_id = jobs.enqueue("playlist", "Playlist", [dirty_track], mode="append", start_worker=False)
+
+        for snapshot in (jobs.get_job(job_id), jobs.list_jobs()[0]):
+            stored_track = snapshot["tracks"][0]
+            self.assertEqual(
+                {
+                    "id": "1",
+                    "title": "Title 1",
+                    "artist": "Artist 1",
+                    "album": "Synthetic",
+                    "duration": 180.5,
+                    "provider": "deezer",
+                    "url": "https://example.invalid/1",
+                    "position": 4,
+                    "total": 9,
+                },
+                stored_track,
+            )
+            self.assertNotIn("credential", json.dumps(snapshot, ensure_ascii=False))
+            self.assertNotIn("oauth_token", json.dumps(snapshot, ensure_ascii=False))
+
+        for path in (self.data_root / "jobs.json", self.data_root / "jobs.json.bak"):
+            serialized = path.read_text(encoding="utf-8")
+            self.assertNotIn("credential", serialized)
+            self.assertNotIn("oauth_token", serialized)
+            self.assertEqual(["provider", "id", "title", "artist", "album", "url", "duration", "position", "total"],
+                             list(_read_json(path)["jobs"][job_id]["tracks"][0].keys()))
+
     def test_journal_recovers_backup_requeues_only_unfinished_idempotent_jobs_and_interrupts_flip(self) -> None:
         jobs = self.jobs
         self.assertTrue(hasattr(jobs, "initialize"), "jobs.initialize must explicitly bind a data root")
@@ -746,6 +786,46 @@ class DurableJobJournalTests(unittest.TestCase):
         self.assertEqual("queued", jobs.get_job(new_id)["state"])
         self.assertEqual([], jobs.get_job(new_id)["results"])
 
+    def test_same_root_reinitialize_during_inflight_processing_does_not_duplicate_or_restart_item(self) -> None:
+        jobs = self.jobs
+        entered = threading.Event()
+        release = threading.Event()
+        calls: list[str] = []
+        calls_lock = threading.Lock()
+
+        def fake_process(_job, _pl_dir, track, *_args):
+            with calls_lock:
+                calls.append(f"{track.get('provider', 'deezer')}:{track['id']}")
+            entered.set()
+            release.wait(1)
+            return True, "", "flac"
+
+        jobs.initialize(self.data_root, start_worker=False)
+        with (
+            patch.object(jobs, "playlist_dir", return_value=Path(self.tmp.name) / "playlist"),
+            patch.object(jobs, "_process_track", side_effect=fake_process),
+        ):
+            job_id = jobs.enqueue("playlist", "Playlist", [_track("1")], mode="append", start_worker=True)
+            self.assertTrue(entered.wait(1))
+            try:
+                jobs.initialize(self.data_root, start_worker=True)
+            except RuntimeError:
+                pass
+            threading.Event().wait(0.05)
+            release.set()
+            deadline = time.time() + 1
+            while time.time() < deadline and jobs.get_job(job_id)["state"] != "done":
+                threading.Event().wait(0.01)
+
+        self.assertEqual(["deezer:1"], calls)
+        job = jobs.get_job(job_id)
+        self.assertIsNotNone(job)
+        self.assertEqual("done", job["state"])
+        self.assertEqual("succeeded", job["outcome"])
+        self.assertEqual(1, job["total"])
+        self.assertEqual(1, job["done"])
+        self.assertEqual(["deezer:1"], [item["key"] for item in job["results"]])
+
     def test_worker_exception_persists_only_public_error_text(self) -> None:
         jobs = self.jobs
         jobs.initialize(self.data_root, start_worker=False)
@@ -795,6 +875,39 @@ class DurableJobJournalTests(unittest.TestCase):
         self.assertEqual(["sc"], [item["provider"] for item in pending])
         self.assertEqual("deezer:1", job["results"][0]["key"])
         self.assertEqual("deezer", job["results"][0]["provider"])
+
+    def test_duplicate_same_provider_tracks_process_once_and_same_raw_id_across_providers_stays_distinct(self) -> None:
+        jobs = self.jobs
+        calls: list[str] = []
+
+        def fake_process(_job, _pl_dir, track, *_args):
+            calls.append(f"{track.get('provider', 'deezer')}:{track['id']}")
+            return True, "", "flac"
+
+        jobs.initialize(self.data_root, start_worker=False)
+        with (
+            patch.object(jobs, "playlist_dir", return_value=Path(self.tmp.name) / "playlist"),
+            patch.object(jobs, "_process_track", side_effect=fake_process),
+        ):
+            job_id = jobs.enqueue(
+                "playlist",
+                "Playlist",
+                [_track("1", "deezer"), _track("1", "deezer"), _track("1", "sc")],
+                mode="append",
+                start_worker=True,
+            )
+            deadline = time.time() + 1
+            while time.time() < deadline and jobs.get_job(job_id)["state"] != "done":
+                threading.Event().wait(0.01)
+
+        job = jobs.get_job(job_id)
+        self.assertEqual(["deezer:1", "sc:1"], calls)
+        self.assertEqual("done", job["state"])
+        self.assertEqual("succeeded", job["outcome"])
+        self.assertEqual(2, job["total"])
+        self.assertEqual(2, job["done"])
+        self.assertEqual(0, job["failed"])
+        self.assertEqual(["deezer:1", "sc:1"], [item["key"] for item in job["results"]])
 
     def test_restart_reconciles_ready_sidecar_without_calling_downloader(self) -> None:
         jobs = self.jobs
@@ -856,6 +969,8 @@ class DurableJobJournalTests(unittest.TestCase):
             job = reloaded.get_job(job_id)
             self.assertEqual("done", job["state"])
             self.assertEqual(2, job["done"])
+            self.assertEqual(2, job["total"])
+            self.assertEqual("succeeded", job["outcome"])
             self.assertEqual(["deezer:1", "sc:1"], [item["key"] for item in job["results"]])
 
     def test_malformed_nested_journal_recovers_valid_backup(self) -> None:
@@ -905,6 +1020,99 @@ class DurableJobJournalTests(unittest.TestCase):
 
         for payload in malformed_cases:
             journal.write_text(json.dumps(payload), encoding="utf-8")
+            reloaded = importlib.reload(jobs)
+            reloaded.initialize(self.data_root, start_worker=False)
+            self.assertIsNotNone(reloaded.get_job(valid_id))
+            self.assertEqual(valid_backup, backup.read_bytes())
+
+    def test_incoherent_journal_primary_recovers_backup_without_replacing_backup(self) -> None:
+        jobs = self.jobs
+        jobs.initialize(self.data_root, start_worker=False)
+        valid_id = jobs.enqueue("playlist", "Playlist", [_track("1")], mode="append", start_worker=False)
+        journal = self.data_root / "jobs.json"
+        backup = self.data_root / "jobs.json.bak"
+        valid_backup = backup.read_bytes()
+        incoherent = {
+            "version": 1,
+            "jobs": {
+                "bad": {
+                    "id": "bad",
+                    "playlist_id": "p",
+                    "title": "t",
+                    "state": "queued",
+                    "outcome": "pending",
+                    "mode": "append",
+                    "created_at": 1,
+                    "total": 1,
+                    "done": 1,
+                    "failed": 0,
+                    "tracks": [{"id": "1", "title": "t", "provider": "deezer"}],
+                    "results": [],
+                    "current": None,
+                    "terminal_error": None,
+                }
+            },
+        }
+        journal.write_text(json.dumps(incoherent), encoding="utf-8")
+
+        reloaded = importlib.reload(jobs)
+        reloaded.initialize(self.data_root, start_worker=False)
+
+        self.assertIsNotNone(reloaded.get_job(valid_id))
+        self.assertEqual(valid_backup, backup.read_bytes())
+
+    def test_strict_journal_schema_rejects_result_key_and_count_incoherence(self) -> None:
+        jobs = self.jobs
+        jobs.initialize(self.data_root, start_worker=False)
+        valid_id = jobs.enqueue("playlist", "Playlist", [_track("1")], mode="append", start_worker=False)
+        journal = self.data_root / "jobs.json"
+        backup = self.data_root / "jobs.json.bak"
+        valid_backup = backup.read_bytes()
+
+        def job_fixture(**overrides: object) -> dict[str, object]:
+            job = {
+                "id": "bad",
+                "playlist_id": "p",
+                "title": "t",
+                "state": "done",
+                "outcome": "succeeded",
+                "mode": "append",
+                "created_at": 1,
+                "total": 1,
+                "done": 1,
+                "failed": 0,
+                "tracks": [{"id": "1", "title": "t", "provider": "deezer"}],
+                "results": [
+                    {"id": "1", "provider": "deezer", "key": "deezer:1", "title": "t", "ok": True, "error": "", "quality": "flac"}
+                ],
+                "current": None,
+                "terminal_error": None,
+            }
+            job.update(overrides)
+            return job
+
+        malformed_cases = [
+            job_fixture(
+                done=2,
+                results=[
+                    {"id": "1", "provider": "deezer", "key": "deezer:1", "title": "t", "ok": True, "error": "", "quality": "flac"},
+                    {"id": "1", "provider": "deezer", "key": "deezer:1", "title": "t", "ok": True, "error": "", "quality": "flac"},
+                ],
+            ),
+            job_fixture(
+                results=[
+                    {"id": "2", "provider": "deezer", "key": "deezer:2", "title": "other", "ok": True, "error": "", "quality": "flac"}
+                ],
+            ),
+            job_fixture(results=[]),
+            job_fixture(failed=1),
+            job_fixture(outcome="succeeded", failed=1, results=[
+                {"id": "1", "provider": "deezer", "key": "deezer:1", "title": "t", "ok": False, "error": "failed", "quality": ""}
+            ]),
+        ]
+
+        for malformed in malformed_cases:
+            journal.write_text(json.dumps({"version": 1, "jobs": {"bad": malformed}}), encoding="utf-8")
             reloaded = importlib.reload(jobs)
             reloaded.initialize(self.data_root, start_worker=False)
             self.assertIsNotNone(reloaded.get_job(valid_id))
