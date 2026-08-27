@@ -125,6 +125,7 @@ Commit: `build(frontend): create canonical CSP-safe assets`
 - Modify: `desktop/src-tauri/permissions/service-login.toml`
 - Create: `desktop/src-tauri/permissions/backend-connection.toml`
 - Modify: `run_backend.py`
+- Modify: `dev.js`
 - Create: `qa/tests/test_desktop_contract.py`
 
 **Step 1: Write failing desktop contract tests**
