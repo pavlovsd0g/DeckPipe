@@ -10,6 +10,7 @@ import time
 import uuid
 from pathlib import Path
 
+from . import rekordbox as rb
 from .atomic_io import (
     atomic_load_json,
     atomic_write_json,
@@ -24,6 +25,8 @@ from .library import is_ready_entry, load_sidecar, max_position, numbered_name, 
 AUTO_RETRIES = 2
 JOURNAL_VERSION = 1
 IDEMPOTENT_DOWNLOAD_MODES = {"append", "playlist_order"}
+MAX_REKORDBOX_FLIP_WORKERS = 4
+convert_to_wav = None
 
 _jobs: dict[str, dict] = {}
 _queue: list[str] = []
@@ -880,10 +883,12 @@ def enqueue_flip(
     workers: int = 0,
     *,
     start_worker: bool | None = None,
+    allow_rekordbox_apply: bool = False,
 ) -> str:
     _require_initialized()
-    if start_worker is not False:
+    if start_worker is not False and not allow_rekordbox_apply:
         raise RuntimeError("Rekordbox mutation jobs are disabled until Task 5")
+    workers = max(1, min(int(workers or (os.cpu_count() or 1)), MAX_REKORDBOX_FLIP_WORKERS))
     job_id = uuid.uuid4().hex[:8]
     job = {
         "id": job_id,
@@ -902,6 +907,7 @@ def enqueue_flip(
         "terminal_error": None,
         "to_wav": to_wav,
         "workers": workers,
+        "allow_rekordbox_apply": bool(allow_rekordbox_apply),
     }
     with _lock:
         candidate_jobs = copy.deepcopy(_jobs)
@@ -916,13 +922,18 @@ def enqueue_flip(
 
 def _flip_worker(job_id: str, to_wav: bool, workers: int):
     from concurrent.futures import ThreadPoolExecutor
-    from .converter import convert_to_wav
-    from . import rekordbox as rb
 
     try:
         mark_running(job_id)
         with _lock:
             job = _jobs[job_id]
+        if not job.get("allow_rekordbox_apply"):
+            mark_terminal(job_id, outcome="failed", error={"code": "rekordbox_apply_disabled", "message": "Rekordbox mutation is disabled"})
+            return
+        workers = max(1, min(int(workers or job.get("workers") or 1), MAX_REKORDBOX_FLIP_WORKERS))
+        with _lock:
+            job["workers"] = workers
+            _persist_locked()
         pl_dir = playlist_dir(job["playlist_id"], job["title"])
         sc = load_sidecar(pl_dir)
         tracks = {tid: e for tid, e in sc.get("tracks", {}).items() if is_ready_entry(pl_dir, e)}
@@ -957,21 +968,25 @@ def _flip_worker(job_id: str, to_wav: bool, workers: int):
 
         converted = {}
         if to_wav:
-            workers = workers or min(8, (os.cpu_count() or 4))
+            converter = convert_to_wav
+            if converter is None:
+                from .converter import convert_to_wav as converter
 
             def _conv(item):
                 tid, e, src, _dst = item
                 stage = None
                 try:
-                    from mutagen import File as MutagenFile
+                    ref = float(e.get("duration_actual") or e.get("duration_expected") or e.get("duration") or 0)
+                    if ref <= 0:
+                        from mutagen import File as MutagenFile
 
-                    ref = float(MutagenFile(str(src)).info.length)
-                    stage = convert_to_wav(src)
+                        ref = float(MutagenFile(str(src)).info.length)
+                    stage = converter(src)
                     v_ok, _v_err, _ = verify_file(stage, ref, tolerance=0.5)
                     if not v_ok:
                         cleanup_owned_stages(stage)
                         return tid, None, _public_error("conversion")
-                    wav = publish_staged_file(stage, final_path_from_stage(stage))
+                    wav = stage if not is_partial_path(stage) else publish_staged_file(stage, final_path_from_stage(stage))
                     return tid, wav, ""
                 except Exception:
                     cleanup_owned_stages(stage)
@@ -990,54 +1005,59 @@ def _flip_worker(job_id: str, to_wav: bool, workers: int):
                 mark_item_complete(job_id, {"id": tid, "title": e["title"]},
                                    ok=exists, error="" if exists else "WAV not found", quality="")
 
-        backup = rb.backup_db()
-        db = rb.open_db()
-        rb_updated = 0
-        try:
-            by_path = {}
-            for c in db.get_content():
-                if c.FolderPath:
-                    by_path[os.path.normcase(str(c.FolderPath))] = c
-            for tid, e, old_rb, new_rb in plan:
-                wav, _ = converted.get(tid, (None, ""))
-                target = new_rb if (to_wav and wav) or not to_wav else None
-                if target is None:
-                    continue
-                content = by_path.get(os.path.normcase(str(old_rb)))
-                if content is None:
-                    continue
-                try:
-                    db.update_content_path(content, target, save=True, commit=False)
-                except Exception:
-                    new_p = str(target).replace("\\", "/")
-                    old_p = content.FolderPath
-                    if content.OrgFolderPath == old_p:
-                        content.OrgFolderPath = new_p
-                    content.FolderPath = new_p
-                    content.FileNameL = new_p.split("/")[-1]
-                content.FileType = FILETYPE_BY_EXT.get(target.suffix.lower(), content.FileType)
-                content.FileSize = target.stat().st_size
-                rb_updated += 1
-            db.commit()
+        desired = []
+        ready_tids = []
+        for tid, e, _old_rb, new_rb in plan:
+            wav, _err = converted.get(tid, (None, ""))
+            target = new_rb if (to_wav and wav) or (not to_wav and wav is not None) else None
+            if target is None:
+                continue
+            provider = e.get("provider", "deezer")
+            desired.append({
+                "provider_id": f"{provider}:{tid}",
+                "title": e.get("title", ""),
+                "artist": e.get("artist", ""),
+                "album": e.get("album", ""),
+                "duration": int(e.get("duration_expected") or e.get("duration") or 0),
+                "position": int(e.get("position") or 0),
+                "path": str(target),
+            })
+            ready_tids.append(tid)
+
+        def _advance_sidecar(_result):
             sc = load_sidecar(pl_dir)
-            for tid, e, old_rb, new_rb in plan:
-                wav, err = converted.get(tid, (None, ""))
-                if to_wav and wav:
+            for tid in ready_tids:
+                if to_wav:
                     sc["tracks"][tid]["flipped_to"] = "wav"
-                elif not to_wav and wav is not None:
+                else:
                     sc["tracks"][tid].pop("flipped_to", None)
             save_sidecar(pl_dir, sc)
+
+        if len(desired) != len(plan):
+            mark_terminal(job_id, outcome="failed", error={"code": "rekordbox_plan_incomplete", "message": "Rekordbox sync failed"})
+            return
+        sync_result = rb.sync_playlist(
+            job["title"],
+            desired,
+            dry_run=False,
+            confirmation_token=rb.APPLY_CONFIRMATION_TOKEN,
+            on_reconciled=_advance_sidecar,
+        )
+        with _lock:
+            job["backup_id"] = sync_result.get("backup_id")
+            job["rb_updated"] = sync_result.get("plan", {}).get("counts", {}).get("resolved", 0) if sync_result.get("reconciled") else 0
+            _persist_locked()
+        if not sync_result.get("reconciled"):
             with _lock:
-                job["backup"] = str(backup)
-                job["rb_updated"] = rb_updated
+                for result in job["results"]:
+                    result["ok"] = False
+                    result["error"] = "Rekordbox sync failed"
+                    result["quality"] = ""
+                job["failed"] = len(job["results"])
+                job["done"] = len(job["results"])
                 _persist_locked()
-        except Exception:
-            db.rollback()
-            with _lock:
-                job["error"] = "master.db write failed"
-                _persist_locked()
-        finally:
-            db.close()
+            mark_terminal(job_id, outcome="failed", error=sync_result.get("error") or {"code": "rekordbox_sync_failed", "message": "Rekordbox sync failed"})
+            return
         with _lock:
             failed = _jobs[job_id]["failed"]
             total = _jobs[job_id]["total"]

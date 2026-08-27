@@ -1,8 +1,9 @@
 [CmdletBinding()]
 param(
-    [string]$DatabasePath = (Join-Path $env:APPDATA 'Pioneer\rekordbox\master.db'),
+    [string]$DatabasePath = '',
     [string]$OutputDirectory = '',
-    [string]$PythonPath = ''
+    [string]$PythonPath = '',
+    [switch]$DisposableCopyAcknowledged
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,6 +20,12 @@ $modulePath = Join-Path $PSScriptRoot 'DeckPipe.QA.psm1'
 $auditPath = Join-Path $repoRoot 'audit\check_rekordbox_unicode.py'
 Import-Module $modulePath -Force
 
+if ([string]::IsNullOrWhiteSpace($DatabasePath)) {
+    throw 'DatabasePath is required. Pass an explicit disposable Rekordbox database copy path.'
+}
+if (-not $DisposableCopyAcknowledged) {
+    throw 'DisposableCopyAcknowledged is required to confirm the source can be copied for read-only QA.'
+}
 foreach ($requiredPath in @($DatabasePath, $PythonPath, $auditPath)) {
     if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
         throw "Required file was not found: $requiredPath"

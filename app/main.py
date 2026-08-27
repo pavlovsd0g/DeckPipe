@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """DeckPipe MVP — FastAPI бэкенд."""
 import asyncio
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -723,10 +724,54 @@ class RbSyncIn(BaseModel):
     playlist_title: str
 
 
+def _desired_tracks_for_rekordbox(playlist_key: str, playlist_title: str) -> list[dict]:
+    pl_dir = library.playlist_dir(playlist_key, playlist_title or playlist_key)
+    sidecar = library.load_sidecar(pl_dir)
+    desired = []
+    for tid, entry in sidecar.get("tracks", {}).items():
+        if not library.is_ready_entry(pl_dir, entry):
+            continue
+        provider = entry.get("provider", "deezer")
+        path = Path(pl_dir) / entry["file"]
+        desired.append({
+            "provider_id": f"{provider}:{tid}",
+            "title": entry.get("title", ""),
+            "artist": entry.get("artist", ""),
+            "album": entry.get("album", ""),
+            "duration": int(entry.get("duration_expected") or entry.get("duration") or 0),
+            "position": int(entry.get("position") or 0),
+            "path": str(path),
+        })
+    return sorted(desired, key=lambda item: (item["position"], item["provider_id"]))
+
+
+def _rb_apply_authorized(confirmation_token: str | None) -> bool:
+    return os.environ.get("DECKPIPE_RB_EXPERIMENTAL") == "1" and confirmation_token == rb.APPLY_CONFIRMATION_TOKEN
+
+
 @app.post("/api/rb/sync")
-def api_rb_sync(body: RbSyncIn):
+def api_rb_sync(body: RbSyncIn, dry_run: bool = True, confirmation_token: str | None = None):
     """Синк локального плейлиста (ок-треки по порядку) в Rekordbox."""
-    raise HTTPException(409, "Rekordbox mutation is disabled until Task 5")
+    apply_requested = not dry_run
+    effective_dry_run = True
+    if apply_requested and _rb_apply_authorized(confirmation_token):
+        effective_dry_run = False
+    desired = _desired_tracks_for_rekordbox(body.playlist_key, body.playlist_title)
+    result = rb.sync_playlist(
+        body.playlist_title,
+        desired,
+        dry_run=effective_dry_run,
+        confirmation_token=confirmation_token if not effective_dry_run else None,
+    )
+    return {
+        "dry_run": bool(result.get("dry_run")),
+        "applied": bool(result.get("applied")),
+        "reconciled": bool(result.get("reconciled")),
+        "unresolved": result.get("unresolved", []),
+        "backup_id": result.get("backup_id"),
+        "error": result.get("error"),
+        "plan": result.get("plan"),
+    }
 
 
 class FlipIn(BaseModel):
