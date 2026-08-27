@@ -16,7 +16,7 @@ param(
     [switch]$IsolatedUi,
     [switch]$ValidateOnly,
     [switch]$AllowUnsignedEngineeringEvidence,
-    [ValidateSet('', 'identity', 'isolated-preflight', 'listener-owned', 'listener-none', 'listener-multiple', 'listener-unowned', 'listener-wrong-path', 'listener-pid-reuse', 'mandatory-skips')]
+    [ValidateSet('', 'identity', 'isolated-preflight', 'listener-owned', 'listener-none', 'listener-multiple', 'listener-unowned', 'listener-wrong-path', 'listener-pid-reuse', 'mandatory-skips', 'verifier-process-contract', 'reparse-attribute-guard')]
     [string]$SelfTestContract = ''
 )
 
@@ -93,6 +93,475 @@ function Get-PropertyValue {
     return $property.Value
 }
 
+function Test-DeckPipeHasReparseAttribute {
+    param([Parameter(Mandatory)]$Attributes)
+
+    return [bool](([IO.FileAttributes]$Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+}
+
+function Assert-DeckPipeNoReparseAttributes {
+    param(
+        [Parameter(Mandatory)]$Attributes,
+        [Parameter(Mandatory)][string]$Context
+    )
+
+    if (Test-DeckPipeHasReparseAttribute -Attributes $Attributes) {
+        throw "$Context reparse point is not allowed."
+    }
+}
+
+function Assert-DeckPipeItemNotReparse {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Context
+    )
+
+    $item = Get-Item -LiteralPath $Path -Force
+    Assert-DeckPipeNoReparseAttributes -Attributes $item.Attributes -Context $Context
+    return $item
+}
+
+function Get-DeckPipeReleaseRelativePath {
+    param([Parameter(Mandatory)][string]$RelativePath)
+
+    if ([string]::IsNullOrWhiteSpace($RelativePath)) { throw 'empty release path' }
+    $path = ($RelativePath -replace '\\', '/')
+    if ($path -match '^[A-Za-z]:|^/|//|:') {
+        throw "path traversal, ADS, or escape in release path: $RelativePath"
+    }
+    $parts = @($path -split '/' | Where-Object { $_ -ne '' })
+    if ($parts.Count -eq 0) { throw 'empty release path' }
+    foreach ($part in $parts) {
+        if ($part -eq '.' -or $part -eq '..') {
+            throw "path traversal or escape in release path: $RelativePath"
+        }
+    }
+    if ($parts.Count -ne 1) { throw "nested release paths are not allowed: $RelativePath" }
+    return $parts[0]
+}
+
+function Assert-DeckPipeNoForbiddenReleasePath {
+    param([Parameter(Mandatory)][string]$RelativePath)
+
+    $normalized = Get-DeckPipeReleaseRelativePath -RelativePath $RelativePath
+    if ($normalized -match '(^|/)(config\.local\.json|cookies?\.txt|master\.db)$') {
+        throw "forbidden staged file: $RelativePath"
+    }
+    if ($normalized -match '(?i)(credential|secret|token|cookie|profile|appdata|localappdata|rekordbox|master\.db|\.sqlite|\.db$|\.media$)') {
+        throw "forbidden staged file: $RelativePath"
+    }
+    return $normalized
+}
+
+function Test-DeckPipeArtifactPath {
+    param([Parameter(Mandatory)][string]$RelativePath)
+
+    $extension = [IO.Path]::GetExtension($RelativePath).ToLowerInvariant()
+    return ($extension -eq '.exe' -or $extension -eq '.msi')
+}
+
+function Get-DeckPipeArtifactType {
+    param([Parameter(Mandatory)][string]$RelativePath)
+
+    $extension = [IO.Path]::GetExtension($RelativePath).ToLowerInvariant()
+    if ($extension -eq '.exe') { return 'exe' }
+    if ($extension -eq '.msi') { return 'msi' }
+    throw "unexpected artifact extension: $RelativePath"
+}
+
+function Assert-DeckPipeCanonicalArtifactName {
+    param(
+        [Parameter(Mandatory)][string]$RelativePath,
+        [Parameter(Mandatory)]$Evidence
+    )
+
+    $shortRevision = ([string]$Evidence.source_revision).Substring(0, 7)
+    $prefix = 'DeckPipe-' + [regex]::Escape([string]$Evidence.build_id) + '-' + [regex]::Escape($shortRevision)
+    $pattern = '^' + $prefix + '-x64(\.exe|-setup\.exe|\.msi)$'
+    if ($RelativePath -notmatch $pattern) {
+        throw "ambiguous executable artifact or non-canonical artifact name for evidence version/build/source: $RelativePath"
+    }
+}
+
+function Assert-DeckPipeKeySetsEqual {
+    param(
+        [hashtable]$Expected,
+        [hashtable]$Actual,
+        [string]$Context
+    )
+
+    foreach ($key in @($Expected.Keys)) {
+        if (-not $Actual.ContainsKey($key)) { throw "$Context missing: $($Expected[$key])" }
+    }
+    foreach ($key in @($Actual.Keys)) {
+        if (-not $Expected.ContainsKey($key)) { throw "$Context extra: $($Actual[$key])" }
+    }
+}
+
+function Get-DeckPipeStageFileRecords {
+    param([Parameter(Mandatory)][string]$StagePath)
+
+    Assert-DeckPipeItemNotReparse -Path $StagePath -Context 'CandidateEvidenceDirectory' | Out-Null
+    $records = @()
+    $seen = @{}
+    $metadataFiles = @('release-evidence.json', 'sbom.spdx.json', 'SHA256SUMS.txt')
+    foreach ($entry in @(Get-ChildItem -LiteralPath $StagePath -Force | Sort-Object Name)) {
+        Assert-DeckPipeNoReparseAttributes -Attributes $entry.Attributes -Context "evidence top-level entry $($entry.Name)"
+        if ($entry.PSIsContainer) { throw "staging subdirectories are not allowed: $($entry.Name)" }
+        $relative = Assert-DeckPipeNoForbiddenReleasePath -RelativePath $entry.Name
+        $key = $relative.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { throw "duplicate or case-confusable staged path: $relative" }
+        $seen[$key] = $true
+
+        $metadataMatch = @($metadataFiles | Where-Object { $_ -ieq $relative })
+        if ($metadataMatch.Count -gt 0 -and $metadataMatch[0] -cne $relative) {
+            throw "case-confusable release metadata path: $relative"
+        }
+        if ($metadataMatch.Count -eq 0 -and -not (Test-DeckPipeArtifactPath -RelativePath $relative)) {
+            throw "extra staged file outside release allowlist: $relative"
+        }
+        $records += [pscustomobject]@{
+            RelativePath = $relative
+            FullName = $entry.FullName
+            Sha256 = (Get-FileHash -LiteralPath $entry.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+    }
+    foreach ($required in $metadataFiles) {
+        if (-not $seen.ContainsKey($required.ToLowerInvariant())) {
+            throw "required release file is missing: $required"
+        }
+    }
+    return $records
+}
+
+function Read-DeckPipeManifestEntries {
+    param([Parameter(Mandatory)][string]$StagePath)
+
+    $manifestPath = Join-Path $StagePath 'SHA256SUMS.txt'
+    Assert-DeckPipeItemNotReparse -Path $manifestPath -Context 'evidence top-level entry SHA256SUMS.txt' | Out-Null
+    $entries = @()
+    $seen = @{}
+    foreach ($line in @(Get-Content -LiteralPath $manifestPath)) {
+        if (-not $line.Trim()) { continue }
+        if ($line -notmatch '^([0-9a-f]{64})  (.+)$') { throw "invalid SHA-256 manifest line: $line" }
+        $relative = Assert-DeckPipeNoForbiddenReleasePath -RelativePath $Matches[2]
+        if ($relative -eq 'SHA256SUMS.txt') { throw 'SHA-256 manifest must not contain itself' }
+        $key = $relative.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { throw "duplicate or case-confusable manifest path: $relative" }
+        $seen[$key] = $true
+        $entries += [pscustomobject]@{ RelativePath = $relative; Sha256 = $Matches[1] }
+    }
+    return $entries
+}
+
+function Assert-DeckPipeManifestExact {
+    param(
+        [Parameter(Mandatory)][string]$StagePath,
+        [object[]]$ActualFiles = $null
+    )
+
+    if ($null -eq $ActualFiles) { $ActualFiles = @(Get-DeckPipeStageFileRecords -StagePath $StagePath) }
+    $entries = @(Read-DeckPipeManifestEntries -StagePath $StagePath)
+    $actualByPath = @{}
+    foreach ($file in @($ActualFiles | Where-Object { $_.RelativePath -ne 'SHA256SUMS.txt' })) {
+        $actualByPath[$file.RelativePath.ToLowerInvariant()] = $file.RelativePath
+    }
+    $manifestByPath = @{}
+    foreach ($entry in $entries) { $manifestByPath[$entry.RelativePath.ToLowerInvariant()] = $entry.RelativePath }
+    Assert-DeckPipeKeySetsEqual -Expected $actualByPath -Actual $manifestByPath -Context 'manifest/staging inventory mismatch'
+
+    $actualHashByPath = @{}
+    foreach ($file in $ActualFiles) { $actualHashByPath[$file.RelativePath.ToLowerInvariant()] = $file.Sha256 }
+    foreach ($entry in $entries) {
+        if ($actualHashByPath[$entry.RelativePath.ToLowerInvariant()] -ne $entry.Sha256) {
+            throw "manifest hash mismatch: $($entry.RelativePath)"
+        }
+    }
+    return $entries
+}
+
+function Read-DeckPipeReleaseEvidence {
+    param(
+        [Parameter(Mandatory)][string]$StagePath,
+        [Parameter(Mandatory)]$ManifestEntries
+    )
+
+    $evidencePath = Join-Path $StagePath 'release-evidence.json'
+    Assert-DeckPipeItemNotReparse -Path $evidencePath -Context 'evidence top-level entry release-evidence.json' | Out-Null
+    $evidence = Get-Content -LiteralPath $evidencePath -Raw | ConvertFrom-Json
+    foreach ($required in @('schema_version', 'product', 'version', 'build_id', 'source_revision', 'artifacts', 'signing', 'timestamp')) {
+        if (-not ($evidence.PSObject.Properties.Name -contains $required)) {
+            throw "malformed release evidence: missing $required"
+        }
+    }
+    foreach ($required in @('status', 'signed')) {
+        if (-not ($evidence.signing.PSObject.Properties.Name -contains $required)) {
+            throw "malformed release evidence: signing missing $required"
+        }
+    }
+    if (-not ($evidence.timestamp.PSObject.Properties.Name -contains 'status')) {
+        throw 'malformed release evidence: timestamp missing status'
+    }
+    if ($evidence.product -ne 'DeckPipe' -or $evidence.version -ne '0.6.0') {
+        throw 'malformed release evidence: product/version mismatch'
+    }
+    if ($evidence.build_id -notmatch '^0\.6\.0\+[0-9]{8}\.[0-9]{6}\.[0-9a-f]{7,40}$') {
+        throw 'malformed release evidence: invalid build_id'
+    }
+    if ($evidence.source_revision -notmatch '^[0-9a-f]{40}$') {
+        throw 'malformed release evidence: invalid source revision'
+    }
+
+    $artifacts = @($evidence.artifacts)
+    $signed = @($evidence.signing.signed)
+    if ($artifacts.Count -eq 0) { throw 'release evidence artifacts must be nonempty' }
+    if ($signed.Count -eq 0) { throw 'release evidence signing.signed must be nonempty' }
+
+    $manifestByPath = @{}
+    foreach ($entry in $ManifestEntries) { $manifestByPath[$entry.RelativePath.ToLowerInvariant()] = $entry }
+    $artifactByPath = @{}
+    foreach ($artifact in $artifacts) {
+        foreach ($required in @('path', 'sha256', 'type')) {
+            if (-not ($artifact.PSObject.Properties.Name -contains $required)) {
+                throw "malformed release evidence: artifact missing $required"
+            }
+        }
+        $relative = Assert-DeckPipeNoForbiddenReleasePath -RelativePath ([string]$artifact.path)
+        Assert-DeckPipeCanonicalArtifactName -RelativePath $relative -Evidence $evidence
+        $expectedType = Get-DeckPipeArtifactType -RelativePath $relative
+        if ([string]$artifact.type -ne $expectedType) {
+            throw "malformed release evidence: artifact type/extension mismatch $relative"
+        }
+        $key = $relative.ToLowerInvariant()
+        if ($artifactByPath.ContainsKey($key)) { throw "duplicate or case-confusable evidence artifact path: $relative" }
+        $artifactByPath[$key] = $relative
+        if (-not $manifestByPath.ContainsKey($key)) {
+            throw "malformed release evidence: artifact missing from manifest $relative"
+        }
+        if ($manifestByPath[$key].Sha256 -ne [string]$artifact.sha256) {
+            throw "malformed release evidence: artifact hash mismatch $relative"
+        }
+    }
+
+    $signedByPath = @{}
+    foreach ($signedPath in $signed) {
+        $relative = Assert-DeckPipeNoForbiddenReleasePath -RelativePath ([string]$signedPath)
+        $key = $relative.ToLowerInvariant()
+        if ($signedByPath.ContainsKey($key)) { throw "duplicate or case-confusable signed artifact path: $relative" }
+        $signedByPath[$key] = $relative
+    }
+    Assert-DeckPipeKeySetsEqual -Expected $artifactByPath -Actual $signedByPath -Context 'signed/artifact evidence mismatch'
+    return $evidence
+}
+
+function Assert-DeckPipeSbomExact {
+    param(
+        [Parameter(Mandatory)][string]$StagePath,
+        [Parameter(Mandatory)]$ManifestEntries,
+        [Parameter(Mandatory)]$Evidence
+    )
+
+    $sbomPath = Join-Path $StagePath 'sbom.spdx.json'
+    Assert-DeckPipeItemNotReparse -Path $sbomPath -Context 'evidence top-level entry sbom.spdx.json' | Out-Null
+    $sbom = Get-Content -LiteralPath $sbomPath -Raw | ConvertFrom-Json
+    if ($sbom.spdxVersion -ne 'SPDX-2.3') { throw 'invalid SPDX version' }
+    $describes = @($sbom.relationships | Where-Object {
+        $_.spdxElementId -eq 'SPDXRef-DOCUMENT' -and
+        $_.relationshipType -eq 'DESCRIBES' -and
+        $_.relatedSpdxElement -eq 'SPDXRef-Package-DeckPipe'
+    })
+    if ($describes.Count -ne 1) { throw 'SPDX SBOM must contain DOCUMENT DESCRIBES Package relationship' }
+
+    $expected = @{}
+    foreach ($entry in $ManifestEntries) {
+        if ($entry.RelativePath -ne 'sbom.spdx.json') { $expected[$entry.RelativePath.ToLowerInvariant()] = $entry }
+    }
+    if (-not $expected.ContainsKey('release-evidence.json')) { throw 'SBOM expected set must include release evidence' }
+
+    $sbomByPath = @{}
+    $sbomArtifactByPath = @{}
+    $fileIds = @{}
+    foreach ($file in @($sbom.files)) {
+        $relative = Assert-DeckPipeNoForbiddenReleasePath -RelativePath ([string]$file.fileName)
+        $key = $relative.ToLowerInvariant()
+        if ($fileIds.ContainsKey($file.SPDXID)) { throw "duplicate SPDXID: $($file.SPDXID)" }
+        if ($sbomByPath.ContainsKey($key)) { throw "duplicate or case-confusable SBOM file path: $relative" }
+        $fileIds[$file.SPDXID] = $true
+        $sbomByPath[$key] = $relative
+        if (-not $expected.ContainsKey($key)) { throw "SBOM contains unexpected file: $relative" }
+        $shaEntries = @($file.checksums | Where-Object { $_.algorithm -eq 'SHA256' })
+        if ($shaEntries.Count -ne 1 -or $shaEntries[0].checksumValue -ne $expected[$key].Sha256) {
+            throw "SBOM checksum mismatch: $relative"
+        }
+        $contains = @($sbom.relationships | Where-Object {
+            $_.spdxElementId -eq 'SPDXRef-Package-DeckPipe' -and
+            $_.relationshipType -eq 'CONTAINS' -and
+            $_.relatedSpdxElement -eq $file.SPDXID
+        })
+        if ($contains.Count -ne 1) { throw "SBOM missing Package CONTAINS File relationship: $relative" }
+        if (Test-DeckPipeArtifactPath -RelativePath $relative) { $sbomArtifactByPath[$key] = $relative }
+    }
+
+    $expectedByPath = @{}
+    foreach ($key in @($expected.Keys)) { $expectedByPath[$key] = $expected[$key].RelativePath }
+    Assert-DeckPipeKeySetsEqual -Expected $expectedByPath -Actual $sbomByPath -Context 'SBOM/manifest file inventory mismatch'
+
+    $evidenceArtifactByPath = @{}
+    foreach ($artifact in @($Evidence.artifacts)) {
+        $relative = Assert-DeckPipeNoForbiddenReleasePath -RelativePath ([string]$artifact.path)
+        $evidenceArtifactByPath[$relative.ToLowerInvariant()] = $relative
+    }
+    Assert-DeckPipeKeySetsEqual -Expected $evidenceArtifactByPath -Actual $sbomArtifactByPath -Context 'SBOM/evidence artifact mismatch'
+}
+
+function ConvertTo-DeckPipeWindowsArgument {
+    param([AllowNull()][string]$Argument)
+
+    if ($null -eq $Argument) { $Argument = '' }
+    if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"]') { return $Argument }
+    $builder = [Text.StringBuilder]::new()
+    [void]$builder.Append('"')
+    $backslashes = 0
+    foreach ($char in $Argument.ToCharArray()) {
+        if ($char -eq '\') {
+            $backslashes++
+            continue
+        }
+        if ($char -eq '"') {
+            [void]$builder.Append('\', ($backslashes * 2) + 1)
+            [void]$builder.Append('"')
+            $backslashes = 0
+            continue
+        }
+        if ($backslashes -gt 0) {
+            [void]$builder.Append('\', $backslashes)
+            $backslashes = 0
+        }
+        [void]$builder.Append($char)
+    }
+    if ($backslashes -gt 0) { [void]$builder.Append('\', $backslashes * 2) }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Resolve-DeckPipeVerifierPowerShell {
+    $candidates = @()
+    if (-not [string]::IsNullOrWhiteSpace($PSHOME)) {
+        $candidates += (Join-Path $PSHOME 'powershell.exe')
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:SystemRoot)) {
+        $candidates += (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
+    }
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $item = Assert-DeckPipeItemNotReparse -Path $candidate -Context 'release verifier PowerShell executable'
+            if ($item.Name -cne 'powershell.exe') {
+                throw "release verifier executable is not Windows PowerShell: $candidate"
+            }
+            return $item.FullName
+        }
+    }
+    throw 'Windows PowerShell executable was not found for release verifier isolation.'
+}
+
+function ConvertFrom-DeckPipeVerifierStdout {
+    param([AllowNull()][string]$Stdout)
+
+    $trimmed = if ($null -eq $Stdout) { '' } else { $Stdout.Trim() }
+    if ([string]::IsNullOrWhiteSpace($trimmed)) {
+        throw 'release verifier produced empty stdout.'
+    }
+    if (-not ($trimmed.StartsWith('{') -and $trimmed.EndsWith('}'))) {
+        throw 'release verifier produced noisy stdout instead of exactly one JSON object.'
+    }
+    try {
+        $json = $trimmed | ConvertFrom-Json
+    } catch {
+        throw "release verifier produced multiple or malformed JSON objects: $($_.Exception.Message)"
+    }
+    if ($json -is [array]) { throw 'release verifier produced a JSON array instead of one object.' }
+    foreach ($required in @('schema_version', 'status', 'message')) {
+        if (-not ($json.PSObject.Properties.Name -contains $required)) {
+            throw "release verifier JSON missing $required."
+        }
+    }
+    if ([string]$json.status -notin @('PASS', 'FAIL', 'BLOCKED')) {
+        throw "release verifier returned unexpected status: $($json.status)"
+    }
+    return $json
+}
+
+function Invoke-DeckPipeReleaseVerifierProcess {
+    param(
+        [Parameter(Mandatory)][string]$StagePath,
+        [string]$VerifierPath = $releaseVerifierPath,
+        [int]$TimeoutSeconds = 30
+    )
+
+    $verifierItem = Assert-DeckPipeItemNotReparse -Path $VerifierPath -Context 'release verifier script'
+    $powerShellExe = Resolve-DeckPipeVerifierPowerShell
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $powerShellExe
+    $arguments = @(
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        $verifierItem.FullName,
+        '-StagingDirectory',
+        $StagePath
+    )
+    $startInfo.Arguments = ((@($arguments) | ForEach-Object { ConvertTo-DeckPipeWindowsArgument -Argument ([string]$_) }) -join ' ')
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    if (-not [string]::IsNullOrWhiteSpace($env:SystemRoot)) {
+        $systemModulePath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
+        if (Test-Path -LiteralPath $systemModulePath -PathType Container) {
+            $startInfo.EnvironmentVariables['PSModulePath'] = $systemModulePath
+        }
+    }
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $started = $process.Start()
+    if (-not $started) { throw 'release verifier process failed to start.' }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $timeoutMs = [math]::Max(1, $TimeoutSeconds) * 1000
+    if (-not $process.WaitForExit($timeoutMs)) {
+        try { $process.Kill() } catch {}
+        try { $process.WaitForExit(5000) | Out-Null } catch {}
+        throw "release verifier timed out after $TimeoutSeconds seconds."
+    }
+    $process.WaitForExit()
+    $stdoutTask.Wait(5000) | Out-Null
+    $stderrTask.Wait(5000) | Out-Null
+    $stdout = [string]$stdoutTask.Result
+    $stderr = [string]$stderrTask.Result
+    $json = ConvertFrom-DeckPipeVerifierStdout -Stdout $stdout
+    $exitCode = [int]$process.ExitCode
+    if ([string]$json.status -eq 'PASS' -and -not [string]::IsNullOrWhiteSpace($stderr)) {
+        throw "release verifier wrote stderr while returning PASS: $stderr"
+    }
+    $expectedExit = @{ PASS = 0; FAIL = 1; BLOCKED = 2 }[[string]$json.status]
+    if ($exitCode -ne $expectedExit) {
+        throw "release verifier status/exit mismatch: status $($json.status) exit $exitCode expected $expectedExit"
+    }
+    [pscustomobject]@{
+        schema_version = [int]$json.schema_version
+        status = [string]$json.status
+        message = [string]$json.message
+        exit_code = $exitCode
+        stdout = $stdout
+        stderr = $stderr
+    }
+}
+
 function Resolve-DeckPipeEvidenceDirectory {
     if ([string]::IsNullOrWhiteSpace($CandidateEvidenceDirectory)) {
         throw 'CandidateEvidenceDirectory is required before launching installed QA.'
@@ -107,16 +576,15 @@ function Resolve-DeckPipeEvidenceDirectory {
     if (-not (Test-Path -LiteralPath $stagePath -PathType Container)) {
         throw "CandidateEvidenceDirectory was not found: $CandidateEvidenceDirectory"
     }
-    $item = Get-Item -LiteralPath $stagePath -Force
-    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw 'CandidateEvidenceDirectory reparse point is not allowed.'
-    }
+    Assert-DeckPipeItemNotReparse -Path $stagePath -Context 'CandidateEvidenceDirectory' | Out-Null
     foreach ($required in @('release-evidence.json', 'SHA256SUMS.txt', 'sbom.spdx.json')) {
         $requiredPath = Join-Path $stagePath $required
         if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
             throw "Candidate evidence is missing $required"
         }
+        Assert-DeckPipeItemNotReparse -Path $requiredPath -Context "evidence top-level entry $required" | Out-Null
     }
+    Get-DeckPipeStageFileRecords -StagePath $stagePath | Out-Null
     return $stagePath
 }
 
@@ -126,12 +594,12 @@ function Read-DeckPipeVerifiedEvidence {
     if (-not (Test-Path -LiteralPath $releaseVerifierPath -PathType Leaf)) {
         throw "Release verifier was not found: $releaseVerifierPath"
     }
-    . $releaseVerifierPath
-    $verification = Invoke-ReleaseVerification -StagingDirectory $StagePath
+    $verification = Invoke-DeckPipeReleaseVerifierProcess -StagePath $StagePath
+    $actualFiles = @(Get-DeckPipeStageFileRecords -StagePath $StagePath)
     if ($verification.status -eq 'PASS') {
-        $manifestEntries = Assert-ManifestExact $StagePath
-        $evidence = Read-ReleaseEvidence $StagePath $manifestEntries
-        Assert-SbomExact $StagePath $manifestEntries
+        $manifestEntries = Assert-DeckPipeManifestExact -StagePath $StagePath -ActualFiles $actualFiles
+        $evidence = Read-DeckPipeReleaseEvidence -StagePath $StagePath -ManifestEntries $manifestEntries
+        Assert-DeckPipeSbomExact -StagePath $StagePath -ManifestEntries $manifestEntries -Evidence $evidence
         return [pscustomobject]@{
             Verification = $verification
             ManifestEntries = $manifestEntries
@@ -148,9 +616,9 @@ function Read-DeckPipeVerifiedEvidence {
         throw "release verifier status $($verification.status): $($verification.message)"
     }
 
-    $manifestEntries = Assert-ManifestExact $StagePath
-    $evidence = Read-ReleaseEvidence $StagePath $manifestEntries
-    Assert-SbomExact $StagePath $manifestEntries
+    $manifestEntries = Assert-DeckPipeManifestExact -StagePath $StagePath -ActualFiles $actualFiles
+    $evidence = Read-DeckPipeReleaseEvidence -StagePath $StagePath -ManifestEntries $manifestEntries
+    Assert-DeckPipeSbomExact -StagePath $StagePath -ManifestEntries $manifestEntries -Evidence $evidence
     if ($evidence.signing.status -ne 'BLOCKED' -or $evidence.timestamp.status -ne 'BLOCKED') {
         throw 'unsigned engineering evidence requires BLOCKED signing and timestamp status.'
     }
@@ -181,6 +649,7 @@ function Resolve-DeckPipeStagedArtifactPath {
     if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
         throw "candidate artifact file is missing: $RelativePath"
     }
+    Assert-DeckPipeItemNotReparse -Path $full -Context "staged artifact $RelativePath" | Out-Null
     return $full
 }
 
@@ -195,6 +664,9 @@ function Assert-DeckPipeCandidateIdentity {
     }
 
     $resolved = (Resolve-Path -LiteralPath $Path).Path
+    Assert-DeckPipeItemNotReparse -Path $resolved -Context 'installed ExePath' | Out-Null
+    $installDirectoryPath = Split-Path -Parent $resolved
+    Assert-DeckPipeItemNotReparse -Path $installDirectoryPath -Context 'install directory' | Out-Null
     $stagePath = Resolve-DeckPipeEvidenceDirectory
     $verified = Read-DeckPipeVerifiedEvidence -StagePath $stagePath
     $evidence = $verified.Evidence
@@ -229,7 +701,7 @@ function Assert-DeckPipeCandidateIdentity {
     [pscustomobject]@{
         matched = $true
         resolved_exe = $resolved
-        install_directory = Split-Path -Parent $resolved
+        install_directory = $installDirectoryPath
         actual_sha256 = $actualSha
         actual_version = [string]$evidence.version
         actual_build_id = [string]$evidence.build_id
@@ -919,6 +1391,106 @@ function Get-DeckPipeRunSummary {
     }
 }
 
+function Invoke-DeckPipeVerifierProcessContractSelfTest {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('deckpipe-verifier-process-' + [guid]::NewGuid().ToString('N'))
+    $stage = Join-Path $root 'stage'
+    [IO.Directory]::CreateDirectory($stage) | Out-Null
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    $scripts = [ordered]@{
+        pass = @"
+param([string]`$StagingDirectory)
+Write-Output '{"schema_version":1,"status":"PASS","message":"ok"}'
+exit 0
+"@
+        fail = @"
+param([string]`$StagingDirectory)
+Write-Output '{"schema_version":1,"status":"FAIL","message":"bad"}'
+exit 1
+"@
+        blocked = @"
+param([string]`$StagingDirectory)
+Write-Output '{"schema_version":1,"status":"BLOCKED","message":"blocked"}'
+exit 2
+"@
+        empty = @"
+param([string]`$StagingDirectory)
+exit 0
+"@
+        multiple = @"
+param([string]`$StagingDirectory)
+Write-Output '{"schema_version":1,"status":"PASS","message":"one"}'
+Write-Output '{"schema_version":1,"status":"PASS","message":"two"}'
+exit 0
+"@
+        noise = @"
+param([string]`$StagingDirectory)
+Write-Output 'noise'
+Write-Output '{"schema_version":1,"status":"PASS","message":"ok"}'
+exit 0
+"@
+        pass_stderr = @"
+param([string]`$StagingDirectory)
+[Console]::Error.WriteLine('unexpected stderr')
+Write-Output '{"schema_version":1,"status":"PASS","message":"ok"}'
+exit 0
+"@
+        pass_exit_1 = @"
+param([string]`$StagingDirectory)
+Write-Output '{"schema_version":1,"status":"PASS","message":"ok"}'
+exit 1
+"@
+        fail_exit_0 = @"
+param([string]`$StagingDirectory)
+Write-Output '{"schema_version":1,"status":"FAIL","message":"bad"}'
+exit 0
+"@
+        blocked_exit_0 = @"
+param([string]`$StagingDirectory)
+Write-Output '{"schema_version":1,"status":"BLOCKED","message":"blocked"}'
+exit 0
+"@
+    }
+    $results = [ordered]@{}
+    try {
+        foreach ($name in $scripts.Keys) {
+            $scriptPath = Join-Path $root ($name + '.ps1')
+            [IO.File]::WriteAllText($scriptPath, [string]$scripts[$name], $utf8)
+            try {
+                $result = Invoke-DeckPipeReleaseVerifierProcess -StagePath $stage -VerifierPath $scriptPath -TimeoutSeconds 5
+                $results[$name] = "$($result.status):$($result.exit_code)"
+            } catch {
+                $results[$name] = 'REJECTED'
+            }
+        }
+        Write-Host "SELFTEST_JSON $(ConvertTo-Json ([ordered]@{ cases = $results }) -Depth 8 -Compress)"
+    } finally {
+        if (Test-Path -LiteralPath $root -PathType Container) {
+            [IO.Directory]::Delete($root, $true)
+        }
+    }
+}
+
+function Invoke-DeckPipeReparseAttributeGuardSelfTest {
+    $cases = [ordered]@{
+        candidate_evidence_directory = [IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint
+        evidence_top_level_entry = [IO.FileAttributes]::Archive -bor [IO.FileAttributes]::ReparsePoint
+        staged_artifact = [IO.FileAttributes]::Archive -bor [IO.FileAttributes]::ReparsePoint
+        installed_exe = [IO.FileAttributes]::Archive -bor [IO.FileAttributes]::ReparsePoint
+        install_directory = [IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint
+        ordinary_file = [IO.FileAttributes]::Archive
+    }
+    $results = [ordered]@{}
+    foreach ($name in $cases.Keys) {
+        try {
+            Assert-DeckPipeNoReparseAttributes -Attributes $cases[$name] -Context $name
+            $results[$name] = 'ACCEPTED'
+        } catch {
+            $results[$name] = 'REJECTED'
+        }
+    }
+    Write-Host "SELFTEST_JSON $(ConvertTo-Json ([ordered]@{ cases = $results }) -Depth 8 -Compress)"
+}
+
 if (-not [string]::IsNullOrWhiteSpace($SelfTestContract)) {
     $selfTestInstall = Join-Path ([IO.Path]::GetTempPath()) 'deckpipe-listener-selftest'
     $selfTestRootExe = Join-Path $selfTestInstall 'DeckPipe.exe'
@@ -1009,6 +1581,14 @@ if (-not [string]::IsNullOrWhiteSpace($SelfTestContract)) {
             Write-Host "SELFTEST_JSON $(ConvertTo-Json ([ordered]@{ summary = (Get-DeckPipeRunSummary -Checks $selfChecks.ToArray()) }) -Depth 8 -Compress)"
             return
         }
+        'verifier-process-contract' {
+            Invoke-DeckPipeVerifierProcessContractSelfTest
+            return
+        }
+        'reparse-attribute-guard' {
+            Invoke-DeckPipeReparseAttributeGuardSelfTest
+            return
+        }
         'identity' {
             $identity = Assert-DeckPipeCandidateIdentity -Path $ExePath
             Write-Host "SELFTEST_JSON $(ConvertTo-Json ([ordered]@{ identity = $identity; launch_allowed = [bool]$identity.launch_allowed }) -Depth 8 -Compress)"
@@ -1055,6 +1635,10 @@ if ($ValidateOnly) {
 }
 
 $candidateIdentity = Assert-DeckPipeCandidateIdentity -Path $ExePath
+if (-not [bool]$candidateIdentity.launch_allowed) {
+    Write-Host "QA_RESULT status=blocked passed=0 failed=0 warnings=0 blocked=1 blockers=RELEASE"
+    exit 1
+}
 $resolvedExe = [string]$candidateIdentity.resolved_exe
 $installDirectory = [string]$candidateIdentity.install_directory
 

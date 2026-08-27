@@ -42,6 +42,55 @@ class InstalledRunnerContractTests(unittest.TestCase):
             timeout=30,
         )
 
+    def run_runner_with_parent_prelude(self, prelude: str, *args, env=None):
+        quoted_runner = "'" + str(RUNNER).replace("'", "''") + "'"
+        rendered_args = []
+        for arg in args:
+            arg = str(arg)
+            if arg.startswith("-"):
+                rendered_args.append(arg)
+            else:
+                rendered_args.append("'" + arg.replace("'", "''") + "'")
+        quoted_args = " ".join(rendered_args)
+        parent_script = tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            suffix=".ps1",
+            prefix="deckpipe-parent-prelude-",
+            delete=False,
+        )
+        parent_script.write(
+            "$ErrorActionPreference = 'Stop'\n"
+            + prelude
+            + "\n"
+            + f"& {quoted_runner} {quoted_args}\n"
+            + "exit $LASTEXITCODE\n"
+        )
+        parent_script.close()
+        command = [
+            str(POWERSHELL),
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            parent_script.name,
+        ]
+        merged_env = os.environ.copy()
+        if env:
+            merged_env.update(env)
+        try:
+            return subprocess.run(
+                command,
+                cwd=ROOT,
+                env=merged_env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=30,
+            )
+        finally:
+            Path(parent_script.name).unlink(missing_ok=True)
+
     def sha256(self, path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -202,6 +251,75 @@ class InstalledRunnerContractTests(unittest.TestCase):
             self.assertNotIn("SELFTEST_LAUNCH", result.stdout)
             self.assertNotIn("launch_allowed", result.stdout)
 
+    def test_parent_injected_authenticode_function_cannot_authorize_unsigned_evidence(self):
+        with tempfile.TemporaryDirectory(prefix="deckpipe-runner-contract-") as tmp:
+            tmp_path = Path(tmp)
+            stage, artifact = self.make_stage(tmp_path, status="PASS")
+            installed = self.make_installed_copy(tmp_path, artifact)
+            prelude = """
+function Get-AuthenticodeSignature {
+    param([string]$LiteralPath)
+    [pscustomobject]@{
+        Status = 'Valid'
+        TimeStamperCertificate = [pscustomobject]@{ Subject = 'CN=Injected Test TSA'; Thumbprint = 'ABC123' }
+    }
+}
+"""
+
+            result = self.run_runner_with_parent_prelude(
+                prelude,
+                "-SelfTestContract",
+                "identity",
+                "-ExePath",
+                installed,
+                "-CandidateEvidenceDirectory",
+                stage,
+            )
+
+            self.assertNotEqual(0, result.returncode, result.stdout)
+            self.assertIn("release verifier status", result.stdout)
+            self.assertRegex(result.stdout, r"Authenticode|Get-AuthenticodeSignature|signature")
+            self.assertNotIn("SELFTEST_LAUNCH", result.stdout)
+            self.assertNotIn("launch_allowed", result.stdout)
+
+    def test_caller_cannot_supply_a_fake_release_verifier_path(self):
+        with tempfile.TemporaryDirectory(prefix="deckpipe-runner-contract-") as tmp:
+            tmp_path = Path(tmp)
+            fake_verifier = tmp_path / "verify.ps1"
+            fake_verifier.write_text(
+                "Write-Output '{\"schema_version\":1,\"status\":\"PASS\",\"message\":\"fake\"}'\nexit 0\n",
+                encoding="utf-8",
+            )
+
+            result = self.run_runner(
+                "-ValidateOnly",
+                "-ReleaseVerifierPath",
+                fake_verifier,
+            )
+
+            self.assertNotEqual(0, result.returncode, result.stdout)
+            self.assertIn("parameter", result.stdout.lower())
+
+    def test_verifier_process_rejects_noisy_empty_multiple_and_exit_status_mismatches(self):
+        result = self.run_runner("-SelfTestContract", "verifier-process-contract", "-ValidateOnly")
+        self.assertEqual(0, result.returncode, result.stdout)
+        payload = self.parse_selftest_json(result)
+        self.assertEqual(
+            {
+                "pass": "PASS:0",
+                "fail": "FAIL:1",
+                "blocked": "BLOCKED:2",
+                "empty": "REJECTED",
+                "multiple": "REJECTED",
+                "noise": "REJECTED",
+                "pass_stderr": "REJECTED",
+                "pass_exit_1": "REJECTED",
+                "fail_exit_0": "REJECTED",
+                "blocked_exit_0": "REJECTED",
+            },
+            payload["cases"],
+        )
+
     def test_evidence_manifest_and_sbom_tampering_are_rejected_before_launch(self):
         def remove_contains(stage: Path):
             sbom = json.loads((stage / "sbom.spdx.json").read_text(encoding="utf-8"))
@@ -275,6 +393,27 @@ class InstalledRunnerContractTests(unittest.TestCase):
             self.assertTrue(payload["config_path"].startswith(payload["isolated_root"]))
             self.assertTrue(payload["database_path"].startswith(payload["isolated_root"]))
 
+    def test_unsigned_engineering_evidence_stops_normal_runner_before_process_start(self):
+        with tempfile.TemporaryDirectory(prefix="deckpipe-runner-contract-") as tmp:
+            tmp_path = Path(tmp)
+            stage, artifact = self.make_stage(tmp_path)
+            installed = self.make_installed_copy(tmp_path, artifact)
+
+            result = self.run_runner(
+                "-AllowUnsignedEngineeringEvidence",
+                "-IsolatedUi",
+                "-ExePath",
+                installed,
+                "-CandidateEvidenceDirectory",
+                stage,
+            )
+
+            self.assertNotEqual(0, result.returncode, result.stdout)
+            self.assertIn("QA_RESULT status=blocked", result.stdout)
+            self.assertIn("RELEASE", result.stdout)
+            self.assertNotIn("not a valid Win32 application", result.stdout)
+            self.assertNotIn("SELFTEST_LAUNCH", result.stdout)
+
     def test_duplicate_matching_staged_executables_are_ambiguous(self):
         with tempfile.TemporaryDirectory(prefix="deckpipe-runner-contract-") as tmp:
             tmp_path = Path(tmp)
@@ -294,6 +433,22 @@ class InstalledRunnerContractTests(unittest.TestCase):
             self.assertNotEqual(0, result.returncode, result.stdout)
             self.assertIn("ambiguous executable artifact", result.stdout)
             self.assertNotIn("SELFTEST_LAUNCH", result.stdout)
+
+    def test_runner_reparse_attribute_guard_rejects_every_candidate_boundary(self):
+        result = self.run_runner("-SelfTestContract", "reparse-attribute-guard", "-ValidateOnly")
+        self.assertEqual(0, result.returncode, result.stdout)
+        payload = self.parse_selftest_json(result)
+        self.assertEqual(
+            {
+                "candidate_evidence_directory": "REJECTED",
+                "evidence_top_level_entry": "REJECTED",
+                "staged_artifact": "REJECTED",
+                "installed_exe": "REJECTED",
+                "install_directory": "REJECTED",
+                "ordinary_file": "ACCEPTED",
+            },
+            payload["cases"],
+        )
 
     def test_engineering_blocked_evidence_can_never_aggregate_pass(self):
         result = self.run_runner("-SelfTestContract", "mandatory-skips", "-ValidateOnly")
