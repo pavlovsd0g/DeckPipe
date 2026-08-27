@@ -202,7 +202,7 @@ async def api_playlists():
         for e in sc.get("tracks", {}).values():
             if e.get("status", "").startswith("verify_failed"):
                 err += 1
-            elif e.get("status") == "ok" and (pl_dir / e.get("file", "")).exists():
+            elif library.is_ready_entry(pl_dir, e):
                 ok += 1
         p.update({"ok": ok, "errors": err, "path": str(pl_dir)})
     return pls
@@ -326,7 +326,7 @@ def api_sc_sources():
         for e in sc.get("tracks", {}).values():
             if e.get("status", "").startswith("verify_failed"):
                 err += 1
-            elif e.get("status") == "ok" and (pl_dir / e.get("file", "")).exists():
+            elif library.is_ready_entry(pl_dir, e):
                 ok += 1
         out.append({**s, "ok": ok, "errors": err, "path": str(pl_dir)})
     return out
@@ -409,7 +409,7 @@ def api_local_playlists():
         for e in sc.get("tracks", {}).values():
             if e.get("status", "").startswith("verify_failed"):
                 err += 1
-            elif e.get("status") == "ok" and (pl_dir / e.get("file", "")).exists():
+            elif library.is_ready_entry(pl_dir, e):
                 ok += 1
         out.append({**s, "key": key, "ok": ok, "errors": err, "path": str(pl_dir)})
     return out
@@ -722,18 +722,13 @@ class RbSyncIn(BaseModel):
 @app.post("/api/rb/sync")
 def api_rb_sync(body: RbSyncIn):
     """Синк локального плейлиста (ок-треки по порядку) в Rekordbox."""
+    raise HTTPException(409, "Rekordbox mutation is disabled until Task 5")
     pl_dir = library.playlist_dir(body.playlist_key, body.playlist_title)
     sc = library.load_sidecar(pl_dir)
-    entries = [e for e in sc.get("tracks", {}).values()
-               if e.get("status") == "ok" and e.get("file") and (pl_dir / e["file"]).exists()]
+    entries = [e for e in sc.get("tracks", {}).values() if library.is_ready_entry(pl_dir, e)]
     entries.sort(key=lambda e: (int(e.get("position") or 10 ** 6), e["file"].lower()))
     if not entries:
         raise HTTPException(400, "в плейлисте нет скачанных треков (✔)")
-    files = [pl_dir / e["file"] for e in entries]
-    try:
-        return rb.sync_playlist(body.playlist_title, files)
-    except Exception as e:
-        raise HTTPException(409, str(e))
 
 
 class FlipIn(BaseModel):
@@ -746,9 +741,7 @@ class FlipIn(BaseModel):
 @app.post("/api/flip")
 def api_flip(body: FlipIn):
     """WAV-flip: конвертация + перенос путей в master.db (все кью/сетка сохраняются)."""
-    job_id = jobs.enqueue_flip(body.playlist_key, body.playlist_title,
-                               body.to_wav, body.workers)
-    return {"job_id": job_id}
+    raise HTTPException(409, "Rekordbox mutation is disabled until Task 5")
 
 
 @app.get("/api/errors")

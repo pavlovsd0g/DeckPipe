@@ -9,7 +9,7 @@ import requests
 import yt_dlp
 import imageio_ffmpeg
 
-from .atomic_io import is_partial_path, make_staged_path
+from .atomic_io import cleanup_owned_stages, is_partial_path, make_staged_path
 from .deezer_client import sanitize_filename, get_soundcloud_oauth
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
@@ -306,6 +306,7 @@ def download_track(track: dict, out_dir: Path):
     base = sanitize_filename(f"{track['artist']} - {track['title']}" if track.get("artist")
                              else track["title"])
     staged_template = make_staged_path(out_dir / (base + ".download")).with_suffix(".%(ext)s")
+    stage_prefix = staged_template.name.split("%(ext)s", 1)[0]
     opts = {
         "quiet": True, "no_warnings": True, "noplaylist": True,
         # предпочитаем progressive MP3 (точная длительность, чистый контейнер),
@@ -316,13 +317,20 @@ def download_track(track: dict, out_dir: Path):
         "postprocessor_args": ["-movflags", "+faststart"],
     }
     opts = _youtube_dl_opts_with_oauth(opts, sc_oauth_token())
-    with yt_dlp.YoutubeDL(opts) as y:
-        _bind_cookiejar(y, opts)
-        info = y.extract_info(track["url"], download=True)
-        fpath = Path(y.prepare_filename(info))
+    try:
+        with yt_dlp.YoutubeDL(opts) as y:
+            _bind_cookiejar(y, opts)
+            info = y.extract_info(track["url"], download=True)
+            fpath = Path(y.prepare_filename(info))
+    except Exception:
+        cleanup_owned_stages(*out_dir.glob(stage_prefix + "*"))
+        raise RuntimeError("SoundCloud download failed") from None
     # yt-dlp может поменять расширение после пост-обработки
     if not fpath.exists():
-        cands = sorted([p for p in out_dir.glob(base + "*") if is_partial_path(p)],
+        cands = sorted([p for p in out_dir.glob(stage_prefix + "*") if is_partial_path(p)],
                        key=lambda p: p.stat().st_mtime, reverse=True)
+        if not cands:
+            cleanup_owned_stages(*out_dir.glob(stage_prefix + "*"))
+            raise RuntimeError("SoundCloud download failed")
         fpath = cands[0]
     return fpath, fpath.suffix.lstrip(".").lower(), float(info.get("duration") or 0), info

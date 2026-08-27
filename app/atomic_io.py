@@ -151,9 +151,18 @@ def atomic_write_json(
     replace = replace or replace_file
     candidate = validator(copy.deepcopy(payload)) if validator else payload
     with file_lock(path):
-        _write_json_payload(path, candidate, replace=replace)
+        previous = None
         if backup:
-            _write_json_payload(backup_path(path), candidate, replace=replace)
+            if path.exists():
+                try:
+                    previous = _read_json(path, validator)
+                except AtomicIOError:
+                    bak = backup_path(path)
+                    if bak.exists():
+                        previous = _read_json(bak, validator)
+            if previous is not None:
+                _write_json_payload(backup_path(path), previous, replace=replace)
+        _write_json_payload(path, candidate, replace=replace)
 
 
 def backup_path(path: Path) -> Path:
@@ -195,14 +204,14 @@ def make_staged_path(final_path: Path) -> Path:
 
 
 def is_partial_path(path_or_name: Path | str) -> bool:
-    name = Path(path_or_name).name
+    name = Path(path_or_name).name.lower()
     return STAGING_MARKER in name or name.endswith(PARTIAL_MARKER) or f"{PARTIAL_MARKER}." in name
 
 
 def final_path_from_stage(stage_path: Path) -> Path:
     path = Path(stage_path)
     name = path.name
-    marker = name.find(STAGING_MARKER)
+    marker = name.rfind(STAGING_MARKER)
     if marker < 0:
         return path
     return path.with_name(name[:marker] + path.suffix)

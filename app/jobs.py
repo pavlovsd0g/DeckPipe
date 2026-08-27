@@ -17,7 +17,7 @@ from .atomic_io import (
     publish_staged_file,
 )
 from .deezer_client import get_session, load_config, verify_file
-from .library import load_sidecar, max_position, numbered_name, playlist_dir, save_sidecar, track_key, update_track_status
+from .library import is_ready_entry, load_sidecar, max_position, numbered_name, playlist_dir, save_sidecar, track_key, update_track_status
 
 AUTO_RETRIES = 2
 JOURNAL_VERSION = 1
@@ -50,18 +50,29 @@ def _validate_journal(payload: object) -> dict:
     for job_id, job in jobs.items():
         if not isinstance(job_id, str) or not isinstance(job, dict):
             raise ValueError("invalid journal")
+        if job.get("state") not in ("queued", "running", "done"):
+            raise ValueError("invalid journal")
+        if job.get("outcome", "pending") not in ("pending", "succeeded", "partial_failure", "failed", "interrupted"):
+            raise ValueError("invalid journal")
+        if not isinstance(job.get("results", []), list) or not isinstance(job.get("tracks", []), list):
+            raise ValueError("invalid journal")
+        if any(not isinstance(item, dict) for item in job.get("results", [])):
+            raise ValueError("invalid journal")
+        if any(not isinstance(item, dict) for item in job.get("tracks", [])):
+            raise ValueError("invalid journal")
         clean["jobs"][job_id] = dict(job)
     return clean
 
 
 def initialize(data_root: Path | None = None, *, start_worker: bool = True, write_json=None) -> None:
-    global _initialized, _journal_path, _start_worker_default, _write_json, _jobs, _queue
+    global _initialized, _journal_path, _start_worker_default, _write_json, _jobs, _queue, _worker_started
     if data_root is None:
         raise RuntimeError("DeckPipe jobs require an explicit data root")
     with _lock:
         _journal_path = Path(data_root) / "jobs.json"
         _start_worker_default = start_worker
         _write_json = write_json or atomic_write_json
+        _worker_started = False
         payload, recovered = atomic_load_json(
             _journal_path,
             default={"version": JOURNAL_VERSION, "jobs": {}},
@@ -75,6 +86,14 @@ def initialize(data_root: Path | None = None, *, start_worker: bool = True, writ
         for job_id, job in _jobs.items():
             if job.get("state") in ("queued", "running"):
                 if job.get("mode") in IDEMPOTENT_DOWNLOAD_MODES:
+                    if _reconcile_ready_items_locked(job_id):
+                        changed = True
+                    if not pending_track_ids(job_id):
+                        job["state"] = "done"
+                        job["outcome"] = "succeeded" if job.get("failed", 0) == 0 else "partial_failure"
+                        job["current"] = None
+                        changed = True
+                        continue
                     job["state"] = "queued"
                     job["outcome"] = "pending"
                     job["current"] = None
@@ -108,6 +127,10 @@ def _normalize_job(job: dict) -> dict:
     normalized.setdefault("failed", sum(1 for item in normalized.get("results", []) if not item.get("ok")))
     normalized.setdefault("current", None)
     return normalized
+
+
+def _result_key(track: dict) -> str:
+    return f"{track.get('provider', 'deezer')}:{track.get('id')}"
 
 
 def _require_initialized() -> None:
@@ -185,8 +208,43 @@ def list_jobs():
 
 def pending_track_ids(job_id: str) -> list[dict]:
     job = _jobs[job_id]
-    completed = {str(item.get("id")) for item in job.get("results", [])}
-    return [dict(t) for t in job.get("tracks", []) if str(t.get("id")) not in completed]
+    completed = {str(item.get("key") or f"{item.get('provider', 'deezer')}:{item.get('id')}") for item in job.get("results", [])}
+    return [dict(t) for t in job.get("tracks", []) if _result_key(t) not in completed]
+
+
+def _reconcile_ready_items_locked(job_id: str) -> bool:
+    job = _jobs[job_id]
+    if job.get("mode") not in IDEMPOTENT_DOWNLOAD_MODES:
+        return False
+    changed = False
+    try:
+        pl_dir = playlist_dir(job["playlist_id"], job["title"])
+        sidecar = load_sidecar(pl_dir)
+    except Exception:
+        return False
+    results_by_key = {str(item.get("key") or f"{item.get('provider', 'deezer')}:{item.get('id')}") for item in job["results"]}
+    for track in job.get("tracks", []):
+        key = _result_key(track)
+        if key in results_by_key:
+            continue
+        provider = track.get("provider", "deezer")
+        entry = sidecar.get("tracks", {}).get(track_key(track.get("id"), provider))
+        if entry is not None and is_ready_entry(pl_dir, entry):
+            job["results"].append(
+                {
+                    "id": str(track.get("id")),
+                    "provider": provider,
+                    "key": key,
+                    "title": track.get("title", ""),
+                    "ok": True,
+                    "error": "",
+                    "quality": "reconciled",
+                    "reconciled": True,
+                }
+            )
+            job["done"] += 1
+            changed = True
+    return changed
 
 
 def mark_running(job_id: str) -> None:
@@ -203,12 +261,24 @@ def mark_running(job_id: str) -> None:
 def mark_item_complete(job_id: str, track: dict, *, ok: bool, error: str, quality: str) -> None:
     with _lock:
         job = _jobs[job_id]
-        if job["state"] == "done":
+        if job["state"] != "running":
             raise RuntimeError("terminal job cannot accept progress")
         track_id = str(track["id"])
-        if not any(str(item.get("id")) == track_id for item in job["results"]):
+        provider = track.get("provider", "deezer")
+        key = _result_key(track)
+        if any(str(item.get("key") or f"{item.get('provider', 'deezer')}:{item.get('id')}") == key for item in job["results"]):
+            return
+        else:
             job["results"].append(
-                {"id": track_id, "title": track.get("title", ""), "ok": bool(ok), "error": error, "quality": quality}
+                {
+                    "id": track_id,
+                    "provider": provider,
+                    "key": key,
+                    "title": track.get("title", ""),
+                    "ok": bool(ok),
+                    "error": error,
+                    "quality": quality,
+                }
             )
             job["done"] += 1
             if not ok:
@@ -220,6 +290,8 @@ def mark_item_complete(job_id: str, track: dict, *, ok: bool, error: str, qualit
 def mark_terminal(job_id: str, *, outcome: str, error: dict | None = None) -> None:
     with _lock:
         job = _jobs[job_id]
+        if job["state"] == "done":
+            raise RuntimeError("terminal job cannot transition again")
         job["state"] = "done"
         job["outcome"] = outcome
         job["current"] = None
@@ -261,17 +333,27 @@ def _wav_step(fpath: Path, reference_duration: float):
         v_ok, v_err, _ = verify_file(stage, reference_duration, tolerance=0.5)
         if not v_ok:
             cleanup_owned_stages(stage)
-            return None, f"wav after conversion: {v_err}"
+            return None, _public_error("conversion")
         final = publish_staged_file(stage, final_path_from_stage(stage))
         return final, ""
     except Exception as e:
         cleanup_owned_stages(stage)
-        return None, f"conversion: {e}"
+        return None, _public_error("conversion")
 
 
 def _verify_after_tags(fpath: Path, expected: int, infos_duration: int, provider: str) -> tuple[bool, str, float]:
     tol = 12.0 if (provider == "sc" and fpath.suffix.lower() == ".m4a") else 2.0
     return verify_file(fpath, expected or infos_duration, tolerance=tol)
+
+
+def _public_error(kind: str) -> str:
+    return {
+        "download": "download failed",
+        "validation": "media validation failed",
+        "metadata": "metadata tagging failed",
+        "conversion": "conversion failed",
+        "publication": "publication failed",
+    }.get(kind, "operation failed")
 
 
 def _process_track(job, pl_dir, t, ds_holder, counter):
@@ -289,11 +371,11 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
             src_actual = prev.get("duration_actual") or expected
             wav, werr = _wav_step(src, src_actual)
             if wav:
-                if _wav_mode() == "wav_delete":
-                    src.unlink(missing_ok=True)
                 _set_track(pl_dir, tid, file=wav.name, format="wav",
                            status="ok", error="", converted_at=_now(),
                            source_deleted=_wav_mode() == "wav_delete", provider=provider)
+                if _wav_mode() == "wav_delete":
+                    src.unlink(missing_ok=True)
                 return True, "", "wav"
             _set_track(pl_dir, tid, status="verify_failed_convert", error=werr, provider=provider)
             return False, werr, "wav"
@@ -320,20 +402,26 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
                 meta = _meta_from_deezer(infos)
             v_ok, v_err, actual = _verify_after_tags(stage_path, expected, infos_duration, provider)
             if not v_ok:
-                err = v_err
+                err = _public_error("validation")
                 continue
             if meta:
                 try:
                     write_tags(stage_path, meta)
                 except Exception:
-                    pass
+                    err = _public_error("metadata")
+                    cleanup_owned_stages(stage_path)
+                    _set_track(pl_dir, tid, title=t["title"], artist=t["artist"],
+                               file="", format=str(quality).lower(),
+                               status="verify_failed_metadata", error=err,
+                               downloaded_at=_now(), provider=provider, url=t.get("url", ""))
+                    return False, err, quality
             v_ok, v_err, actual = _verify_after_tags(stage_path, expected, infos_duration, provider)
             if v_ok:
                 ok, err = True, ""
                 break
-            err = v_err
+            err = _public_error("validation")
         except Exception as e:
-            err = str(e)
+            err = _public_error("download")
 
     if not ok or stage_path is None:
         cleanup_owned_stages(stage_path)
@@ -352,8 +440,8 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
         cleanup_owned_stages(stage_path)
         _set_track(pl_dir, tid, title=t["title"], artist=t["artist"], file="",
                    format=str(quality).lower(), status="verify_failed_download",
-                   error=str(e), downloaded_at=_now(), provider=provider, url=t.get("url", ""))
-        return False, str(e), quality
+                   error=_public_error("publication"), downloaded_at=_now(), provider=provider, url=t.get("url", ""))
+        return False, _public_error("publication"), quality
 
     src_format = published.suffix.lstrip(".").lower()
     source_file_name = published.name
@@ -371,12 +459,12 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
             _set_track(pl_dir, tid, **base_entry, file=published.name, format=src_format,
                        source_file=source_file_name, status="verify_failed_convert", error=werr)
             return False, werr, quality
-        if _wav_mode() == "wav_delete":
-            published.unlink(missing_ok=True)
         _set_track(pl_dir, tid, **base_entry, file=wav.name, format="wav",
                    source_file=source_file_name,
                    source_deleted=_wav_mode() == "wav_delete",
                    status="ok", error="", converted_at=_now())
+        if _wav_mode() == "wav_delete":
+            published.unlink(missing_ok=True)
         return True, "", "wav"
 
     _set_track(pl_dir, tid, **base_entry, file=published.name, format=src_format,
@@ -444,6 +532,8 @@ def enqueue_flip(
     start_worker: bool | None = None,
 ) -> str:
     _require_initialized()
+    if start_worker is not False:
+        raise RuntimeError("Rekordbox mutation jobs are disabled until Task 5")
     job_id = uuid.uuid4().hex[:8]
     job = {
         "id": job_id,
@@ -483,9 +573,7 @@ def _flip_worker(job_id: str, to_wav: bool, workers: int):
             job = _jobs[job_id]
         pl_dir = playlist_dir(job["playlist_id"], job["title"])
         sc = load_sidecar(pl_dir)
-        tracks = {tid: e for tid, e in sc.get("tracks", {}).items()
-                  if e.get("status") == "ok" and e.get("file") and not is_partial_path(e["file"])
-                  and (pl_dir / e["file"]).exists()}
+        tracks = {tid: e for tid, e in sc.get("tracks", {}).items() if is_ready_entry(pl_dir, e)}
 
         plan = []
         for tid, e in tracks.items():

@@ -97,6 +97,8 @@ def set_soundcloud_oauth(token: str) -> None:
 
 def sanitize_filename(name: str) -> str:
     name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    name = re.sub(r"\.deckpipe-stage-", "_", name, flags=re.IGNORECASE)
+    name = re.sub(r"\.part(?=\.|$)", "_", name, flags=re.IGNORECASE)
     return name.strip().strip(".")[:180] or "track"
 
 

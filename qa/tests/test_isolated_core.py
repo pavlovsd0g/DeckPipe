@@ -111,6 +111,57 @@ class PlaylistScanIsolationTests(unittest.TestCase):
             self.assertEqual("missing", result[0]["status"])
             self.assertEqual("missing", saved["tracks"]["4"]["status"])
 
+    def test_fuzzy_index_keeps_short_title_candidate_when_rarest_token_is_decoy(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="deckpipe-fuzzy-qa-") as temporary:
+            playlist = Path(temporary) / "playlist"
+            playlist.mkdir()
+            correct = playlist / "Artist - Song.flac"
+            correct.write_bytes(b"")
+            (playlist / "Other - Song.flac").write_bytes(b"")
+            (playlist / "Noise - Radio.flac").write_bytes(b"")
+
+            result = library.scan_playlist(
+                playlist,
+                [{"id": "fuzzy", "title": "Song (Radio Edit)", "artist": "Artist", "album": "", "duration": 180}],
+            )
+
+            self.assertEqual("ok", result[0]["status"])
+            self.assertEqual(correct.name, result[0]["file"])
+            counters = library.get_last_scan_counters()
+            self.assertEqual(1, counters["enumerations"])
+            self.assertEqual(3, counters["normalized_stems"])
+            self.assertLess(counters["candidate_checks"], 3)
+
+    def test_provider_collision_scan_keeps_deezer_and_soundcloud_identities_separate(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="deckpipe-provider-collision-") as temporary:
+            playlist = Path(temporary) / "playlist"
+            playlist.mkdir()
+            (playlist / "Deezer Artist - Same.flac").write_bytes(b"")
+            (playlist / "SC Artist - Same.mp3").write_bytes(b"")
+
+            result = library.scan_playlist(
+                playlist,
+                [
+                    {"id": "1", "title": "Same", "artist": "Deezer Artist", "album": "", "duration": 180},
+                    {"id": "1", "title": "Same", "artist": "SC Artist", "album": "", "duration": 180, "provider": "sc"},
+                ],
+            )
+            sidecar = library.load_sidecar(playlist)
+
+            self.assertEqual(["ok", "ok"], [item["status"] for item in result])
+            self.assertIn("1", sidecar["tracks"])
+            self.assertIn("sc:1", sidecar["tracks"])
+
+    def test_ready_entry_rejects_partial_names_case_insensitively(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="deckpipe-ready-entry-") as temporary:
+            playlist = Path(temporary)
+            (playlist / "Final.flac").write_bytes(b"ok")
+            (playlist / "Upper.PART.FLAC").write_bytes(b"partial")
+
+            self.assertTrue(library.is_ready_entry(playlist, {"status": "ok", "file": "Final.flac"}))
+            self.assertFalse(library.is_ready_entry(playlist, {"status": "ok", "file": "Upper.PART.FLAC"}))
+            self.assertFalse(library.is_ready_entry(playlist, {"status": "ok", "file": ""}))
+
 
 class ErrorListingCoverageTests(unittest.TestCase):
     def test_local_playlist_errors_are_included_in_global_error_listing(self) -> None:
@@ -166,6 +217,51 @@ class ErrorListingCoverageTests(unittest.TestCase):
             self.assertEqual(1, len(errors))
             self.assertEqual("local", errors[0]["provider"])
             self.assertEqual("local:fixture", errors[0]["playlist_key"])
+
+    def test_ready_predicate_controls_counts_and_rb_sync_never_receives_partial(self) -> None:
+        old_token = os.environ.get("DECKPIPE_API_TOKEN")
+        old_port = os.environ.get("DECKPIPE_BOUND_PORT")
+        os.environ["DECKPIPE_API_TOKEN"] = "isolated-core-test-token"
+        os.environ["DECKPIPE_BOUND_PORT"] = "8123"
+        try:
+            from app import main
+        finally:
+            if old_token is None:
+                os.environ.pop("DECKPIPE_API_TOKEN", None)
+            else:
+                os.environ["DECKPIPE_API_TOKEN"] = old_token
+            if old_port is None:
+                os.environ.pop("DECKPIPE_BOUND_PORT", None)
+            else:
+                os.environ["DECKPIPE_BOUND_PORT"] = old_port
+
+        with tempfile.TemporaryDirectory(prefix="deckpipe-ready-api-") as temporary:
+            playlist = Path(temporary) / "playlist"
+            playlist.mkdir()
+            partial = playlist / "Artist - Bad.DECKPIPE-STAGE-X.PART.FLAC"
+            partial.write_bytes(b"partial")
+            library.save_sidecar(
+                playlist,
+                {"tracks": {"1": {"title": "Bad", "artist": "Artist", "file": partial.name, "status": "ok"}}},
+            )
+
+            with (
+                patch.object(main, "_local_sources", return_value=[{"id": "fixture", "title": "Ready API"}]),
+                patch.object(library, "playlist_dir", return_value=playlist),
+            ):
+                listed = main.api_local_playlists()
+
+            self.assertEqual(0, listed[0]["ok"])
+            with (
+                patch.object(library, "playlist_dir", return_value=playlist),
+                patch.object(main.rb, "sync_playlist", side_effect=AssertionError("partial reached RB")),
+            ):
+                with self.assertRaises(Exception):
+                    main.api_rb_sync(main.RbSyncIn(playlist_key="local:fixture", playlist_title="Ready API"))
+
+            with patch.object(main.jobs, "enqueue_flip", side_effect=AssertionError("flip enqueue reached live worker")):
+                with self.assertRaises(Exception):
+                    main.api_flip(main.FlipIn(playlist_key="local:fixture", playlist_title="Ready API", to_wav=True))
 
 
 if __name__ == "__main__":

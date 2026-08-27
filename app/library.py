@@ -94,8 +94,19 @@ def update_track_status(pl_dir: Path, deezer_id: str, entry: dict):
     key = track_key(deezer_id, provider)
     with file_lock(sidecar_path(pl_dir)):
         sc = load_sidecar(pl_dir)
-        sc.setdefault("tracks", {})[key] = dict(entry)
+        current = dict(sc.setdefault("tracks", {}).get(key, {}))
+        current.update(dict(entry))
+        sc.setdefault("tracks", {})[key] = current
         save_sidecar(pl_dir, sc)
+
+
+def is_ready_entry(pl_dir: Path, entry: dict) -> bool:
+    if not isinstance(entry, dict) or entry.get("status") != "ok":
+        return False
+    name = entry.get("file", "")
+    if not isinstance(name, str) or not name or is_partial_path(name):
+        return False
+    return (Path(pl_dir) / name).exists()
 
 
 def get_last_scan_counters() -> dict[str, int]:
@@ -219,9 +230,10 @@ class _IndexedFile:
 
 
 class LibraryIndex:
-    def __init__(self, pl_dir: Path):
+    def __init__(self, pl_dir: Path, sidecar_tracks: dict | None = None):
         self.pl_dir = Path(pl_dir)
         self.files: list[_IndexedFile] = []
+        self.sidecar_identity = dict(sidecar_tracks or {})
         self.by_token: dict[str, list[int]] = {}
         self.enumerations = 0
         self.normalized_stems = 0
@@ -249,15 +261,41 @@ class LibraryIndex:
         indexes = set(min(buckets, key=len)) if buckets else range(len(self.files))
         return sum(1 for idx in indexes if n_title in self.files[idx].norm_stem)
 
-    def _candidate_indexes(self, title: str) -> list[int]:
-        buckets = [self.by_token[token] for token in _track_terms(title) if token in self.by_token]
+    def mark_adopted(self, key: str, entry: dict) -> None:
+        self.sidecar_identity[key] = dict(entry)
+
+    def _bucket_intersection(self, tokens: list[str]) -> set[int]:
+        buckets = [set(self.by_token[token]) for token in tokens if token in self.by_token]
         if not buckets:
-            return []
-        return sorted(set(min(buckets, key=len)))
+            return set()
+        return set.intersection(*buckets)
+
+    def _candidate_indexes(self, title: str, artist: str = "") -> list[int]:
+        full_tokens = _track_terms(title)
+        short = _normalize(re.sub(r"[\(\[].*?[\)\]]", "", title))
+        short_tokens = [token for token in short.split() if token]
+        title_indexes = self._bucket_intersection(full_tokens)
+        if not title_indexes:
+            title_indexes = self._bucket_intersection(short_tokens)
+        if not title_indexes:
+            title_buckets = [self.by_token[token] for token in full_tokens + short_tokens if token in self.by_token]
+            if not title_buckets:
+                return []
+            title_indexes = set(min(title_buckets, key=len))
+        artist_tokens = _normalize(artist).split()
+        artist_indexes = self._bucket_intersection(artist_tokens)
+        if not artist_indexes and artist_tokens:
+            artist_buckets = [self.by_token[token] for token in artist_tokens if token in self.by_token]
+            artist_indexes = set().union(*(set(bucket) for bucket in artist_buckets)) if artist_buckets else set()
+        if artist_indexes:
+            narrowed = title_indexes & artist_indexes
+            if narrowed:
+                return sorted(narrowed)
+        return sorted(title_indexes)
 
     def find(self, track_title: str, track_artist: str, used_files: set[Path]) -> Path | None:
         best, best_score = None, 0
-        candidates = self._candidate_indexes(track_title)
+        candidates = self._candidate_indexes(track_title, track_artist)
         same_title_count = self._same_title_count(track_title)
         for idx in candidates:
             item = self.files[idx]
@@ -294,7 +332,7 @@ def scan_playlist(pl_dir: Path, deezer_tracks: list) -> list:
         sidecar_tracks = sc.get("tracks", {})
         changed = False
         result = []
-        index = LibraryIndex(pl_dir)
+        index = LibraryIndex(pl_dir, sidecar_tracks)
         used_files: set[Path] = set()
 
         for t in deezer_tracks:
@@ -304,7 +342,7 @@ def scan_playlist(pl_dir: Path, deezer_tracks: list) -> list:
                 f = Path(pl_dir) / fname
                 if entry.get("status", "").startswith("verify_failed"):
                     status, err = "error", entry.get("error", "")
-                elif fname and not is_partial_path(fname) and f.exists():
+                elif is_ready_entry(pl_dir, entry):
                     status, err = "ok", ""
                     used_files.add(f.resolve())
                 else:
@@ -320,7 +358,7 @@ def scan_playlist(pl_dir: Path, deezer_tracks: list) -> list:
                     fmt = found.suffix.lstrip(".").lower()
                     fname = found.name
                     used_files.add(found.resolve())
-                    sidecar_tracks[key] = {
+                    adopted_entry = {
                         "title": t["title"],
                         "artist": t["artist"],
                         "file": fname,
@@ -330,6 +368,8 @@ def scan_playlist(pl_dir: Path, deezer_tracks: list) -> list:
                         "adopted": True,
                         "provider": t.get("provider", "deezer"),
                     }
+                    sidecar_tracks[key] = adopted_entry
+                    index.mark_adopted(key, adopted_entry)
                     changed = True
                 else:
                     status, err, fmt, fname = "missing", "", "", ""

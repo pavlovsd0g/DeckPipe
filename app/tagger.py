@@ -14,6 +14,10 @@ log = logging.getLogger(__name__)
 UA = {"User-Agent": "Mozilla/5.0"}
 
 
+class TagWriteError(RuntimeError):
+    """Generic tag-write failure without file path or media details."""
+
+
 def deezer_cover_url(picture_id: str, size: int = 500) -> str:
     return f"https://e-cdns-images.dzcdn.net/images/cover/{picture_id}/{size}x{size}-000000-80-0-0.jpg"
 
@@ -69,6 +73,7 @@ def write_tags(fpath: Path, meta: dict):
         # wav: теги не пишем — Rekordbox берёт из своей базы
     except Exception as e:
         log.warning("tag write failed for %s: %s", fpath, e)
+        raise TagWriteError("metadata tagging failed") from None
 
 
 def _tag_flac(fpath: Path, m: dict):
