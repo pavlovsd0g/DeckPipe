@@ -76,6 +76,42 @@ function Get-TestSha256 {
     }
 }
 
+function New-TestLabCaseRoot {
+    param([string]$Name)
+    $root = Join-Path 'D:\DeckPipe-RC-Lab\qa-evidence\release-tests' ("$Name-" + [guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($root) | Out-Null
+    return $root
+}
+
+function New-TestWheelhouse {
+    param(
+        [string]$Root,
+        [string[]]$WheelNames = @(
+            'alpha-1.0.0-py3-none-any.whl',
+            'bravo-2.0.0-cp312-cp312-win_amd64.whl'
+        )
+    )
+    $wheelhouse = Join-Path $Root 'wheelhouse'
+    [IO.Directory]::CreateDirectory($wheelhouse) | Out-Null
+    $records = @()
+    foreach ($name in @($WheelNames | Sort-Object)) {
+        $path = Join-Path $wheelhouse $name
+        Write-Utf8NoBom $path "synthetic wheel bytes for $name"
+        $item = Get-Item -LiteralPath $path
+        $records += [ordered]@{
+            name = $name
+            size = [int64]$item.Length
+            sha256 = Get-TestSha256 $path
+        }
+    }
+    $manifest = [ordered]@{
+        schema_version = 1
+        files = $records
+    }
+    Write-Utf8NoBom (Join-Path $wheelhouse 'wheelhouse-manifest.json') ($manifest | ConvertTo-Json -Depth 6)
+    return $wheelhouse
+}
+
 function Get-TestCurrentHead {
     $revisionOutput = & git -C $repoRoot rev-parse HEAD 2>$null
     $revisionExitCode = $LASTEXITCODE
@@ -464,21 +500,27 @@ It 'rejects private beta policy schema_version type drift in verifier policy val
     Assert-Throws { Assert-ExactPrivateBetaPolicyObject -Policy $policy -Context 'test' } 'schema_version|integer|type'
 }
 
-It 'records Python runtime and build locks without fabricated hashes' {
-    foreach ($relative in @('pyproject.toml', 'requirements.in', 'requirements.lock', 'requirements-build.lock')) {
+It 'records hash-enforced Python runtime and build locks without blocked or unsafe requirements' {
+    foreach ($relative in @('pyproject.toml', 'requirements.in', 'requirements-build.in', 'requirements.lock', 'requirements-build.lock')) {
         Assert-True (Test-Path -LiteralPath (Join-Path $repoRoot $relative)) "Missing $relative"
     }
     foreach ($relative in @('requirements.lock', 'requirements-build.lock')) {
         $text = Read-TextFile $relative
-        Assert-True ($text -match '(?m)^# LOCK-STATUS: BLOCKED$') "$relative must explicitly block publication when hashes are unavailable"
-        Assert-True ($text -match '(?m)^# BLOCKER: offline wheel cache does not contain all required distributions$') "$relative must document the offline hash blocker"
-        Assert-True ($text -match '(?m)^[a-z0-9_.-]+==[0-9]') "$relative must still pin observed package versions"
+        Assert-False ($text -match '(?m)^# LOCK-STATUS: BLOCKED$') "$relative must not carry a blocked release status"
+        Assert-True ($text -match '(?m)^--require-hashes$') "$relative must force pip hash checking"
+        Assert-True ($text -match '--hash=sha256:[0-9a-f]{64}') "$relative must contain real lowercase SHA-256 hashes"
+        Assert-False ($text -match '(?im)^\s*(-e|--editable|https?://|git\+)') "$relative must not contain editable URL or VCS requirements"
         Assert-False ($text -match '(?i)PLACEHOLDER_HASH|FAKE_HASH|examplehash') "$relative contains placeholder hashes"
+        $requirementLines = @($text -split "`r?`n" | Where-Object { $_ -match '^[A-Za-z0-9_.-]+==' })
+        Assert-True ($requirementLines.Count -gt 0) "$relative must contain pinned requirements"
+        foreach ($line in $requirementLines) {
+            Assert-True ($line -match '^[A-Za-z0-9_.-]+==[^\\\s]+') "$relative contains an unpinned requirement line: $line"
+        }
     }
 }
 
 It 'ships PowerShell 5.1 parseable release scripts without certificate-store discovery' {
-    foreach ($relative in @('release\build.ps1', 'release\verify.ps1', 'release\New-SpdxSbom.ps1')) {
+    foreach ($relative in @('release\build.ps1', 'release\prepare-wheelhouse.ps1', 'release\verify.ps1', 'release\New-SpdxSbom.ps1')) {
         $path = Join-Path $repoRoot $relative
         Assert-True (Test-Path -LiteralPath $path) "Missing $relative"
         $tokens = $null
@@ -493,25 +535,27 @@ It 'ships PowerShell 5.1 parseable release scripts without certificate-store dis
 }
 
 It 'fails closed on stale or unsafe staging before writing release outputs' {
-    $build = Join-Path $repoRoot 'release\build.ps1'
+    . (Join-Path $repoRoot 'release\build.ps1')
     $temp = Join-Path ([IO.Path]::GetTempPath()) ('deckpipe-release-test-' + [guid]::NewGuid().ToString('N'))
     [IO.Directory]::CreateDirectory($temp) | Out-Null
     try {
         Write-Utf8NoBom (Join-Path $temp 'stale.txt') 'old output'
-        Assert-Throws { & $build -StagingDirectory $temp -UnsignedEngineeringCandidate } 'Python lock BLOCKED'
+        Assert-Throws { Assert-StagingDirectorySafe $temp } 'staging directory is nonempty'
         Assert-Equal @((Get-ChildItem -LiteralPath $temp -Force)).Count 1 'Rejected staging directory must not be cleaned or mutated'
     } finally {
         [IO.Directory]::Delete($temp, $true)
     }
 }
 
-It 'blocks before staging when Python hash locks are unavailable' {
-    $build = Join-Path $repoRoot 'release\build.ps1'
-    $verify = Join-Path $repoRoot 'release\verify.ps1'
+It 'blocks before staging when no explicit offline wheelhouse is supplied' {
+    . (Join-Path $repoRoot 'release\build.ps1')
     $temp = Join-Path ([IO.Path]::GetTempPath()) ('deckpipe-release-build-' + [guid]::NewGuid().ToString('N'))
     [IO.Directory]::CreateDirectory($temp) | Out-Null
     try {
-        Assert-Throws { & $build -StagingDirectory $temp -UnsignedEngineeringCandidate } 'Python lock BLOCKED'
+        $version = Read-JsonFile 'release\version.json'
+        Assert-Throws {
+            New-ReleaseBuildPlan -StagingDirectory $temp -Version $version -SourceRevision 'dddddddddddddddddddddddddddddddddddddddd' -PythonExe 'python.exe'
+        } 'wheelhouse'
         $verifyResult = Invoke-ReleaseScript 'release\verify.ps1' @('-StagingDirectory', $temp)
         Assert-Equal $verifyResult.ExitCode 2 'BLOCKED verifier exit code'
         $blockedJson = $verifyResult.Output | ConvertFrom-Json
@@ -523,12 +567,12 @@ It 'blocks before staging when Python hash locks are unavailable' {
     }
 }
 
-It 'reports the Python lock blocker before validating a missing staging parent' {
-    $build = Join-Path $repoRoot 'release\build.ps1'
+It 'reports a missing staging parent before creating release directories' {
+    . (Join-Path $repoRoot 'release\build.ps1')
     $missingRoot = Join-Path ([IO.Path]::GetTempPath()) ('deckpipe-missing-parent-' + [guid]::NewGuid().ToString('N'))
     $stage = Join-Path $missingRoot 'stage'
     try {
-        Assert-Throws { & $build -StagingDirectory $stage -UnsignedEngineeringCandidate } 'Python lock BLOCKED'
+        Assert-Throws { Assert-StagingDirectorySafe $stage } 'staging directory parent is missing'
         Assert-False (Test-Path -LiteralPath $missingRoot) 'Blocked build must not create the missing staging parent'
     } finally {
         if (Test-Path -LiteralPath $missingRoot) { [IO.Directory]::Delete($missingRoot, $true) }
@@ -1173,12 +1217,46 @@ It 'rejects ADS-like release paths and manifest tampering' {
     if ($failures.Count -gt 0) { throw ($failures -join '; ') }
 }
 
+It 'validates the offline wheelhouse manifest before build planning' {
+    . (Join-Path $repoRoot 'release\build.ps1')
+    $caseRoot = New-TestLabCaseRoot 'wheelhouse-contract'
+    try {
+        $stage = Join-Path $caseRoot 'staging\candidate'
+        $wheelhouse = New-TestWheelhouse -Root $caseRoot
+        $manifestRecord = Assert-WheelhouseReady -WheelhouseDirectory $wheelhouse -StagingDirectory $stage
+        Assert-Equal $manifestRecord.Path (Join-Path $wheelhouse 'wheelhouse-manifest.json') 'Wheelhouse manifest path drift'
+        Assert-True ($manifestRecord.Sha256 -match '^[0-9a-f]{64}$') 'Wheelhouse manifest hash must be lowercase SHA-256'
+
+        $missing = New-TestWheelhouse -Root (Join-Path $caseRoot 'missing')
+        Remove-Item -LiteralPath (Join-Path $missing 'alpha-1.0.0-py3-none-any.whl') -Force
+        Assert-Throws { Assert-WheelhouseReady -WheelhouseDirectory $missing -StagingDirectory $stage } 'wheelhouse|manifest|missing|mismatch'
+
+        $extra = New-TestWheelhouse -Root (Join-Path $caseRoot 'extra')
+        Write-Utf8NoBom (Join-Path $extra 'charlie-3.0.0-py3-none-any.whl') 'unexpected wheel'
+        Assert-Throws { Assert-WheelhouseReady -WheelhouseDirectory $extra -StagingDirectory $stage } 'wheelhouse|manifest|extra|mismatch'
+
+        $renamed = New-TestWheelhouse -Root (Join-Path $caseRoot 'renamed')
+        Rename-Item -LiteralPath (Join-Path $renamed 'alpha-1.0.0-py3-none-any.whl') -NewName 'alpha-1.0.0-renamed.whl'
+        Assert-Throws { Assert-WheelhouseReady -WheelhouseDirectory $renamed -StagingDirectory $stage } 'wheelhouse|manifest|missing|extra|mismatch'
+
+        $tampered = New-TestWheelhouse -Root (Join-Path $caseRoot 'tampered')
+        Write-Utf8NoBom (Join-Path $tampered 'alpha-1.0.0-py3-none-any.whl') 'tampered wheel'
+        Assert-Throws { Assert-WheelhouseReady -WheelhouseDirectory $tampered -StagingDirectory $stage } 'wheelhouse|hash|mismatch'
+
+        Assert-Throws { Assert-WheelhouseReady -WheelhouseDirectory $repoRoot -StagingDirectory $stage } 'wheelhouse|repository'
+        $stagingWheelhouse = Join-Path $stage 'wheelhouse'
+        [IO.Directory]::CreateDirectory($stagingWheelhouse) | Out-Null
+        Assert-Throws { Assert-WheelhouseReady -WheelhouseDirectory $stagingWheelhouse -StagingDirectory $stage } 'wheelhouse|staging'
+    } finally {
+        if (Test-Path -LiteralPath $caseRoot) { [IO.Directory]::Delete($caseRoot, $true) }
+    }
+}
+
 It 'plans release builds only from an isolated tracked HEAD temp workspace' {
     . (Join-Path $repoRoot 'release\build.ps1')
-    $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('deckpipe-build-plan-' + [guid]::NewGuid().ToString('N'))
+    $tempRoot = New-TestLabCaseRoot 'deckpipe-build-plan'
     $stage = Join-Path $tempRoot 'stage'
-    $wheelhouse = Join-Path $tempRoot 'wheelhouse'
-    [IO.Directory]::CreateDirectory($wheelhouse) | Out-Null
+    $wheelhouse = New-TestWheelhouse -Root $tempRoot
     try {
         $version = Read-JsonFile 'release\version.json'
         $sourceRevision = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
@@ -1191,9 +1269,11 @@ It 'plans release builds only from an isolated tracked HEAD temp workspace' {
             $full = [IO.Path]::GetFullPath([string]$path).TrimEnd('\')
             Assert-False ($full.StartsWith($repoFull, [StringComparison]::OrdinalIgnoreCase)) "Build path leaks into repo: $full"
             Assert-False ($full.StartsWith($stageFull, [StringComparison]::OrdinalIgnoreCase)) "Build path leaks into staging: $full"
-            Assert-True ($full.StartsWith(([IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')), [StringComparison]::OrdinalIgnoreCase)) "Build path is not temp-owned: $full"
+            Assert-True ($full.StartsWith(([IO.Path]::GetFullPath('D:\DeckPipe-RC-Lab\build').TrimEnd('\')), [StringComparison]::OrdinalIgnoreCase)) "Build path is not lab-owned: $full"
         }
 
+        Assert-Equal $plan.WheelhouseManifestPath (Join-Path $wheelhouse 'wheelhouse-manifest.json') 'Wheelhouse manifest path missing from plan'
+        Assert-True ($plan.WheelhouseManifestSha256 -match '^[0-9a-f]{64}$') 'Wheelhouse manifest hash missing from plan'
         Assert-Equal @($plan.PipInstallCommands).Count 2 'Both runtime and build locks must be installed'
         $pipText = ((@($plan.PipInstallCommands) | ForEach-Object { $_.Arguments -join ' ' }) -join "`n")
         Assert-True ($pipText -match [regex]::Escape('requirements-build.lock')) 'Build lock install missing'
@@ -1214,10 +1294,9 @@ It 'plans release builds only from an isolated tracked HEAD temp workspace' {
 
 It 'plans private beta artifacts with explicit unsigned-private-beta naming and rejects mixed signing modes' {
     . (Join-Path $repoRoot 'release\build.ps1')
-    $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('deckpipe-private-beta-plan-' + [guid]::NewGuid().ToString('N'))
+    $tempRoot = New-TestLabCaseRoot 'deckpipe-private-beta-plan'
     $stage = Join-Path $tempRoot 'stage'
-    $wheelhouse = Join-Path $tempRoot 'wheelhouse'
-    [IO.Directory]::CreateDirectory($wheelhouse) | Out-Null
+    $wheelhouse = New-TestWheelhouse -Root $tempRoot
     try {
         $version = Read-JsonFile 'release\version.json'
         $sourceRevision = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'

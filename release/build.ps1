@@ -13,6 +13,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $script:RepoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+$script:ReleaseLabRoot = 'D:\DeckPipe-RC-Lab'
 
 function Read-JsonFile {
     param([string]$RelativePath)
@@ -47,6 +48,11 @@ function Get-Sha256 {
     } finally {
         $sha.Dispose()
     }
+}
+
+function Get-FullPathNormalized {
+    param([string]$Path)
+    return [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)).TrimEnd('\')
 }
 
 function Copy-PrivateBetaPolicy {
@@ -203,6 +209,104 @@ function Assert-PathNotInside {
     }
 }
 
+function Assert-PathInside {
+    param(
+        [string]$Path,
+        [string]$RequiredRoot,
+        [string]$Message
+    )
+    $full = Get-FullPathNormalized $Path
+    $root = [IO.Path]::GetFullPath($RequiredRoot).TrimEnd('\')
+    if ($full -ine $root -and -not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw $Message
+    }
+}
+
+function Get-WheelhouseManifestEntries {
+    param([string]$ManifestPath)
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) { throw 'dependency BLOCKED: wheelhouse-manifest.json is missing' }
+    $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+    foreach ($required in @('schema_version', 'files')) {
+        if (-not ($manifest.PSObject.Properties.Name -contains $required)) { throw "dependency BLOCKED: wheelhouse manifest missing $required" }
+    }
+    if ([int]$manifest.schema_version -ne 1) { throw 'dependency BLOCKED: wheelhouse manifest schema_version must be 1' }
+    return @($manifest.files)
+}
+
+function Assert-WheelhouseReady {
+    param(
+        [string]$WheelhouseDirectory,
+        [string]$StagingDirectory
+    )
+    if (-not $WheelhouseDirectory) { throw 'dependency BLOCKED: explicit offline wheelhouse is required' }
+    if (-not (Test-Path -LiteralPath $WheelhouseDirectory -PathType Container)) { throw 'dependency BLOCKED: offline wheelhouse is missing' }
+
+    $wheelhouseFull = Get-FullPathNormalized $WheelhouseDirectory
+    $repoFull = [IO.Path]::GetFullPath($script:RepoRoot).TrimEnd('\')
+    Assert-PathNotInside -Path $wheelhouseFull -ForbiddenRoot $repoFull -Message 'dependency BLOCKED: wheelhouse cannot be inside the repository'
+    if ($StagingDirectory) {
+        $stageFull = Get-FullPathNormalized $StagingDirectory
+        Assert-PathNotInside -Path $wheelhouseFull -ForbiddenRoot $stageFull -Message 'dependency BLOCKED: wheelhouse cannot be inside staging'
+    }
+    Assert-PathInside -Path $wheelhouseFull -RequiredRoot $script:ReleaseLabRoot -Message 'dependency BLOCKED: wheelhouse must live below D:\DeckPipe-RC-Lab'
+
+    $wheelhouseItem = Get-Item -LiteralPath $wheelhouseFull -Force
+    if (($wheelhouseItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'dependency BLOCKED: wheelhouse reparse point is not allowed' }
+
+    foreach ($entry in @(Get-ChildItem -LiteralPath $wheelhouseFull -Force | Where-Object { $_.PSIsContainer })) {
+        throw "dependency BLOCKED: wheelhouse subdirectories are not allowed: $($entry.Name)"
+    }
+
+    $manifestPath = Join-Path $wheelhouseFull 'wheelhouse-manifest.json'
+    $manifestEntries = Get-WheelhouseManifestEntries -ManifestPath $manifestPath
+    if (@($manifestEntries).Count -eq 0) { throw 'dependency BLOCKED: wheelhouse manifest is empty' }
+
+    $actualByName = @{}
+    foreach ($file in @(Get-ChildItem -LiteralPath $wheelhouseFull -Force -File | Where-Object { $_.Name -ne 'wheelhouse-manifest.json' } | Sort-Object Name)) {
+        if ($file.Name -notmatch '(?i)\.whl$') { throw "dependency BLOCKED: wheelhouse contains non-wheel file: $($file.Name)" }
+        $key = $file.Name.ToLowerInvariant()
+        if ($actualByName.ContainsKey($key)) { throw "dependency BLOCKED: wheelhouse duplicate or case-confusable file: $($file.Name)" }
+        $actualByName[$key] = [pscustomobject]@{
+            Name = $file.Name
+            Size = [int64]$file.Length
+            Sha256 = Get-Sha256 $file.FullName
+        }
+    }
+
+    $manifestByName = @{}
+    foreach ($entry in @($manifestEntries)) {
+        foreach ($required in @('name', 'size', 'sha256')) {
+            if (-not ($entry.PSObject.Properties.Name -contains $required)) { throw "dependency BLOCKED: wheelhouse manifest entry missing $required" }
+        }
+        $name = [string]$entry.name
+        if ($name -match '^[A-Za-z]:|^/|\\|/|:|\.\.') { throw "dependency BLOCKED: unsafe wheelhouse manifest name: $name" }
+        if ($name -notmatch '(?i)\.whl$') { throw "dependency BLOCKED: wheelhouse manifest contains non-wheel file: $name" }
+        if ([string]$entry.sha256 -cnotmatch '^[0-9a-f]{64}$') { throw "dependency BLOCKED: wheelhouse manifest hash is not lowercase SHA-256: $name" }
+        $key = $name.ToLowerInvariant()
+        if ($manifestByName.ContainsKey($key)) { throw "dependency BLOCKED: wheelhouse manifest duplicate or case-confusable name: $name" }
+        $manifestByName[$key] = $entry
+    }
+
+    foreach ($key in @($manifestByName.Keys)) {
+        if (-not $actualByName.ContainsKey($key)) { throw "dependency BLOCKED: wheelhouse manifest/file mismatch missing: $($manifestByName[$key].name)" }
+    }
+    foreach ($key in @($actualByName.Keys)) {
+        if (-not $manifestByName.ContainsKey($key)) { throw "dependency BLOCKED: wheelhouse manifest/file mismatch extra: $($actualByName[$key].Name)" }
+    }
+    foreach ($key in @($manifestByName.Keys)) {
+        $actual = $actualByName[$key]
+        $entry = $manifestByName[$key]
+        if ([int64]$entry.size -ne $actual.Size) { throw "dependency BLOCKED: wheelhouse manifest size mismatch: $($actual.Name)" }
+        if ([string]$entry.sha256 -cne $actual.Sha256) { throw "dependency BLOCKED: wheelhouse hash mismatch: $($actual.Name)" }
+    }
+
+    return [pscustomobject]@{
+        Path = $manifestPath
+        Sha256 = Get-Sha256 $manifestPath
+        Files = @($actualByName.Values | Sort-Object Name)
+    }
+}
+
 function New-ReleaseBuildPlan {
     param(
         [string]$StagingDirectory,
@@ -213,16 +317,17 @@ function New-ReleaseBuildPlan {
         [switch]$PrivateBetaCandidate
     )
     if (-not $WheelhouseDirectory) { throw 'dependency BLOCKED: explicit offline wheelhouse is required' }
-    if (-not (Test-Path -LiteralPath $WheelhouseDirectory -PathType Container)) { throw 'dependency BLOCKED: offline wheelhouse is missing' }
     if (-not $SourceRevision -or $SourceRevision -notmatch '^[0-9a-f]{40}$') { throw 'source provenance BLOCKED: exact 40-character tracked HEAD is required' }
 
     $stagePath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($StagingDirectory)
     $repoFull = [IO.Path]::GetFullPath($script:RepoRoot)
     $stageFull = [IO.Path]::GetFullPath($stagePath)
-    $tempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
-    $buildRoot = Join-Path $tempBase ("deckpipe-release-build-" + [guid]::NewGuid().ToString('N'))
+    $manifestRecord = Assert-WheelhouseReady -WheelhouseDirectory $WheelhouseDirectory -StagingDirectory $stageFull
+    $buildBase = Join-Path $script:ReleaseLabRoot 'build'
+    $buildRoot = Join-Path $buildBase ("deckpipe-release-build-" + [guid]::NewGuid().ToString('N'))
     Assert-PathNotInside -Path $buildRoot -ForbiddenRoot $repoFull -Message 'build workspace must be outside the repository'
     Assert-PathNotInside -Path $buildRoot -ForbiddenRoot $stageFull -Message 'build workspace must be outside staging'
+    Assert-PathInside -Path $buildRoot -RequiredRoot $buildBase -Message 'build workspace must be below D:\DeckPipe-RC-Lab\build'
 
     $sourceRoot = Join-Path $buildRoot 'source'
     $venvPath = Join-Path $buildRoot 'venv'
@@ -263,6 +368,8 @@ function New-ReleaseBuildPlan {
         PyInstallerSpecPath = $specPath
         PyInstallerArguments = $pyInstallerArguments
         PipInstallCommands = $pipInstallCommands
+        WheelhouseManifestPath = $manifestRecord.Path
+        WheelhouseManifestSha256 = $manifestRecord.Sha256
         CargoTargetDir = $cargoTarget
         BundleRoot = $bundleRoot
         ExpectedArtifactNames = @(Get-ExpectedArtifactNames -Version $Version -SourceRevision $SourceRevision -PrivateBetaCandidate:$PrivateBetaCandidate)
@@ -582,6 +689,10 @@ function Invoke-ReleaseBuild {
                 version = $version.version
                 build_id = $version.build_id
                 source_revision = $sourceRevision
+                dependencies = [ordered]@{
+                    wheelhouse_manifest_path = 'wheelhouse-manifest.json'
+                    wheelhouse_manifest_sha256 = $plan.WheelhouseManifestSha256
+                }
                 artifacts = $artifactRecords
                 signing = [ordered]@{ status = $status; signed = $signedArtifacts }
                 timestamp = [ordered]@{ status = $status }
