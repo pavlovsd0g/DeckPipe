@@ -112,6 +112,11 @@ function New-TestWheelhouse {
     return $wheelhouse
 }
 
+function Get-ReleaseTestPythonExe {
+    $candidate = Join-Path $repoRoot '..\..\.venv\Scripts\python.exe'
+    return (Resolve-Path -LiteralPath $candidate).Path
+}
+
 function Get-TestCurrentHead {
     $revisionOutput = & git -C $repoRoot rev-parse HEAD 2>$null
     $revisionExitCode = $LASTEXITCODE
@@ -1252,6 +1257,33 @@ It 'validates the offline wheelhouse manifest before build planning' {
     }
 }
 
+It 'records the prepared offline proof venv at the Task 11 tool-cache path' {
+    $proofPython = 'D:\DeckPipe-RC-Lab\tool-cache\offline-proof\Scripts\python.exe'
+    $proofEvidence = 'D:\DeckPipe-RC-Lab\qa-evidence\offline-install-tool-cache.json'
+    Assert-True (Test-Path -LiteralPath $proofPython -PathType Leaf) 'Prepared offline proof Python is missing from D:\DeckPipe-RC-Lab\tool-cache\offline-proof'
+    Assert-True (Test-Path -LiteralPath $proofEvidence -PathType Leaf) 'Prepared offline proof evidence is missing from qa-evidence'
+    $evidence = Get-Content -LiteralPath $proofEvidence -Raw | ConvertFrom-Json
+    Assert-Equal $evidence.offline_venv 'D:\DeckPipe-RC-Lab\tool-cache\offline-proof' 'Offline proof evidence must bind the Task 11 venv path'
+    Assert-Equal $evidence.offline_python $proofPython 'Offline proof evidence must bind the Task 11 Python path'
+    Assert-True ([string]$evidence.pip_check_summary -match 'No broken requirements found') 'Offline proof evidence must record pip check success'
+}
+
+It 'fails build planning before dependency work when PythonExe is not existing CPython 3.12 x64' {
+    . (Join-Path $repoRoot 'release\build.ps1')
+    $caseRoot = New-TestLabCaseRoot 'python-precondition'
+    try {
+        $stage = Join-Path $caseRoot 'stage'
+        $wheelhouse = New-TestWheelhouse -Root $caseRoot
+        $version = Read-JsonFile 'release\version.json'
+        $sourceRevision = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+        Assert-Throws {
+            New-ReleaseBuildPlan -StagingDirectory $stage -WheelhouseDirectory $wheelhouse -Version $version -SourceRevision $sourceRevision -PythonExe (Join-Path $caseRoot 'missing-python.exe')
+        } 'PythonExe|CPython|3\.12|x64|AMD64|existing'
+    } finally {
+        if (Test-Path -LiteralPath $caseRoot) { [IO.Directory]::Delete($caseRoot, $true) }
+    }
+}
+
 It 'plans release builds only from an isolated tracked HEAD temp workspace' {
     . (Join-Path $repoRoot 'release\build.ps1')
     $tempRoot = New-TestLabCaseRoot 'deckpipe-build-plan'
@@ -1261,7 +1293,7 @@ It 'plans release builds only from an isolated tracked HEAD temp workspace' {
         $version = Read-JsonFile 'release\version.json'
         $sourceRevision = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
         Assert-Throws { New-ReleaseBuildPlan -StagingDirectory $stage -Version $version -SourceRevision $sourceRevision -PythonExe 'python.exe' } 'wheelhouse'
-        $plan = New-ReleaseBuildPlan -StagingDirectory $stage -WheelhouseDirectory $wheelhouse -Version $version -SourceRevision $sourceRevision -PythonExe 'python.exe'
+        $plan = New-ReleaseBuildPlan -StagingDirectory $stage -WheelhouseDirectory $wheelhouse -Version $version -SourceRevision $sourceRevision -PythonExe (Get-ReleaseTestPythonExe)
 
         $repoFull = [IO.Path]::GetFullPath($repoRoot).TrimEnd('\')
         $stageFull = [IO.Path]::GetFullPath($stage).TrimEnd('\')
@@ -1280,6 +1312,7 @@ It 'plans release builds only from an isolated tracked HEAD temp workspace' {
         Assert-True ($pipText -match [regex]::Escape('requirements.lock')) 'Runtime lock install missing'
         Assert-True ($pipText -match '--no-index') 'pip must be offline'
         Assert-True ($pipText -match '--require-hashes') 'pip must enforce hashes'
+        Assert-True ($pipText -match '--no-cache-dir') 'pip must not read a global cache during build installs'
         Assert-True ($pipText -match [regex]::Escape($wheelhouse)) 'pip must use explicit wheelhouse'
         Assert-True ((@($plan.PyInstallerArguments) -join ' ') -match '--distpath') 'PyInstaller distpath must be controlled'
         Assert-True ((@($plan.PyInstallerArguments) -join ' ') -match '--workpath') 'PyInstaller workpath must be controlled'
@@ -1300,7 +1333,7 @@ It 'plans private beta artifacts with explicit unsigned-private-beta naming and 
     try {
         $version = Read-JsonFile 'release\version.json'
         $sourceRevision = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
-        $plan = New-ReleaseBuildPlan -StagingDirectory $stage -WheelhouseDirectory $wheelhouse -Version $version -SourceRevision $sourceRevision -PythonExe 'python.exe' -PrivateBetaCandidate
+        $plan = New-ReleaseBuildPlan -StagingDirectory $stage -WheelhouseDirectory $wheelhouse -Version $version -SourceRevision $sourceRevision -PythonExe (Get-ReleaseTestPythonExe) -PrivateBetaCandidate
         Assert-True ($plan.ExpectedArtifactNames -contains 'DeckPipe-0.6.0+20260827.050713.6456dba254a6-bbbbbbb-unsigned-private-beta-x64.exe') 'Private beta application artifact name missing'
         Assert-True ($plan.ExpectedArtifactNames -contains 'DeckPipe-0.6.0+20260827.050713.6456dba254a6-bbbbbbb-unsigned-private-beta-x64-setup.exe') 'Private beta setup artifact name missing'
         Assert-True ($plan.ExpectedArtifactNames -contains 'DeckPipe-0.6.0+20260827.050713.6456dba254a6-bbbbbbb-unsigned-private-beta-x64.msi') 'Private beta MSI artifact name missing'

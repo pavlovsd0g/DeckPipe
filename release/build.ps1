@@ -50,6 +50,46 @@ function Get-Sha256 {
     }
 }
 
+function Get-PythonRuntimeInfo {
+    param([string]$PythonExe)
+    if (-not $PythonExe) { throw 'PythonExe must point to an existing Windows x64 CPython 3.12 executable' }
+    $command = Get-Command $PythonExe -ErrorAction SilentlyContinue
+    if ($null -eq $command) { throw "PythonExe must point to an existing Windows x64 CPython 3.12 executable: $PythonExe" }
+    $pythonPath = $command.Source
+    if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) { throw "PythonExe must point to an existing Windows x64 CPython 3.12 executable: $PythonExe" }
+
+    $pythonProbe = @'
+import platform, struct, sys
+print(sys.executable)
+print(platform.python_implementation())
+print(platform.python_version())
+print(platform.machine())
+print(struct.calcsize('P') * 8)
+'@
+    $oldErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $lines = @(& $pythonPath -c $pythonProbe 2>&1)
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $oldErrorActionPreference
+    }
+    if ($code -ne 0 -or $lines.Count -lt 5) {
+        throw "PythonExe probe failed for ${PythonExe}: $(($lines | Out-String).Trim())"
+    }
+    $info = [pscustomobject]@{
+        Path = [string]$lines[0]
+        Implementation = [string]$lines[1]
+        Version = [string]$lines[2]
+        Machine = [string]$lines[3]
+        Bits = [int]$lines[4]
+    }
+    if ($info.Implementation -ne 'CPython' -or $info.Version -notmatch '^3\.12\.' -or $info.Machine -ne 'AMD64' -or $info.Bits -ne 64) {
+        throw "PythonExe must be Windows x64 CPython 3.12 AMD64/64-bit, got $($info.Implementation) $($info.Version) $($info.Machine) $($info.Bits)-bit at $($info.Path)"
+    }
+    return $info
+}
+
 function Get-FullPathNormalized {
     param([string]$Path)
     return [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)).TrimEnd('\')
@@ -323,6 +363,7 @@ function New-ReleaseBuildPlan {
     $repoFull = [IO.Path]::GetFullPath($script:RepoRoot)
     $stageFull = [IO.Path]::GetFullPath($stagePath)
     $manifestRecord = Assert-WheelhouseReady -WheelhouseDirectory $WheelhouseDirectory -StagingDirectory $stageFull
+    $pythonInfo = Get-PythonRuntimeInfo -PythonExe $PythonExe
     $buildBase = Join-Path $script:ReleaseLabRoot 'build'
     $buildRoot = Join-Path $buildBase ("deckpipe-release-build-" + [guid]::NewGuid().ToString('N'))
     Assert-PathNotInside -Path $buildRoot -ForbiddenRoot $repoFull -Message 'build workspace must be outside the repository'
@@ -340,8 +381,8 @@ function New-ReleaseBuildPlan {
     $wheelhouseFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($WheelhouseDirectory)
 
     $pipInstallCommands = @(
-        [pscustomobject]@{ Arguments = @('-m', 'pip', 'install', '--no-index', '--require-hashes', '--find-links', $wheelhouseFull, '-r', (Join-Path $sourceRoot 'requirements-build.lock')) },
-        [pscustomobject]@{ Arguments = @('-m', 'pip', 'install', '--no-index', '--require-hashes', '--find-links', $wheelhouseFull, '-r', (Join-Path $sourceRoot 'requirements.lock')) }
+        [pscustomobject]@{ Arguments = @('-m', 'pip', 'install', '--no-cache-dir', '--no-index', '--require-hashes', '--find-links', $wheelhouseFull, '-r', (Join-Path $sourceRoot 'requirements-build.lock')) },
+        [pscustomobject]@{ Arguments = @('-m', 'pip', 'install', '--no-cache-dir', '--no-index', '--require-hashes', '--find-links', $wheelhouseFull, '-r', (Join-Path $sourceRoot 'requirements.lock')) }
     )
     $pyInstallerArguments = @(
         '-m', 'PyInstaller', '--noconfirm', '--onefile', '--name', 'deckpipe-backend',
@@ -376,7 +417,8 @@ function New-ReleaseBuildPlan {
         ApplicationArtifactName = @(Get-ExpectedArtifactNames -Version $Version -SourceRevision $SourceRevision -PrivateBetaCandidate:$PrivateBetaCandidate)[0]
         SetupArtifactName = @(Get-ExpectedArtifactNames -Version $Version -SourceRevision $SourceRevision -PrivateBetaCandidate:$PrivateBetaCandidate)[1]
         MsiArtifactName = @(Get-ExpectedArtifactNames -Version $Version -SourceRevision $SourceRevision -PrivateBetaCandidate:$PrivateBetaCandidate)[2]
-        PythonExe = $PythonExe
+        PythonExe = $pythonInfo.Path
+        PythonRuntime = $pythonInfo
     }
 }
 
@@ -600,12 +642,14 @@ function Invoke-ReleaseBuild {
     [IO.Directory]::CreateDirectory($plan.BuildRoot) | Out-Null
     $oldCargoTargetDir = $env:CARGO_TARGET_DIR
     $oldCargoNetOffline = $env:CARGO_NET_OFFLINE
+    $oldPipNoCacheDir = $env:PIP_NO_CACHE_DIR
     try {
+        $env:PIP_NO_CACHE_DIR = '1'
         $publishedStage = Invoke-ReleaseCandidateTransaction -StagingDirectory $stagePath -Version $version -SourceRevision $sourceRevision -UnsignedEngineeringCandidate:$UnsignedEngineeringCandidate -PrivateBetaCandidate:$PrivateBetaCandidate -AssembleCandidate {
             param($candidatePath, $expectedNames)
 
             Export-TrackedSourceToTemp -Plan $plan
-            & $PythonExe -m venv $plan.VenvPath
+            & $plan.PythonExe -m venv $plan.VenvPath
             if ($LASTEXITCODE -ne 0) { throw 'build failed: Python venv creation failed' }
             foreach ($pipCommand in @($plan.PipInstallCommands)) {
                 & $plan.VenvPython @($pipCommand.Arguments)
@@ -719,6 +763,7 @@ function Invoke-ReleaseBuild {
     } finally {
         $env:CARGO_TARGET_DIR = $oldCargoTargetDir
         $env:CARGO_NET_OFFLINE = $oldCargoNetOffline
+        $env:PIP_NO_CACHE_DIR = $oldPipNoCacheDir
         if ($null -ne $plan) {
             Remove-OwnedBuildRoot -BuildRoot $plan.BuildRoot -StagePath $stagePath
         }

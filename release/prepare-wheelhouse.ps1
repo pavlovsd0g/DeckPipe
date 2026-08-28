@@ -275,8 +275,8 @@ $wheelhouse = Join-Path $lab 'wheelhouse'
 $toolCache = Join-Path $lab 'tool-cache'
 $pipCache = Join-Path $toolCache 'pip-cache'
 $toolVenv = Join-Path $toolCache "pip-tools-$PipToolsVersion"
-$offlineVenv = Join-Path $lab 'install\offline-proof-prepare'
-$offlineProofPath = Join-Path $lab 'qa-evidence\offline-install-prepare.json'
+$offlineVenv = Join-Path $toolCache 'offline-proof'
+$offlineProofPath = Join-Path $lab 'qa-evidence\offline-install-tool-cache.json'
 $manifestPath = Join-Path $wheelhouse 'wheelhouse-manifest.json'
 
 Clear-OwnedDirectory $downloads
@@ -287,6 +287,7 @@ Clear-OwnedDirectory $offlineVenv
 
 $oldPipCacheDir = $env:PIP_CACHE_DIR
 $oldPipDisableVersionCheck = $env:PIP_DISABLE_PIP_VERSION_CHECK
+$oldPipNoCacheDir = $env:PIP_NO_CACHE_DIR
 try {
     $env:PIP_CACHE_DIR = $pipCache
     $env:PIP_DISABLE_PIP_VERSION_CHECK = '1'
@@ -320,11 +321,13 @@ try {
     }
     Write-WheelhouseManifest -WheelhouseDirectory $wheelhouse -OutputPath $manifestPath -PythonInfo $pythonInfo -PipToolsVersion $PipToolsVersion
 
+    $env:PIP_NO_CACHE_DIR = '1'
     Invoke-Checked $pythonFull @('-m', 'venv', $offlineVenv) 'create offline proof venv' | Out-Null
     $offlinePython = Join-Path $offlineVenv 'Scripts\python.exe'
     $offlineOutput = Invoke-Checked $offlinePython @(
         '-m', 'pip', 'install',
         '--disable-pip-version-check',
+        '--no-cache-dir',
         '--no-index',
         '--find-links', $wheelhouse,
         '--require-hashes',
@@ -339,6 +342,7 @@ try {
         wheelhouse_manifest_path = $manifestPath
         wheelhouse_manifest_sha256 = Get-Sha256 $manifestPath
         offline_venv = $offlineVenv
+        offline_python = $offlinePython
         offline_install_summary = ($offlineOutput -split "`r?`n" | Select-Object -Last 20)
         pip_check_summary = ($pipCheckOutput -split "`r?`n" | Select-Object -Last 20)
     }
@@ -349,9 +353,11 @@ try {
         inventory_path = $inventoryPath
         wheelhouse_manifest_path = $manifestPath
         wheelhouse_manifest_sha256 = Get-Sha256 $manifestPath
+        offline_venv = $offlineVenv
         offline_proof_path = $offlineProofPath
     } | ConvertTo-Json -Depth 6
 } finally {
     $env:PIP_CACHE_DIR = $oldPipCacheDir
     $env:PIP_DISABLE_PIP_VERSION_CHECK = $oldPipDisableVersionCheck
+    $env:PIP_NO_CACHE_DIR = $oldPipNoCacheDir
 }
