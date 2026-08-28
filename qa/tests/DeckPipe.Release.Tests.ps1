@@ -1317,6 +1317,15 @@ It 'plans release builds only from an isolated tracked HEAD temp workspace' {
         Assert-True ((@($plan.PyInstallerArguments) -join ' ') -match '--distpath') 'PyInstaller distpath must be controlled'
         Assert-True ((@($plan.PyInstallerArguments) -join ' ') -match '--workpath') 'PyInstaller workpath must be controlled'
         Assert-True ((@($plan.PyInstallerArguments) -join ' ') -match '--specpath') 'PyInstaller specpath must be controlled'
+        $addDataIndex = [array]::IndexOf([object[]]$plan.PyInstallerArguments, '--add-data')
+        Assert-True ($addDataIndex -ge 0 -and $addDataIndex -lt (@($plan.PyInstallerArguments).Count - 1)) 'PyInstaller static asset add-data argument is missing'
+        $addData = [string]$plan.PyInstallerArguments[$addDataIndex + 1]
+        $addDataParts = @($addData -split ';', 2)
+        Assert-Equal $addDataParts.Count 2 'PyInstaller add-data must contain one source and one destination'
+        Assert-Equal $addDataParts[1] 'app/static' 'PyInstaller static asset destination drift'
+        $staticAssetSource = [IO.Path]::GetFullPath($addDataParts[0]).TrimEnd('\')
+        Assert-True ([IO.Path]::IsPathRooted($addDataParts[0])) 'PyInstaller static asset source must be absolute so specpath cannot change resolution'
+        Assert-True ($staticAssetSource.StartsWith(([IO.Path]::GetFullPath($plan.SourceRoot).TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase)) "PyInstaller static asset source must come from tracked temp source: $staticAssetSource"
         Assert-True ($plan.ExpectedArtifactNames -contains 'DeckPipe-0.6.0+20260827.050713.6456dba254a6-aaaaaaa-x64.exe') 'Expected application artifact name missing'
         Assert-True ($plan.ExpectedArtifactNames -contains 'DeckPipe-0.6.0+20260827.050713.6456dba254a6-aaaaaaa-x64-setup.exe') 'Expected setup artifact name missing'
         Assert-True ($plan.ExpectedArtifactNames -contains 'DeckPipe-0.6.0+20260827.050713.6456dba254a6-aaaaaaa-x64.msi') 'Expected MSI artifact name missing'
@@ -1350,6 +1359,41 @@ It 'plans private beta artifacts with explicit unsigned-private-beta naming and 
         Assert-Throws {
             Invoke-ReleaseBuild -StagingDirectory $stage -PrivateBetaCandidate -TimestampUrl 'https://timestamp.example/rfc3161'
         } 'PrivateBetaCandidate|timestamp|cannot combine'
+    } finally {
+        if (Test-Path -LiteralPath $tempRoot) { [IO.Directory]::Delete($tempRoot, $true) }
+    }
+}
+
+It 'returns the published final staging path after a successful candidate transaction' {
+    . (Join-Path $repoRoot 'release\build.ps1')
+    $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('deckpipe-transaction-return-' + [guid]::NewGuid().ToString('N'))
+    $stage = Join-Path $tempRoot 'final-stage'
+    [IO.Directory]::CreateDirectory($tempRoot) | Out-Null
+    [IO.Directory]::CreateDirectory($stage) | Out-Null
+    try {
+        $version = Read-JsonFile 'release\version.json'
+        $sourceRevision = Get-TestCurrentHead
+        $publishedStage = Invoke-ReleaseCandidateTransaction -StagingDirectory $stage -Version $version -SourceRevision $sourceRevision -PrivateBetaCandidate -AssembleCandidate {
+            param($CandidateDirectory, $ExpectedArtifactNames)
+            Write-Output ''
+            Write-Output 'native build chatter before publish'
+            $fixture = New-SyntheticReleaseStage -WithExecutable -SignedEvidence -StageName 'deckpipe-transaction-return-fixture' -BuildId $version.build_id -SourceRevision $sourceRevision
+            try {
+                Set-SyntheticPrivateBetaPolicy -StagePath $fixture
+                foreach ($file in @(Get-ChildItem -LiteralPath $fixture -Force -File)) {
+                    Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $CandidateDirectory $file.Name)
+                }
+            } finally {
+                if (Test-Path -LiteralPath $fixture) { [IO.Directory]::Delete($fixture, $true) }
+            }
+        } -ValidateCandidate {
+            param($CandidateDirectory)
+            $result = Invoke-ReleaseVerifierForCandidate -CandidateDirectory $CandidateDirectory -PrivateBetaCandidate
+            Assert-Equal $result.status 'PASS' 'Candidate transaction fixture must verify before publish'
+            Write-Output 'verifier chatter before publish'
+        }
+        Assert-Equal $publishedStage ([IO.Path]::GetFullPath($stage).TrimEnd('\')) 'Successful transaction must return the final staging path'
+        Assert-True (Test-Path -LiteralPath $stage -PathType Container) 'Successful transaction must publish final staging'
     } finally {
         if (Test-Path -LiteralPath $tempRoot) { [IO.Directory]::Delete($tempRoot, $true) }
     }

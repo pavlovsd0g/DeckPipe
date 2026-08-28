@@ -376,6 +376,7 @@ function New-ReleaseBuildPlan {
     $distPath = Join-Path $buildRoot 'pyinstaller-dist'
     $workPath = Join-Path $buildRoot 'pyinstaller-work'
     $specPath = Join-Path $buildRoot 'pyinstaller-spec'
+    $staticAssetSource = Join-Path $sourceRoot 'app\static'
     $cargoTarget = Join-Path $buildRoot 'cargo-target'
     $bundleRoot = Join-Path $cargoTarget 'release\bundle'
     $wheelhouseFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($WheelhouseDirectory)
@@ -389,7 +390,7 @@ function New-ReleaseBuildPlan {
         '--distpath', $distPath, '--workpath', $workPath, '--specpath', $specPath,
         '--collect-all', 'yt_dlp', '--collect-all', 'deezer_python_gql', '--collect-all', 'imageio_ffmpeg',
         '--collect-all', 'uvicorn', '--collect-all', 'sqlcipher3',
-        '--add-data', 'app/static;app/static',
+        '--add-data', "$staticAssetSource;app/static",
         '--hidden-import', 'pyrekordbox', '--hidden-import', 'mutagen', '--hidden-import', 'Crypto',
         '--hidden-import', 'app.main', '--hidden-import', 'app.jobs', '--hidden-import', 'app.library',
         '--hidden-import', 'app.deezer_client', '--hidden-import', 'app.soundcloud', '--hidden-import', 'app.tagger',
@@ -595,8 +596,8 @@ function Invoke-ReleaseCandidateTransaction {
     $expectedNames = @(Get-ExpectedArtifactNames -Version $Version -SourceRevision $SourceRevision -PrivateBetaCandidate:$PrivateBetaCandidate)
     try {
         [IO.Directory]::CreateDirectory($candidatePath) | Out-Null
-        & $AssembleCandidate $candidatePath $expectedNames
-        & $ValidateCandidate $candidatePath
+        & $AssembleCandidate $candidatePath $expectedNames | ForEach-Object { Write-Host $_ }
+        & $ValidateCandidate $candidatePath | ForEach-Object { Write-Host $_ }
 
         if (Test-Path -LiteralPath $stagePath) {
             $entries = @(Get-ChildItem -LiteralPath $stagePath -Force)
