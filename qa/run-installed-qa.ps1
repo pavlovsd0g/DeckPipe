@@ -206,7 +206,14 @@ function Assert-DeckPipeExactPrivateBetaPolicyObject {
     $actualNames = @($Policy.PSObject.Properties.Name)
     foreach ($name in @($privateBetaPolicy.Keys)) {
         if (-not ($actualNames -contains $name)) { throw "$Context private-beta policy missing $name" }
-        if ([string]$Policy.$name -ne [string]$privateBetaPolicy[$name]) { throw "$Context private-beta policy drift: $name" }
+        $value = $Policy.$name
+        if ($name -eq 'schema_version') {
+            if (-not ($value -is [int] -or $value -is [long]) -or [int64]$value -ne 1) {
+                throw "$Context private-beta policy schema_version must be integer 1"
+            }
+        } elseif (-not ($value -is [string]) -or [string]$value -cne [string]$privateBetaPolicy[$name]) {
+            throw "$Context private-beta policy string drift: $name"
+        }
     }
     foreach ($name in $actualNames) {
         if (-not $privateBetaPolicy.Contains($name)) { throw "$Context private-beta policy extra $name" }
@@ -402,13 +409,12 @@ function Read-DeckPipeReleaseEvidence {
         $trackedPolicy = Get-DeckPipePrivateBetaPolicyRecord
         $stagedPolicyPath = Join-Path $StagePath 'policy.json'
         Assert-DeckPipeItemNotReparse -Path $stagedPolicyPath -Context 'evidence top-level entry policy.json' | Out-Null
-        $stagedRaw = Get-Content -LiteralPath $stagedPolicyPath -Raw
-        if ($stagedRaw -cne $trackedPolicy.Raw) {
-            throw 'staged private-beta policy must be byte-for-byte identical to tracked policy.json'
-        }
-        $stagedPolicy = $stagedRaw | ConvertFrom-Json
-        Assert-DeckPipeExactPrivateBetaPolicyObject -Policy $stagedPolicy -Context 'staged'
         $stagedPolicyHash = (Get-FileHash -LiteralPath $stagedPolicyPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($stagedPolicyHash -cne $trackedPolicy.Sha256) {
+            throw 'staged private-beta policy sha256 must match tracked policy.json byte-for-byte'
+        }
+        $stagedPolicy = Get-Content -LiteralPath $stagedPolicyPath -Raw | ConvertFrom-Json
+        Assert-DeckPipeExactPrivateBetaPolicyObject -Policy $stagedPolicy -Context 'staged'
         if ($stagedPolicyHash -cne [string]$evidence.distribution.policy_sha256) {
             throw 'private-beta policy_sha256 hash mismatch'
         }

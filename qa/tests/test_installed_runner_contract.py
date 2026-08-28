@@ -104,6 +104,57 @@ class InstalledRunnerContractTests(unittest.TestCase):
         finally:
             Path(parent_script.name).unlink(missing_ok=True)
 
+    def run_runner_policy_validator_probe(self, schema_version_literal: str):
+        script = tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            suffix=".ps1",
+            prefix="deckpipe-policy-validator-",
+            delete=False,
+        )
+        quoted_runner = "'" + str(RUNNER).replace("'", "''") + "'"
+        script.write(
+            "$ErrorActionPreference = 'Stop'\n"
+            + f". {quoted_runner} -ValidateOnly | Out-Null\n"
+            + "$policy = [pscustomobject][ordered]@{\n"
+            + f"  schema_version = {schema_version_literal}\n"
+            + "  channel = 'private-beta'\n"
+            + "  signing_requirement = 'owner-waived'\n"
+            + "  timestamp_requirement = 'owner-waived'\n"
+            + "  windows_reputation_warning = 'accepted'\n"
+            + "  waiver_date = '2026-08-28'\n"
+            + "  intended_audience = 'controlled-small-group'\n"
+            + "}\n"
+            + "try {\n"
+            + "  Assert-DeckPipeExactPrivateBetaPolicyObject -Policy $policy -Context 'test'\n"
+            + "  Write-Host 'ACCEPTED'\n"
+            + "  exit 0\n"
+            + "} catch {\n"
+            + "  Write-Host $_.Exception.Message\n"
+            + "  exit 1\n"
+            + "}\n"
+        )
+        script.close()
+        command = [
+            str(POWERSHELL),
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script.name,
+        ]
+        try:
+            return subprocess.run(
+                command,
+                cwd=ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=30,
+            )
+        finally:
+            Path(script.name).unlink(missing_ok=True)
+
     def sha256(self, path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -264,6 +315,74 @@ class InstalledRunnerContractTests(unittest.TestCase):
         shutil.copyfile(staged_artifact, installed)
         return installed
 
+    def refresh_stage_inventory(self, stage: Path):
+        files = sorted(p.name for p in stage.iterdir() if p.is_file() and p.name not in {"SHA256SUMS.txt", "sbom.spdx.json"})
+        relationships = [
+            {
+                "spdxElementId": "SPDXRef-DOCUMENT",
+                "relationshipType": "DESCRIBES",
+                "relatedSpdxElement": "SPDXRef-Package-DeckPipe",
+            }
+        ]
+        sbom_files = []
+        for relative in files:
+            full = stage / relative
+            spdx_id = "SPDXRef-File-" + hashlib.sha256((relative + "\0" + self.sha256(full)).encode()).hexdigest()[:32]
+            sbom_files.append(
+                {
+                    "SPDXID": spdx_id,
+                    "fileName": relative,
+                    "checksums": [{"algorithm": "SHA256", "checksumValue": self.sha256(full)}],
+                    "licenseConcluded": "NOASSERTION",
+                    "copyrightText": "NOASSERTION",
+                }
+            )
+            relationships.append(
+                {
+                    "spdxElementId": "SPDXRef-Package-DeckPipe",
+                    "relationshipType": "CONTAINS",
+                    "relatedSpdxElement": spdx_id,
+                }
+            )
+        sbom = {
+            "spdxVersion": "SPDX-2.3",
+            "dataLicense": "CC0-1.0",
+            "SPDXID": "SPDXRef-DOCUMENT",
+            "name": f"DeckPipe-{BUILD_ID}",
+            "documentNamespace": f"https://deckpipe.local/spdx/{BUILD_ID}",
+            "creationInfo": {"created": "2026-08-27T05:07:13Z", "creators": ["Tool: test"]},
+            "packages": [
+                {
+                    "SPDXID": "SPDXRef-Package-DeckPipe",
+                    "name": "DeckPipe",
+                    "versionInfo": "0.6.0",
+                    "downloadLocation": "NOASSERTION",
+                    "filesAnalyzed": True,
+                    "licenseConcluded": "NOASSERTION",
+                    "licenseDeclared": "NOASSERTION",
+                    "copyrightText": "NOASSERTION",
+                }
+            ],
+            "files": sbom_files,
+            "relationships": relationships,
+        }
+        self.write_json(stage / "sbom.spdx.json", sbom)
+        manifest_files = sorted(files + ["sbom.spdx.json"])
+        (stage / "SHA256SUMS.txt").write_text(
+            "".join(f"{self.sha256(stage / relative)}  {relative}\n" for relative in manifest_files),
+            encoding="utf-8",
+        )
+
+    def rewrite_policy_as_utf16_and_bind_hash(self, stage: Path):
+        policy_path = stage / "policy.json"
+        tracked_raw = (ROOT / "release" / "policy.json").read_text(encoding="utf-8")
+        policy_path.write_text(tracked_raw, encoding="utf-16")
+        evidence_path = stage / "release-evidence.json"
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        evidence["distribution"]["policy_sha256"] = self.sha256(policy_path)
+        self.write_json(evidence_path, evidence)
+        self.refresh_stage_inventory(stage)
+
     def parse_selftest_json(self, result):
         for line in result.stdout.splitlines():
             if line.startswith("SELFTEST_JSON "):
@@ -360,6 +479,55 @@ class InstalledRunnerContractTests(unittest.TestCase):
             self.assertRegex(result.stdout, r"policy_path|policy\.json|release verifier status")
             self.assertNotIn("SELFTEST_LAUNCH", result.stdout)
             self.assertNotIn("launch_allowed", result.stdout)
+
+    def test_reencoded_same_semantics_policy_cannot_authorize_private_beta_launch(self):
+        with tempfile.TemporaryDirectory(prefix="deckpipe-runner-contract-") as tmp:
+            tmp_path = Path(tmp)
+            stage, artifact = self.make_stage(tmp_path, private_beta=True)
+            self.rewrite_policy_as_utf16_and_bind_hash(stage)
+            installed = self.make_installed_copy(tmp_path, artifact)
+
+            result = self.run_runner(
+                "-SelfTestContract",
+                "identity",
+                "-ExePath",
+                installed,
+                "-CandidateEvidenceDirectory",
+                stage,
+            )
+
+            self.assertNotEqual(0, result.returncode, result.stdout)
+            self.assertRegex(result.stdout, r"policy|sha256|tracked|byte")
+            self.assertNotIn("SELFTEST_LAUNCH", result.stdout)
+            self.assertNotIn("launch_allowed", result.stdout)
+
+    def test_schema_version_type_drift_cannot_authorize_private_beta_launch(self):
+        with tempfile.TemporaryDirectory(prefix="deckpipe-runner-contract-") as tmp:
+            tmp_path = Path(tmp)
+            policy = PRIVATE_BETA_POLICY.copy()
+            policy["schema_version"] = "1"
+            stage, artifact = self.make_stage(tmp_path, private_beta=True, policy=policy)
+            installed = self.make_installed_copy(tmp_path, artifact)
+
+            result = self.run_runner(
+                "-SelfTestContract",
+                "identity",
+                "-ExePath",
+                installed,
+                "-CandidateEvidenceDirectory",
+                stage,
+            )
+
+            self.assertNotEqual(0, result.returncode, result.stdout)
+            self.assertRegex(result.stdout, r"schema_version|integer|type|policy|sha256|tracked|byte")
+            self.assertNotIn("SELFTEST_LAUNCH", result.stdout)
+            self.assertNotIn("launch_allowed", result.stdout)
+
+    def test_runner_policy_validator_rejects_schema_version_type_drift(self):
+        result = self.run_runner_policy_validator_probe("'1'")
+
+        self.assertNotEqual(0, result.returncode, result.stdout)
+        self.assertRegex(result.stdout, r"schema_version|integer|type")
 
     def test_parent_injected_authenticode_function_cannot_authorize_unsigned_evidence(self):
         with tempfile.TemporaryDirectory(prefix="deckpipe-runner-contract-") as tmp:

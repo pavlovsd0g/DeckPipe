@@ -237,6 +237,18 @@ function Set-SyntheticPrivateBetaPolicy {
     Update-SyntheticStageInventory $StagePath
 }
 
+function Convert-SyntheticPolicyToUtf16WithBoundHash {
+    param([Parameter(Mandatory)][string]$StagePath)
+    $policyPath = Join-Path $StagePath 'policy.json'
+    $trackedRaw = Get-Content -LiteralPath (Join-Path $repoRoot 'release\policy.json') -Raw
+    [IO.File]::WriteAllText($policyPath, $trackedRaw, [Text.UnicodeEncoding]::new($false, $true))
+    $evidencePath = Join-Path $StagePath 'release-evidence.json'
+    $evidence = Get-Content -LiteralPath $evidencePath -Raw | ConvertFrom-Json
+    $evidence.distribution.policy_sha256 = Get-TestSha256 $policyPath
+    Write-Utf8NoBom $evidencePath ($evidence | ConvertTo-Json -Depth 10)
+    Update-SyntheticStageInventory $StagePath
+}
+
 function Update-SyntheticStageInventory {
     param([string]$StagePath)
     $sbomFiles = @()
@@ -436,6 +448,20 @@ It 'defines exactly one tracked private beta waiver policy' {
     foreach ($name in $expectedNames) {
         Assert-Equal $policy.$name $script:ExpectedPrivateBetaPolicy[$name] "Private beta policy drift: $name"
     }
+}
+
+It 'rejects private beta policy schema_version type drift in verifier policy validation' {
+    . (Join-Path $repoRoot 'release\verify.ps1')
+    $policy = [pscustomobject][ordered]@{
+        schema_version = '1'
+        channel = 'private-beta'
+        signing_requirement = 'owner-waived'
+        timestamp_requirement = 'owner-waived'
+        windows_reputation_warning = 'accepted'
+        waiver_date = '2026-08-28'
+        intended_audience = 'controlled-small-group'
+    }
+    Assert-Throws { Assert-ExactPrivateBetaPolicyObject -Policy $policy -Context 'test' } 'schema_version|integer|type'
 }
 
 It 'records Python runtime and build locks without fabricated hashes' {
@@ -905,6 +931,25 @@ It 'rejects private beta policy drift forged hashes caller policy paths and sign
                 Set-SyntheticPrivateBetaPolicy -StagePath $stage -Channel 'public'
             }
             Pattern = 'private-beta|public|channel|policy'
+        },
+        @{
+            Name = 'schema-version-string'
+            Mutate = {
+                param($stage)
+                $policy = New-TestPrivateBetaPolicy
+                $policy['schema_version'] = '1'
+                Set-SyntheticPrivateBetaPolicy -StagePath $stage -Policy $policy
+            }
+            Pattern = 'schema_version|integer|type|policy|sha256|tracked|byte'
+        },
+        @{
+            Name = 'same-semantics-utf16-policy'
+            Mutate = {
+                param($stage)
+                Set-SyntheticPrivateBetaPolicy -StagePath $stage
+                Convert-SyntheticPolicyToUtf16WithBoundHash -StagePath $stage
+            }
+            Pattern = 'policy|sha256|tracked|byte'
         },
         @{
             Name = 'caller-policy-path'

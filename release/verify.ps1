@@ -48,7 +48,14 @@ function Assert-ExactPrivateBetaPolicyObject {
     $expectedNames = @($script:PrivateBetaPolicy.Keys)
     foreach ($name in $expectedNames) {
         if (-not ($actualNames -contains $name)) { throw "$Context private-beta policy missing $name" }
-        if ([string]$Policy.$name -ne [string]$script:PrivateBetaPolicy[$name]) { throw "$Context private-beta policy drift: $name" }
+        $value = $Policy.$name
+        if ($name -eq 'schema_version') {
+            if (-not ($value -is [int] -or $value -is [long]) -or [int64]$value -ne 1) {
+                throw "$Context private-beta policy schema_version must be integer 1"
+            }
+        } elseif (-not ($value -is [string]) -or [string]$value -cne [string]$script:PrivateBetaPolicy[$name]) {
+            throw "$Context private-beta policy string drift: $name"
+        }
     }
     foreach ($name in $actualNames) {
         if (-not ($script:PrivateBetaPolicy.Contains($name))) { throw "$Context private-beta policy extra $name" }
@@ -521,11 +528,10 @@ function Read-ReleaseEvidence {
         $trackedPolicy = Get-TrackedPrivateBetaPolicyRecord
         $stagedPolicyPath = Join-Path $stagePathForEvidence 'policy.json'
         if (-not (Test-Path -LiteralPath $stagedPolicyPath -PathType Leaf)) { throw 'staged private-beta policy is missing: policy.json' }
-        $stagedRaw = Get-Content -LiteralPath $stagedPolicyPath -Raw
-        if ($stagedRaw -cne $trackedPolicy.Raw) { throw 'staged private-beta policy must be byte-for-byte identical to tracked policy.json' }
-        $stagedPolicy = $stagedRaw | ConvertFrom-Json
-        Assert-ExactPrivateBetaPolicyObject -Policy $stagedPolicy -Context 'staged'
         $stagedPolicyHash = Get-Sha256 $stagedPolicyPath
+        if ($stagedPolicyHash -cne $trackedPolicy.Sha256) { throw 'staged private-beta policy sha256 must match tracked policy.json byte-for-byte' }
+        $stagedPolicy = Get-Content -LiteralPath $stagedPolicyPath -Raw | ConvertFrom-Json
+        Assert-ExactPrivateBetaPolicyObject -Policy $stagedPolicy -Context 'staged'
         if ($stagedPolicyHash -cne [string]$evidence.distribution.policy_sha256) { throw 'private-beta policy_sha256 hash mismatch' }
         if ($manifestByPath['policy.json'].Sha256 -cne $stagedPolicyHash) { throw 'private-beta manifest policy hash mismatch' }
         $isPrivateBeta = $true
