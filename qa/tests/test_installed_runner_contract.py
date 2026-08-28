@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -10,6 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "qa" / "run-installed-qa.ps1"
+FRONTEND_INDEX = ROOT / "frontend" / "index.html"
 POWERSHELL = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
 BUILD_ID = "0.6.0+20260827.050713.6456dba254a6"
 SOURCE_REVISION = subprocess.check_output(
@@ -388,6 +390,52 @@ class InstalledRunnerContractTests(unittest.TestCase):
             if line.startswith("SELFTEST_JSON "):
                 return json.loads(line[len("SELFTEST_JSON ") :])
         self.fail(f"SELFTEST_JSON line missing from output:\n{result.stdout}")
+
+    def unicode_from_codepoints(self, *codepoints):
+        return "".join(chr(codepoint) for codepoint in codepoints)
+
+    def runner_unicode_assignment(self, variable_name):
+        source = RUNNER.read_text(encoding="ascii")
+        match = re.search(
+            rf"\${re.escape(variable_name)}\s*=\s*New-DeckPipeUnicodeString\s+-CodePoints\s+@\(([^)]*)\)",
+            source,
+        )
+        self.assertIsNotNone(match, f"${variable_name} codepoint assignment missing")
+        return self.unicode_from_codepoints(
+            *(int(token.strip(), 16) for token in match.group(1).split(","))
+        )
+
+    def test_installed_ui_contract_uses_accessible_bug_report_name(self):
+        expected_name = self.unicode_from_codepoints(
+            0x041E,
+            0x0442,
+            0x043F,
+            0x0440,
+            0x0430,
+            0x0432,
+            0x0438,
+            0x0442,
+            0x044C,
+            0x20,
+            0x0431,
+            0x0430,
+            0x0433,
+            0x0440,
+            0x0435,
+            0x043F,
+            0x043E,
+            0x0440,
+            0x0442,
+        )
+
+        frontend = FRONTEND_INDEX.read_text(encoding="utf-8")
+        button = re.search(
+            r'<button\b(?=[^>]*\bdata-action="send-report")(?=[^>]*\baria-label="([^"]+)")[^>]*>',
+            frontend,
+        )
+        self.assertIsNotNone(button, "send-report button with aria-label missing")
+        self.assertEqual(expected_name, button.group(1))
+        self.assertEqual(button.group(1), self.runner_unicode_assignment("uiNameBugReport"))
 
     def test_spoofed_notepad_hash_and_fake_version_manifest_cannot_authorize_launch(self):
         with tempfile.TemporaryDirectory(prefix="deckpipe-runner-contract-") as tmp:
