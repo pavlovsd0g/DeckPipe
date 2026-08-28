@@ -121,7 +121,11 @@ class LoopbackSecurityMiddleware:
                 return True
 
         fetch_site = headers.get("sec-fetch-site")
-        if fetch_site and fetch_site.lower() == "cross-site":
+        if (
+            fetch_site
+            and fetch_site.lower() == "cross-site"
+            and origin != self.settings.allowed_origin
+        ):
             return True
 
         return False

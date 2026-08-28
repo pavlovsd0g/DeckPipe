@@ -190,6 +190,38 @@ class SecurityContractTests(unittest.TestCase):
         self.assertEqual({"GET", "POST", "DELETE", "OPTIONS"}, allowed_methods)
         self.assertIn("Authorization", headers.get("access-control-allow-headers", ""))
 
+    def test_packaged_origin_may_cross_site_fetch_the_loopback_api(self) -> None:
+        browser_metadata = {
+            "origin": "http://tauri.localhost",
+            "sec-fetch-site": "cross-site",
+        }
+        preflight = request(
+            "OPTIONS",
+            "/api/jobs",
+            {
+                **browser_metadata,
+                "access-control-request-method": "GET",
+                "access-control-request-headers": "Authorization",
+            },
+        )
+        authorized = request(
+            "GET",
+            "/api/jobs",
+            {
+                **browser_metadata,
+                "authorization": f"Bearer {SENTINEL_TOKEN}",
+            },
+        )
+
+        self.assertEqual(204, preflight[0])
+        self.assertEqual(200, authorized[0])
+        for _status, headers, body in (preflight, authorized):
+            self.assertEqual(
+                "http://tauri.localhost",
+                headers.get("access-control-allow-origin"),
+            )
+            self.assertNotIn(SENTINEL_TOKEN.encode("utf-8"), body)
+
     def test_hostile_browser_requests_are_rejected_before_auth_or_routing(self) -> None:
         hostile_get = request(
             "GET",
