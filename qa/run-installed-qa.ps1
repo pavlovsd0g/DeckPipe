@@ -766,6 +766,110 @@ function Resolve-DeckPipeStagedArtifactPath {
     return $full
 }
 
+function Test-DeckPipeApplicationArtifactPath {
+    param(
+        [Parameter(Mandatory)]$Evidence,
+        [Parameter(Mandatory)][string]$RelativePath
+    )
+
+    $shortSource = ([string]$Evidence.source_revision).Substring(0, 7)
+    $label = ''
+    if ($Evidence.PSObject.Properties.Name -contains 'distribution') {
+        $label = '-' + [string]$Evidence.distribution.artifact_label
+    }
+    $expected = "DeckPipe-$($Evidence.build_id)-$shortSource$label-x64.exe"
+    return [string]$RelativePath -ceq $expected
+}
+
+function Get-DeckPipeBytePatternOffsets {
+    param(
+        [Parameter(Mandatory)][byte[]]$Bytes,
+        [Parameter(Mandatory)][byte[]]$Pattern
+    )
+
+    $offsets = [Collections.Generic.List[int]]::new()
+    if ($Pattern.Length -eq 0 -or $Bytes.Length -lt $Pattern.Length) {
+        return $offsets.ToArray()
+    }
+    for ($index = 0; $index -le ($Bytes.Length - $Pattern.Length); $index++) {
+        $matched = $true
+        for ($inner = 0; $inner -lt $Pattern.Length; $inner++) {
+            if ($Bytes[$index + $inner] -ne $Pattern[$inner]) {
+                $matched = $false
+                break
+            }
+        }
+        if ($matched) {
+            $offsets.Add($index)
+        }
+    }
+    return $offsets.ToArray()
+}
+
+function Compare-DeckPipeTauriBundleMarkerPayload {
+    param(
+        [Parameter(Mandatory)][string]$InstalledPath,
+        [Parameter(Mandatory)][string]$StagedPath
+    )
+
+    $stagedBytes = [IO.File]::ReadAllBytes($StagedPath)
+    $installedBytes = [IO.File]::ReadAllBytes($InstalledPath)
+    if ($stagedBytes.Length -ne $installedBytes.Length) {
+        return [pscustomobject]@{ Matched = $false; BundleType = ''; Reason = 'installed and staged executable lengths differ' }
+    }
+
+    $encoding = [Text.Encoding]::ASCII
+    $stagedMarker = $encoding.GetBytes('__TAURI_BUNDLE_TYPE_VAR_UNK')
+    $installedMarkers = [ordered]@{
+        NSS = $encoding.GetBytes('__TAURI_BUNDLE_TYPE_VAR_NSS')
+        MSI = $encoding.GetBytes('__TAURI_BUNDLE_TYPE_VAR_MSI')
+    }
+    $stagedOffsets = @(Get-DeckPipeBytePatternOffsets -Bytes $stagedBytes -Pattern $stagedMarker)
+    if ($stagedOffsets.Count -ne 1) {
+        return [pscustomobject]@{ Matched = $false; BundleType = ''; Reason = "staged Tauri bundle marker count is $($stagedOffsets.Count), expected 1" }
+    }
+    foreach ($bundleType in $installedMarkers.Keys) {
+        $stagedInstalledMarkerOffsets = @(Get-DeckPipeBytePatternOffsets -Bytes $stagedBytes -Pattern $installedMarkers[$bundleType])
+        if ($stagedInstalledMarkerOffsets.Count -ne 0) {
+            return [pscustomobject]@{ Matched = $false; BundleType = ''; Reason = 'staged executable contains an installed Tauri bundle marker' }
+        }
+    }
+
+    $installedMatches = @()
+    foreach ($bundleType in $installedMarkers.Keys) {
+        foreach ($offset in @(Get-DeckPipeBytePatternOffsets -Bytes $installedBytes -Pattern $installedMarkers[$bundleType])) {
+            $installedMatches += [pscustomobject]@{ BundleType = $bundleType; Offset = [int]$offset }
+        }
+    }
+    if ($installedMatches.Count -ne 1) {
+        return [pscustomobject]@{ Matched = $false; BundleType = ''; Reason = "installed Tauri bundle marker count is $($installedMatches.Count), expected 1" }
+    }
+
+    $installedUnkOffsets = @(Get-DeckPipeBytePatternOffsets -Bytes $installedBytes -Pattern $stagedMarker)
+    if ($installedUnkOffsets.Count -ne 0) {
+        return [pscustomobject]@{ Matched = $false; BundleType = ''; Reason = 'installed executable still contains the staged Tauri bundle marker' }
+    }
+
+    $stagedOffset = [int]$stagedOffsets[0]
+    $installedMatch = $installedMatches[0]
+    if ([int]$installedMatch.Offset -ne $stagedOffset) {
+        return [pscustomobject]@{ Matched = $false; BundleType = [string]$installedMatch.BundleType; Reason = 'Tauri bundle markers occur at different offsets' }
+    }
+
+    $bundleCodeOffset = $stagedOffset + $stagedMarker.Length - 3
+    $bundleCodeEnd = $bundleCodeOffset + 3
+    for ($index = 0; $index -lt $stagedBytes.Length; $index++) {
+        if ($index -ge $bundleCodeOffset -and $index -lt $bundleCodeEnd) {
+            continue
+        }
+        if ($stagedBytes[$index] -ne $installedBytes[$index]) {
+            return [pscustomobject]@{ Matched = $false; BundleType = [string]$installedMatch.BundleType; Reason = "payload byte drift outside Tauri bundle marker at offset $index" }
+        }
+    }
+
+    return [pscustomobject]@{ Matched = $true; BundleType = [string]$installedMatch.BundleType; Reason = 'recognized Tauri bundle marker transform' }
+}
+
 function Assert-DeckPipeCandidateIdentity {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -784,24 +888,48 @@ function Assert-DeckPipeCandidateIdentity {
     $verified = Read-DeckPipeVerifiedEvidence -StagePath $stagePath
     $evidence = $verified.Evidence
     $actualSha = (Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash.ToLowerInvariant()
-    $shortSource = ([string]$evidence.source_revision).Substring(0, 7)
-    $namePattern = '^DeckPipe-' + [regex]::Escape([string]$evidence.build_id) + '-' + [regex]::Escape($shortSource) + '-.*\.exe$'
     $artifactMatches = [Collections.Generic.List[object]]::new()
+    $markerComparisonReasons = [Collections.Generic.List[string]]::new()
     foreach ($artifact in @($evidence.artifacts)) {
         if ([string]$artifact.type -ne 'exe') { continue }
-        if ([string]$artifact.sha256 -cne $actualSha) { continue }
-        if ([string]$artifact.path -notmatch $namePattern) {
-            throw "candidate executable artifact name does not match release evidence naming: $($artifact.path)"
-        }
+        $isApplicationArtifact = Test-DeckPipeApplicationArtifactPath -Evidence $evidence -RelativePath ([string]$artifact.path)
         $stagedPath = Resolve-DeckPipeStagedArtifactPath -StagePath $stagePath -RelativePath ([string]$artifact.path)
         $stagedSha = (Get-FileHash -LiteralPath $stagedPath -Algorithm SHA256).Hash.ToLowerInvariant()
         if ($stagedSha -cne [string]$artifact.sha256) {
             throw "candidate staged artifact hash mismatch: $($artifact.path)"
         }
-        $artifactMatches.Add([pscustomobject]@{ Artifact = $artifact; StagedPath = $stagedPath })
+        if ([string]$artifact.sha256 -cne $actualSha) {
+            if (-not $isApplicationArtifact) { continue }
+            $markerMatch = Compare-DeckPipeTauriBundleMarkerPayload -InstalledPath $resolved -StagedPath $stagedPath
+            if (-not $markerMatch.Matched) {
+                $markerComparisonReasons.Add([string]$markerMatch.Reason)
+                continue
+            }
+            $artifactMatches.Add([pscustomobject]@{
+                Artifact = $artifact
+                StagedPath = $stagedPath
+                StagedSha256 = $stagedSha
+                IdentityMatchMode = 'tauri-bundle-marker'
+                AcceptedBundleType = [string]$markerMatch.BundleType
+                IsApplicationArtifact = $true
+            })
+            continue
+        }
+        $artifactMatches.Add([pscustomobject]@{
+            Artifact = $artifact
+            StagedPath = $stagedPath
+            StagedSha256 = $stagedSha
+            IdentityMatchMode = 'exact-sha256'
+            AcceptedBundleType = ''
+            IsApplicationArtifact = [bool]$isApplicationArtifact
+        })
     }
     if ($artifactMatches.Count -eq 0) {
-        throw 'installed ExePath bytes do not match exactly one executable artifact in release evidence.'
+        $detail = ''
+        if ($markerComparisonReasons.Count -gt 0) {
+            $detail = ' Last Tauri bundle marker comparison: ' + [string]$markerComparisonReasons[$markerComparisonReasons.Count - 1]
+        }
+        throw "installed ExePath bytes do not match exactly one application executable artifact in release evidence by exact SHA-256 or recognized Tauri bundle marker.$detail"
     }
     if ($artifactMatches.Count -gt 1) {
         throw 'ambiguous executable artifact: installed ExePath bytes match multiple staged executables.'
@@ -811,11 +939,17 @@ function Assert-DeckPipeCandidateIdentity {
     }
 
     $match = $artifactMatches[0]
+    if (-not [bool]$match.IsApplicationArtifact) {
+        throw 'installed ExePath matched a setup artifact, not the application executable artifact.'
+    }
     [pscustomobject]@{
         matched = $true
         resolved_exe = $resolved
         install_directory = $installDirectoryPath
         actual_sha256 = $actualSha
+        staged_sha256 = [string]$match.StagedSha256
+        identity_match_mode = [string]$match.IdentityMatchMode
+        accepted_bundle_type = [string]$match.AcceptedBundleType
         actual_version = [string]$evidence.version
         actual_build_id = [string]$evidence.build_id
         source_revision = [string]$evidence.source_revision
@@ -2104,6 +2238,9 @@ try {
             build_id = [string]$candidateIdentity.actual_build_id
             executable = [IO.Path]::GetFileName($resolvedExe)
             executable_sha256 = [string]$candidateIdentity.actual_sha256
+            staged_executable_sha256 = [string]$candidateIdentity.staged_sha256
+            identity_match_mode = [string]$candidateIdentity.identity_match_mode
+            accepted_bundle_type = [string]$candidateIdentity.accepted_bundle_type
             source_revision = [string]$candidateIdentity.source_revision
             evidence_directory = [string]$candidateIdentity.evidence_directory
             staged_artifact = [string]$candidateIdentity.staged_artifact_path
