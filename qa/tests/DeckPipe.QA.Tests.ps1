@@ -129,7 +129,8 @@ function Update-InstalledQaTestStageInventory {
 }
 
 function New-InstalledQaIdentityFixture {
-    $artifactBytes = [Text.Encoding]::ASCII.GetBytes('prefix-__TAURI_BUNDLE_TYPE_VAR_UNK-suffix')
+    $artifactBytes = [Text.Encoding]::ASCII.GetBytes(
+        'prefix-inert-nss=__TAURI_BUNDLE_TYPE_VAR_NSS-inert-msi=__TAURI_BUNDLE_TYPE_VAR_MSI-active=__TAURI_BUNDLE_TYPE_VAR_UNK-wrong-offset-UNK-suffix')
     $root = Join-Path ([IO.Path]::GetTempPath()) ('deckpipe-installed-identity-' + [guid]::NewGuid().ToString('N'))
     $stage = Join-Path $root 'stage'
     $install = Join-Path $root 'installed\DeckPipe'
@@ -172,12 +173,18 @@ function New-InstalledQaIdentityFixture {
     }
 }
 
-function Set-InstalledQaBundleMarker {
-    param([Parameter(Mandatory)][string]$Path)
+function Set-InstalledQaAsciiReplacement {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$OldText,
+        [Parameter(Mandatory)][string]$NewText
+    )
+
+    if ($OldText.Length -ne $NewText.Length) { throw 'test setup failed: replacement length mismatch' }
 
     $bytes = [IO.File]::ReadAllBytes($Path)
-    $old = [Text.Encoding]::ASCII.GetBytes('__TAURI_BUNDLE_TYPE_VAR_UNK')
-    $new = [Text.Encoding]::ASCII.GetBytes('__TAURI_BUNDLE_TYPE_VAR_NSS')
+    $old = [Text.Encoding]::ASCII.GetBytes($OldText)
+    $new = [Text.Encoding]::ASCII.GetBytes($NewText)
     $offset = -1
     for ($index = 0; $index -le ($bytes.Length - $old.Length); $index++) {
         $matched = $true
@@ -196,6 +203,27 @@ function Set-InstalledQaBundleMarker {
     for ($inner = 0; $inner -lt $new.Length; $inner++) {
         $bytes[$offset + $inner] = $new[$inner]
     }
+    [IO.File]::WriteAllBytes($Path, $bytes)
+}
+
+function Set-InstalledQaBundleMarker {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [ValidateSet('NSS', 'MSI', 'BAD')]
+        [string]$BundleType = 'NSS'
+    )
+
+    Set-InstalledQaAsciiReplacement `
+        -Path $Path `
+        -OldText '__TAURI_BUNDLE_TYPE_VAR_UNK' `
+        -NewText ("__TAURI_BUNDLE_TYPE_VAR_$BundleType")
+}
+
+function Set-InstalledQaExtraChangedByte {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $bytes[$bytes.Length - 1] = $bytes[$bytes.Length - 1] -bxor 1
     [IO.File]::WriteAllBytes($Path, $bytes)
 }
 
@@ -387,6 +415,43 @@ It 'accepts a private-beta NSIS install when only the Tauri bundle marker code c
         Assert-Equal $payload.identity.staged_artifact_path $fixture.ArtifactName
         Assert-Equal $payload.identity.actual_sha256 (Get-TestSha256 $fixture.Installed)
         Assert-False ([string]$payload.identity.actual_sha256 -eq [string]$payload.identity.staged_sha256) 'Marker acceptance must retain the distinct installed hash'
+    } finally {
+        if (Test-Path -LiteralPath $fixture.Root -PathType Container) { [IO.Directory]::Delete($fixture.Root, $true) }
+    }
+}
+
+It 'rejects a Tauri bundle marker transform with one extra changed byte' {
+    $fixture = New-InstalledQaIdentityFixture
+    try {
+        Set-InstalledQaBundleMarker -Path $fixture.Installed
+        Set-InstalledQaExtraChangedByte -Path $fixture.Installed
+        $result = Invoke-InstalledQaIdentitySelfTest -ExePath $fixture.Installed -CandidateEvidenceDirectory $fixture.Stage
+        Assert-Equal $result.ExitCode 1 'Expected identity self-test to reject marker drift plus an extra changed byte'
+        Assert-True ($result.Output -match 'recognized Tauri bundle marker') "Expected marker identity rejection. Output: $($result.Output)"
+    } finally {
+        if (Test-Path -LiteralPath $fixture.Root -PathType Container) { [IO.Directory]::Delete($fixture.Root, $true) }
+    }
+}
+
+It 'rejects a Tauri bundle marker code change at the wrong offset' {
+    $fixture = New-InstalledQaIdentityFixture
+    try {
+        Set-InstalledQaAsciiReplacement -Path $fixture.Installed -OldText 'wrong-offset-UNK' -NewText 'wrong-offset-NSS'
+        $result = Invoke-InstalledQaIdentitySelfTest -ExePath $fixture.Installed -CandidateEvidenceDirectory $fixture.Stage
+        Assert-Equal $result.ExitCode 1 'Expected identity self-test to reject an unanchored three-byte code change'
+        Assert-True ($result.Output -match 'recognized Tauri bundle marker') "Expected marker identity rejection. Output: $($result.Output)"
+    } finally {
+        if (Test-Path -LiteralPath $fixture.Root -PathType Container) { [IO.Directory]::Delete($fixture.Root, $true) }
+    }
+}
+
+It 'rejects an invalid Tauri bundle marker code' {
+    $fixture = New-InstalledQaIdentityFixture
+    try {
+        Set-InstalledQaBundleMarker -Path $fixture.Installed -BundleType BAD
+        $result = Invoke-InstalledQaIdentitySelfTest -ExePath $fixture.Installed -CandidateEvidenceDirectory $fixture.Stage
+        Assert-Equal $result.ExitCode 1 'Expected identity self-test to reject an unsupported bundle code'
+        Assert-True ($result.Output -match 'recognized Tauri bundle marker') "Expected marker identity rejection. Output: $($result.Output)"
     } finally {
         if (Test-Path -LiteralPath $fixture.Root -PathType Container) { [IO.Directory]::Delete($fixture.Root, $true) }
     }

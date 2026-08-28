@@ -781,31 +781,6 @@ function Test-DeckPipeApplicationArtifactPath {
     return [string]$RelativePath -ceq $expected
 }
 
-function Get-DeckPipeBytePatternOffsets {
-    param(
-        [Parameter(Mandatory)][byte[]]$Bytes,
-        [Parameter(Mandatory)][byte[]]$Pattern
-    )
-
-    $offsets = [Collections.Generic.List[int]]::new()
-    if ($Pattern.Length -eq 0 -or $Bytes.Length -lt $Pattern.Length) {
-        return $offsets.ToArray()
-    }
-    for ($index = 0; $index -le ($Bytes.Length - $Pattern.Length); $index++) {
-        $matched = $true
-        for ($inner = 0; $inner -lt $Pattern.Length; $inner++) {
-            if ($Bytes[$index + $inner] -ne $Pattern[$inner]) {
-                $matched = $false
-                break
-            }
-        }
-        if ($matched) {
-            $offsets.Add($index)
-        }
-    }
-    return $offsets.ToArray()
-}
-
 function Compare-DeckPipeTauriBundleMarkerPayload {
     param(
         [Parameter(Mandatory)][string]$InstalledPath,
@@ -818,56 +793,46 @@ function Compare-DeckPipeTauriBundleMarkerPayload {
         return [pscustomobject]@{ Matched = $false; BundleType = ''; Reason = 'installed and staged executable lengths differ' }
     }
 
-    $encoding = [Text.Encoding]::ASCII
-    $stagedMarker = $encoding.GetBytes('__TAURI_BUNDLE_TYPE_VAR_UNK')
-    $installedMarkers = [ordered]@{
-        NSS = $encoding.GetBytes('__TAURI_BUNDLE_TYPE_VAR_NSS')
-        MSI = $encoding.GetBytes('__TAURI_BUNDLE_TYPE_VAR_MSI')
-    }
-    $stagedOffsets = @(Get-DeckPipeBytePatternOffsets -Bytes $stagedBytes -Pattern $stagedMarker)
-    if ($stagedOffsets.Count -ne 1) {
-        return [pscustomobject]@{ Matched = $false; BundleType = ''; Reason = "staged Tauri bundle marker count is $($stagedOffsets.Count), expected 1" }
-    }
-    foreach ($bundleType in $installedMarkers.Keys) {
-        $stagedInstalledMarkerOffsets = @(Get-DeckPipeBytePatternOffsets -Bytes $stagedBytes -Pattern $installedMarkers[$bundleType])
-        if ($stagedInstalledMarkerOffsets.Count -ne 0) {
-            return [pscustomobject]@{ Matched = $false; BundleType = ''; Reason = 'staged executable contains an installed Tauri bundle marker' }
-        }
-    }
-
-    $installedMatches = @()
-    foreach ($bundleType in $installedMarkers.Keys) {
-        foreach ($offset in @(Get-DeckPipeBytePatternOffsets -Bytes $installedBytes -Pattern $installedMarkers[$bundleType])) {
-            $installedMatches += [pscustomobject]@{ BundleType = $bundleType; Offset = [int]$offset }
-        }
-    }
-    if ($installedMatches.Count -ne 1) {
-        return [pscustomobject]@{ Matched = $false; BundleType = ''; Reason = "installed Tauri bundle marker count is $($installedMatches.Count), expected 1" }
-    }
-
-    $installedUnkOffsets = @(Get-DeckPipeBytePatternOffsets -Bytes $installedBytes -Pattern $stagedMarker)
-    if ($installedUnkOffsets.Count -ne 0) {
-        return [pscustomobject]@{ Matched = $false; BundleType = ''; Reason = 'installed executable still contains the staged Tauri bundle marker' }
-    }
-
-    $stagedOffset = [int]$stagedOffsets[0]
-    $installedMatch = $installedMatches[0]
-    if ([int]$installedMatch.Offset -ne $stagedOffset) {
-        return [pscustomobject]@{ Matched = $false; BundleType = [string]$installedMatch.BundleType; Reason = 'Tauri bundle markers occur at different offsets' }
-    }
-
-    $bundleCodeOffset = $stagedOffset + $stagedMarker.Length - 3
-    $bundleCodeEnd = $bundleCodeOffset + 3
+    $differenceOffsets = [Collections.Generic.List[int]]::new()
     for ($index = 0; $index -lt $stagedBytes.Length; $index++) {
-        if ($index -ge $bundleCodeOffset -and $index -lt $bundleCodeEnd) {
-            continue
-        }
         if ($stagedBytes[$index] -ne $installedBytes[$index]) {
-            return [pscustomobject]@{ Matched = $false; BundleType = [string]$installedMatch.BundleType; Reason = "payload byte drift outside Tauri bundle marker at offset $index" }
+            $differenceOffsets.Add($index)
+            if ($differenceOffsets.Count -gt 3) {
+                return [pscustomobject]@{ Matched = $false; BundleType = ''; Reason = "payload has more than three changed bytes; additional drift at offset $index" }
+            }
         }
     }
 
-    return [pscustomobject]@{ Matched = $true; BundleType = [string]$installedMatch.BundleType; Reason = 'recognized Tauri bundle marker transform' }
+    if ($differenceOffsets.Count -ne 3) {
+        return [pscustomobject]@{ Matched = $false; BundleType = ''; Reason = "payload changed byte count is $($differenceOffsets.Count), expected 3" }
+    }
+    if ($differenceOffsets[1] -ne ($differenceOffsets[0] + 1) -or $differenceOffsets[2] -ne ($differenceOffsets[0] + 2)) {
+        return [pscustomobject]@{ Matched = $false; BundleType = ''; Reason = 'payload changed bytes are not one contiguous three-byte range' }
+    }
+
+    $encoding = [Text.Encoding]::ASCII
+    $prefix = $encoding.GetBytes('__TAURI_BUNDLE_TYPE_VAR_')
+    $bundleCodeOffset = [int]$differenceOffsets[0]
+    $prefixOffset = $bundleCodeOffset - $prefix.Length
+    if ($prefixOffset -lt 0) {
+        return [pscustomobject]@{ Matched = $false; BundleType = ''; Reason = 'changed range is not immediately after the Tauri bundle marker prefix' }
+    }
+    for ($index = 0; $index -lt $prefix.Length; $index++) {
+        if ($stagedBytes[$prefixOffset + $index] -ne $prefix[$index] -or $installedBytes[$prefixOffset + $index] -ne $prefix[$index]) {
+            return [pscustomobject]@{ Matched = $false; BundleType = ''; Reason = 'changed range is not immediately after the Tauri bundle marker prefix' }
+        }
+    }
+
+    $stagedBundleType = $encoding.GetString($stagedBytes, $bundleCodeOffset, 3)
+    $installedBundleType = $encoding.GetString($installedBytes, $bundleCodeOffset, 3)
+    if ($stagedBundleType -cne 'UNK') {
+        return [pscustomobject]@{ Matched = $false; BundleType = ''; Reason = "staged bundle marker code is invalid: $stagedBundleType" }
+    }
+    if ($installedBundleType -cnotin @('NSS', 'MSI')) {
+        return [pscustomobject]@{ Matched = $false; BundleType = ''; Reason = "installed bundle marker code is invalid: $installedBundleType" }
+    }
+
+    return [pscustomobject]@{ Matched = $true; BundleType = $installedBundleType; Reason = 'recognized Tauri bundle marker transform' }
 }
 
 function Assert-DeckPipeCandidateIdentity {
