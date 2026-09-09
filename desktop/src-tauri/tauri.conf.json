@@ -29,8 +29,7 @@
       "icons/icon.ico"
     ],
     "externalBin": [
-      "binaries/deckpipe-backend",
-      "binaries/deckpipe-auth-host"
+      "binaries/deckpipe-backend"
     ],
     "resources": {
       "../../release/auth-helper/": "auth-helper/",

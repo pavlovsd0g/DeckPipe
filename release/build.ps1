@@ -692,7 +692,7 @@ function Invoke-ReleaseBuild {
                 if ($LASTEXITCODE -ne 0) { throw 'build failed: desktop npm ci --offline failed' }
                 $env:CARGO_TARGET_DIR = $plan.CargoTargetDir
                 $env:CARGO_NET_OFFLINE = 'true'
-                & npm run build
+                & npm run build -- --verbose
                 if ($LASTEXITCODE -ne 0) { throw 'build failed: Tauri build failed' }
             } finally {
                 Pop-Location

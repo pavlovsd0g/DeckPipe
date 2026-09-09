@@ -13,6 +13,15 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class HelperPackageTests(unittest.TestCase):
+    def test_cargo_and_external_binaries_have_unique_installed_names(self):
+        env = dict(os.environ, CARGO_NET_OFFLINE='true')
+        metadata = subprocess.run(['cargo', 'metadata', '--offline', '--no-deps', '--format-version', '1'], cwd=ROOT / 'desktop/src-tauri', env=env, text=True, capture_output=True, timeout=30, check=True)
+        cargo_bins = {target['name'] for target in json.loads(metadata.stdout)['packages'][0]['targets'] if 'bin' in target['kind']}
+        config = json.loads((ROOT / 'desktop/src-tauri/tauri.conf.json').read_text())
+        external_bins = {Path(path).name for path in config['bundle']['externalBin']}
+        self.assertIn('deckpipe-auth-host', cargo_bins)
+        self.assertEqual(cargo_bins & external_bins, set(), 'Tauri bundles Cargo binaries automatically; duplicate externalBin entries cause WiX ICE30')
+
     @unittest.skipUnless(os.name == 'nt' and (ROOT / 'desktop/node_modules/@tauri-apps/cli/tauri.js').is_file(), 'Installed Windows Tauri CLI required')
     def test_tauri_selects_desktop_main_when_native_helper_is_also_a_bin(self):
         # Exercise the installed CLI's actual discovery without compiling or
@@ -74,7 +83,7 @@ class HelperPackageTests(unittest.TestCase):
         config = json.loads((ROOT / 'desktop/src-tauri/tauri.conf.json').read_text())
         self.assertEqual(config['bundle']['resources']['../../release/auth-helper/'], 'auth-helper/')
         self.assertEqual(config['bundle']['resources']['../../extension/'], 'auth-helper/extension/')
-        self.assertIn('binaries/deckpipe-auth-host', config['bundle']['externalBin'])
+        self.assertNotIn('binaries/deckpipe-auth-host', config['bundle']['externalBin'])
         self.assertTrue((ROOT / 'release/auth-helper/README.md').is_file())
         main = (ROOT / 'desktop/src-tauri/src/main.rs').read_text(encoding='utf-8')
         self.assertIn('fn auth_open_setup(', main)

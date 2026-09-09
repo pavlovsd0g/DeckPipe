@@ -533,12 +533,33 @@ class StagedPublicationTests(unittest.TestCase):
 
 
 class DurableJobJournalTests(unittest.TestCase):
+    @staticmethod
+    def _join_worker(worker) -> None:
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=3)
+            if worker.is_alive():
+                raise AssertionError("test worker did not stop")
+
+    @classmethod
+    def _stop_and_join_worker(cls, worker, stop_event) -> None:
+        stop_event.set()
+        cls._join_worker(worker)
+
+    @classmethod
+    def _stop_module_worker(cls, jobs) -> None:
+        with jobs._lock:
+            worker = jobs._worker_thread
+            stop_event = jobs._worker_stop
+        cls._stop_and_join_worker(worker, stop_event)
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(prefix="deckpipe-jobs-")
         self.data_root = Path(self.tmp.name) / "data"
         import app.jobs as jobs
 
+        self._stop_module_worker(jobs)
         self.jobs = importlib.reload(jobs)
+        self._obsolete_workers = []
         # These tests isolate durable worker/journal transitions. The actual
         # common-root and unplugged-drive boundary is exercised in catalog workflow.
         destination_guard = patch('app.catalog_service.validate_destination')
@@ -546,6 +567,9 @@ class DurableJobJournalTests(unittest.TestCase):
         self.addCleanup(destination_guard.stop)
 
     def tearDown(self) -> None:
+        self._stop_module_worker(self.jobs)
+        for worker, stop_event in self._obsolete_workers:
+            self._stop_and_join_worker(worker, stop_event)
         self.tmp.cleanup()
 
     def test_init_requires_explicit_data_root_and_list_get_return_snapshots(self) -> None:
@@ -841,11 +865,14 @@ class DurableJobJournalTests(unittest.TestCase):
         ):
             with jobs._lock:
                 jobs._ensure_worker_locked()
+                obsolete_worker = jobs._worker_thread
+                obsolete_stop = jobs._worker_stop
+            self._obsolete_workers.append((obsolete_worker, obsolete_stop))
             self.assertTrue(sleeper_ready.wait(1))
             jobs.initialize(new_root, start_worker=False)
             job_id = jobs.enqueue("playlist", "Playlist", [_track("1")], mode="append", start_worker=False)
             release_sleep.set()
-            threading.Event().wait(0.05)
+            self._join_worker(obsolete_worker)
 
         self.assertEqual([], calls)
         self.assertEqual("queued", jobs.get_job(job_id)["state"])
@@ -870,10 +897,13 @@ class DurableJobJournalTests(unittest.TestCase):
         ):
             old_id = jobs.enqueue("playlist", "Playlist", [_track("1")], mode="append", start_worker=True)
             self.assertTrue(entered.wait(1))
+            obsolete_worker = jobs._worker_thread
+            obsolete_stop = jobs._worker_stop
+            self._obsolete_workers.append((obsolete_worker, obsolete_stop))
             jobs.initialize(new_root, start_worker=False)
             new_id = jobs.enqueue("playlist", "Playlist", [_track("2")], mode="append", start_worker=False)
             release.set()
-            threading.Event().wait(0.05)
+            self._join_worker(obsolete_worker)
 
         self.assertIsNone(jobs.get_job(old_id))
         self.assertEqual("queued", jobs.get_job(new_id)["state"])
