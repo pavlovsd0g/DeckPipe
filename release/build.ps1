@@ -643,6 +643,8 @@ function Invoke-ReleaseBuild {
     [IO.Directory]::CreateDirectory($plan.BuildRoot) | Out-Null
     $oldCargoTargetDir = $env:CARGO_TARGET_DIR
     $oldCargoNetOffline = $env:CARGO_NET_OFFLINE
+    $oldCargoHome = $env:CARGO_HOME
+    $oldRustupHome = $env:RUSTUP_HOME
     $oldPipNoCacheDir = $env:PIP_NO_CACHE_DIR
     try {
         $env:PIP_NO_CACHE_DIR = '1'
@@ -668,6 +670,14 @@ function Invoke-ReleaseBuild {
             $sidecarDir = Join-Path $plan.SourceRoot 'desktop\src-tauri\binaries'
             [IO.Directory]::CreateDirectory($sidecarDir) | Out-Null
             Copy-Item -LiteralPath (Join-Path $plan.PyInstallerDistPath 'deckpipe-backend.exe') -Destination (Join-Path $sidecarDir 'deckpipe-backend-x86_64-pc-windows-msvc.exe') -Force
+
+            # git archive excludes generated externalBin files. Bootstrap the
+            # native host from this same exported revision before Tauri bundles it.
+            $helperBuild = Join-Path $plan.SourceRoot 'release\auth-helper\Build-AuthHelper.ps1'
+            & $helperBuild -SourceRoot $plan.SourceRoot -TargetDirectory $plan.CargoTargetDir -Release
+            if (-not (Test-Path -LiteralPath (Join-Path $sidecarDir 'deckpipe-auth-host-x86_64-pc-windows-msvc.exe') -PathType Leaf)) {
+                throw 'build failed: native auth helper was not produced in exported source'
+            }
 
             Push-Location $plan.SourceRoot
             try {
@@ -764,6 +774,8 @@ function Invoke-ReleaseBuild {
     } finally {
         $env:CARGO_TARGET_DIR = $oldCargoTargetDir
         $env:CARGO_NET_OFFLINE = $oldCargoNetOffline
+        $env:CARGO_HOME = $oldCargoHome
+        $env:RUSTUP_HOME = $oldRustupHome
         $env:PIP_NO_CACHE_DIR = $oldPipNoCacheDir
         if ($null -ne $plan) {
             Remove-OwnedBuildRoot -BuildRoot $plan.BuildRoot -StagePath $stagePath

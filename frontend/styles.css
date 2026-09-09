@@ -73,7 +73,8 @@ header {
 #settings {
   align-items: center;
   display: flex;
-  flex: 1 1 520px;
+  flex: 1 1 100%;
+  flex-wrap: wrap;
   gap: 8px;
   justify-content: flex-end;
   min-width: 0;
@@ -706,6 +707,14 @@ button.srow {
 .hidden {
   display: none !important;
 }
+
+.root-setup { max-width: 640px; margin: 10vh auto; padding: 28px; line-height: 1.7; }
+.root-setup h2 { margin-top: 0; }
+.library-state { padding: 5px 20px; font-size: 12px; color: var(--muted, #9aa5b6); }
+.track-location { min-width: 200px; max-width: 380px; }
+.track-location .file-path { display: block; font-size: 11px; overflow-wrap: anywhere; white-space: normal; }
+.track-location .location-label { display: block; font-size: 11px; color: var(--ok); }
+.track-location select { width: 100%; max-width: 320px; margin-bottom: 5px; }
 
 #sc-add.visible-flex,
 #searchbar.visible-flex,

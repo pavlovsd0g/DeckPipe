@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .atomic_io import atomic_load_json, atomic_write_json, file_lock, is_partial_path
 from .deezer_client import load_config, save_config, sanitize_filename
+from . import rename_journal
 
 SIDECAR_NAME = ".deckpipe.json"
 DEFAULT_ROOT = Path.home() / "Music" / "DeckPipe"
@@ -72,7 +73,7 @@ def _validate_sidecar(payload: object) -> dict:
     return normalized
 
 
-def load_sidecar(pl_dir: Path) -> dict:
+def _load_sidecar_state(pl_dir: Path) -> dict:
     path = sidecar_path(pl_dir)
     if not path.exists() and not Path(f"{path}.bak").exists():
         return {"tracks": {}}
@@ -84,9 +85,82 @@ def load_sidecar(pl_dir: Path) -> dict:
     )
 
 
-def save_sidecar(pl_dir: Path, data: dict):
+def _save_sidecar_state(pl_dir: Path, data: dict) -> None:
     Path(pl_dir).mkdir(parents=True, exist_ok=True)
     atomic_write_json(sidecar_path(pl_dir), data, validator=_validate_sidecar, backup=True)
+
+
+def _entry_path(pl_dir: Path, name: object) -> Path | None:
+    if not isinstance(name, str) or not name or is_partial_path(name):
+        return None
+    rel = Path(name)
+    if rel.is_absolute() or rel.name != name:
+        return None
+    candidate = Path(pl_dir) / rel
+    try:
+        root = Path(pl_dir).resolve()
+        resolved = candidate.resolve()
+        if resolved != root and root not in resolved.parents:
+            return None
+    except Exception:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def _recover_renames_locked(pl_dir: Path, sidecar: dict) -> dict:
+    journal = rename_journal.load(pl_dir)
+    if journal is None:
+        return sidecar
+    tracks = sidecar.get("tracks", {})
+    operations = journal["operations"]
+    for operation in operations:
+        entry = tracks.get(operation["key"])
+        if not isinstance(entry, dict) or entry.get("file") not in {operation["source"], operation["destination"]}:
+            raise RuntimeError("playlist rename recovery requires manual review")
+
+    for operation in operations:
+        source = Path(pl_dir) / operation["source"]
+        temporary = Path(pl_dir) / operation["temporary"]
+        destination = Path(pl_dir) / operation["destination"]
+        if temporary.exists():
+            continue
+        if source.exists():
+            rename_journal.move_new(source, temporary)
+            continue
+        if destination.exists():
+            continue
+        raise RuntimeError("playlist rename recovery requires manual review")
+
+    for operation in operations:
+        temporary = Path(pl_dir) / operation["temporary"]
+        destination = Path(pl_dir) / operation["destination"]
+        if temporary.exists():
+            if destination.exists():
+                raise RuntimeError("playlist rename recovery requires manual review")
+            rename_journal.move_new(temporary, destination)
+        elif not destination.exists():
+            raise RuntimeError("playlist rename recovery requires manual review")
+
+    recovered = {**sidecar, "tracks": {key: dict(entry) for key, entry in tracks.items()}}
+    for operation in operations:
+        entry = recovered["tracks"][operation["key"]]
+        entry["file"] = operation["destination"]
+        entry["position"] = operation["position"]
+    _save_sidecar_state(pl_dir, recovered)
+    rename_journal.remove(pl_dir)
+    return recovered
+
+
+def load_sidecar(pl_dir: Path) -> dict:
+    path = sidecar_path(pl_dir)
+    if not path.exists() and not Path(f"{path}.bak").exists() and not rename_journal.journal_path(pl_dir).exists():
+        return {"tracks": {}}
+    with file_lock(sidecar_path(pl_dir)):
+        return _recover_renames_locked(Path(pl_dir), _load_sidecar_state(pl_dir))
+
+
+def save_sidecar(pl_dir: Path, data: dict):
+    _save_sidecar_state(pl_dir, data)
 
 
 def update_track_status(pl_dir: Path, deezer_id: str, entry: dict):
@@ -103,21 +177,7 @@ def update_track_status(pl_dir: Path, deezer_id: str, entry: dict):
 def is_ready_entry(pl_dir: Path, entry: dict) -> bool:
     if not isinstance(entry, dict) or entry.get("status") != "ok":
         return False
-    name = entry.get("file", "")
-    if not isinstance(name, str) or not name or is_partial_path(name):
-        return False
-    rel = Path(name)
-    if rel.is_absolute() or rel.name != name:
-        return False
-    candidate = Path(pl_dir) / rel
-    try:
-        root = Path(pl_dir).resolve()
-        resolved = candidate.resolve()
-        if resolved != root and root not in resolved.parents:
-            return False
-    except Exception:
-        return False
-    return candidate.is_file()
+    return _entry_path(pl_dir, entry.get("file", "")) is not None
 
 
 def get_last_scan_counters() -> dict[str, int]:
@@ -147,27 +207,70 @@ def renumber_playlist(pl_dir: Path, ordered_ids: list, digits: int) -> int:
     with file_lock(sidecar_path(pl_dir)):
         sc = load_sidecar(pl_dir)
         tracks = sc.get("tracks", {})
-        renamed = 0
+        candidates = []
+        metadata_only = []
         for i, tid in enumerate(ordered_ids, start=1):
             e = tracks.get(track_key(tid)) or tracks.get(str(tid))
             if not e or not e.get("file") or is_partial_path(e["file"]):
                 continue
-            old = Path(pl_dir) / e["file"]
-            if not old.exists():
+            old = _entry_path(pl_dir, e["file"])
+            if old is None:
                 continue
             new_name = f"{i:0{digits}d} - {strip_number_prefix(e['file'])}"
             if e["file"] == new_name and e.get("position") == i:
                 continue
             new = Path(pl_dir) / new_name
-            if new.exists() and new != old:
+            if new == old:
+                metadata_only.append((e, i))
                 continue
-            old.rename(new)
-            e["file"] = new_name
-            e["position"] = i
-            renamed += 1
-        if renamed:
+            key = track_key(tid)
+            if key not in tracks and str(tid) in tracks:
+                key = str(tid)
+            candidates.append(
+                {
+                    "key": key,
+                    "source": old.name,
+                    "temporary": rename_journal.temporary_name(new_name),
+                    "destination": new_name,
+                    "position": i,
+                }
+            )
+
+        selected = candidates
+        while selected:
+            sources = {operation["source"] for operation in selected}
+            filtered = [
+                operation
+                for operation in selected
+                if not (Path(pl_dir, operation["destination"]).exists() and operation["destination"] not in sources)
+            ]
+            if len(filtered) == len(selected):
+                break
+            selected = filtered
+
+        if selected:
+            rename_journal.save(pl_dir, selected)
+            for operation in selected:
+                rename_journal.move_new(
+                    Path(pl_dir) / operation["source"],
+                    Path(pl_dir) / operation["temporary"],
+                )
+            for operation in selected:
+                rename_journal.move_new(
+                    Path(pl_dir) / operation["temporary"],
+                    Path(pl_dir) / operation["destination"],
+                )
+            for operation in selected:
+                entry = tracks[operation["key"]]
+                entry["file"] = operation["destination"]
+                entry["position"] = operation["position"]
+        for entry, position in metadata_only:
+            entry["position"] = position
+        if selected or metadata_only:
             save_sidecar(pl_dir, sc)
-        return renamed
+        if selected:
+            rename_journal.remove(pl_dir)
+        return len(selected)
 
 
 def _normalize(s: str) -> str:
@@ -194,43 +297,29 @@ def _score_match(
     stem_norm: str,
     same_title_count: int | None = None,
 ) -> int:
-    n_title = _normalize(track_title)
-    n_title_short = _normalize(re.sub(r"[\(\[].*?[\)\]]", "", track_title))
-    n_artist = _normalize(track_artist)
-    first_artist = _normalize(re.split(r"[,;&]| feat\.? | ft\.? | vs\.? | x ", track_artist)[0])
-    score = 0
-    if n_title and stem_norm == n_title:
-        score += 5
-    elif n_title and n_title in stem_norm:
-        score += 3
-    elif n_title_short and len(n_title_short) >= 4 and n_title_short in stem_norm:
-        score += 2
-    elif stem_norm in n_title:
-        score += 1
-    if score == 0:
+    del same_title_count
+    title = _normalize(track_title)
+    artist = _normalize(track_artist)
+    if not title:
         return 0
-    if n_artist and n_artist in stem_norm:
-        score += 3
-    elif first_artist and first_artist in stem_norm:
-        score += 2
-    if score >= 5:
-        return score
-    return score if same_title_count == 1 else 0
+    expected = _normalize(f"{track_artist} - {track_title}") if artist else title
+    return 10 if stem_norm == expected else 0
 
 
 def match_file(track_title: str, track_artist: str, files: list) -> Path | None:
     clean = [Path(f) for f in files if not is_partial_path(f)]
     stems = [(f, _normalize(_strip_track_number(f.stem))) for f in clean]
-    n_title = _normalize(track_title)
-    same_count = sum(1 for _f, stem in stems if n_title and n_title in stem)
-    best, best_score = None, 0
+    best = []
+    best_score = 0
     for f, stem in stems:
         if not stem:
             continue
-        score = _score_match(track_title, track_artist, stem, same_count)
+        score = _score_match(track_title, track_artist, stem)
         if score > best_score:
-            best, best_score = f, score
-    return best if best_score >= 3 else None
+            best, best_score = [f], score
+        elif score and score == best_score:
+            best.append(f)
+    return best[0] if best_score and len(best) == 1 else None
 
 
 @dataclass
@@ -282,41 +371,25 @@ class LibraryIndex:
         return set.intersection(*buckets)
 
     def _candidate_indexes(self, title: str, artist: str = "") -> list[int]:
-        full_tokens = _track_terms(title)
-        short = _normalize(re.sub(r"[\(\[].*?[\)\]]", "", title))
-        short_tokens = [token for token in short.split() if token]
-        title_indexes = self._bucket_intersection(full_tokens)
-        if not title_indexes:
-            title_indexes = self._bucket_intersection(short_tokens)
-        if not title_indexes:
-            title_buckets = [self.by_token[token] for token in full_tokens + short_tokens if token in self.by_token]
-            if not title_buckets:
-                return []
-            title_indexes = set(min(title_buckets, key=len))
-        artist_tokens = _normalize(artist).split()
-        artist_indexes = self._bucket_intersection(artist_tokens)
-        if not artist_indexes and artist_tokens:
-            artist_buckets = [self.by_token[token] for token in artist_tokens if token in self.by_token]
-            artist_indexes = set().union(*(set(bucket) for bucket in artist_buckets)) if artist_buckets else set()
-        if artist_indexes:
-            narrowed = title_indexes & artist_indexes
-            if narrowed:
-                return sorted(narrowed)
-        return sorted(title_indexes)
+        expected = _normalize(f"{artist} - {title}") if _normalize(artist) else _normalize(title)
+        tokens = expected.split()
+        return sorted(self._bucket_intersection(tokens))
 
     def find(self, track_title: str, track_artist: str, used_files: set[Path]) -> Path | None:
-        best, best_score = None, 0
+        best = []
+        best_score = 0
         candidates = self._candidate_indexes(track_title, track_artist)
-        same_title_count = self._same_title_count(track_title)
         for idx in candidates:
             item = self.files[idx]
             if item.resolved in used_files:
                 continue
             self.candidate_checks += 1
-            score = _score_match(track_title, track_artist, item.norm_stem, same_title_count)
+            score = _score_match(track_title, track_artist, item.norm_stem)
             if score > best_score:
-                best, best_score = item.path, score
-        return best if best_score >= 3 else None
+                best, best_score = [item.path], score
+            elif score and score == best_score:
+                best.append(item.path)
+        return best[0] if best_score and len(best) == 1 else None
 
     def counters(self) -> dict[str, int]:
         return {
@@ -335,7 +408,7 @@ def _entry_for_track(sidecar_tracks: dict, t: dict) -> tuple[str, dict | None]:
     return key, entry
 
 
-def scan_playlist(pl_dir: Path, deezer_tracks: list) -> list:
+def scan_playlist(pl_dir: Path, deezer_tracks: list, *, adopt_unmatched: bool = True) -> list:
     global _last_scan_counters
     lock_context = file_lock(sidecar_path(pl_dir)) if Path(pl_dir).exists() or sidecar_path(pl_dir).exists() else nullcontext()
     with lock_context:
@@ -345,6 +418,13 @@ def scan_playlist(pl_dir: Path, deezer_tracks: list) -> list:
         result = []
         index = LibraryIndex(pl_dir, sidecar_tracks)
         used_files: set[Path] = set()
+        for owned_entry in sidecar_tracks.values():
+            if not isinstance(owned_entry, dict):
+                continue
+            for field in ("file", "source_file"):
+                owned = _entry_path(pl_dir, owned_entry.get(field, ""))
+                if owned is not None:
+                    used_files.add(owned.resolve())
 
         for t in deezer_tracks:
             key, entry = _entry_for_track(sidecar_tracks, t)
@@ -363,7 +443,7 @@ def scan_playlist(pl_dir: Path, deezer_tracks: list) -> list:
                     changed = True
                 fmt = entry.get("format", "")
             else:
-                found = index.find(t["title"], t["artist"], used_files)
+                found = index.find(t["title"], t["artist"], used_files) if adopt_unmatched else None
                 if found:
                     status, err = "ok", ""
                     fmt = found.suffix.lstrip(".").lower()
@@ -396,7 +476,7 @@ def scan_playlist(pl_dir: Path, deezer_tracks: list) -> list:
                 }
             )
 
-        if changed:
+        if changed and adopt_unmatched:
             save_sidecar(pl_dir, sc)
         _last_scan_counters = index.counters()
         return result

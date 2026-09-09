@@ -418,7 +418,9 @@ class FrontendBuildContractTests(unittest.TestCase):
         source = read_text(FRONTEND / "app.js")
         self.assertIn("from '@tauri-apps/api/core'", source)
         self.assertRegex(js, r"invoke\([\"']backend_connection[\"']\)")
-        self.assertRegex(js, r"invoke\([\"']service_login[\"']")
+        for command in ["auth_begin", "auth_status", "auth_cancel", "auth_logout", "auth_open_setup"]:
+            self.assertRegex(js, rf"invoke\([\"']{command}[\"']")
+        self.assertNotRegex(js, r"invoke\([\"']service_login[\"']")
         self.assertIn("Authorization", js)
         self.assertIn("Bearer ${connection.token}", js)
         self.assertNotIn("window.__TAURI__", js)
@@ -491,6 +493,7 @@ globalThis.fetch = async url => {
   const path = new URL(url).pathname;
   const fixtures = {
     '/api/errors': [{playlist_key: 'p1', playlist_title: 'Playlist', track: {title: 'Broken', artist: 'Artist'}, error: 'failed'}],
+    '/api/remote-actions': [{id: 'remote-1', state: 'failed', target_id: 'p1', track_ids: ['t1'], last_error: {message: 'retry'}}],
     '/api/playlists': [{id: 'p1', title: 'Playlist', count: 1}],
     '/api/sc/sources': [{id: 's1', title: 'Source', count: 1}],
     '/api/local/playlists': [{key: 'local:one', title: 'Local', count: 1}],
@@ -515,12 +518,16 @@ searchTarget = {key: 'target', title: 'Target', provider: 'deezer'};
 searchSel = {'deezer:0': {id: 't1', title: 'Track', artist: 'Artist', duration: 10, provider: 'deezer'}};
 _renderBasket();
 collectActions(elements.get('#basket')).forEach(action => emitted.add(action));
-tracks = [{id: 't1', title: 'Track', artist: 'Artist', album: 'Album', duration: 10, status: 'missing'}];
+tracks = [
+  {id: 't1', title: 'Track', artist: 'Artist', album: 'Album', duration: 10, status: 'missing'},
+  {id: 't2', title: 'Ambiguous', artist: 'Artist', album: 'Album', duration: 10, status: 'ambiguous', locations: [{path: 'C:/Music/Artist - Ambiguous.flac'}]},
+];
 renderTracks();
 collectActions(elements.get('#tracks')).forEach(action => emitted.add(action));
 window._errors = [{playlist_key: 'p1', playlist_title: 'Playlist', track: {title: 'Broken', artist: 'Artist'}, error: 'failed'}];
 await loadErrors();
 collectActions(elements.get('#playlists')).forEach(action => emitted.add(action));
+libraryConfigured = true;
 await loadSearchTargets();
 collectActions(elements.get('#playlists')).forEach(action => emitted.add(action));
 console.log(JSON.stringify({
@@ -580,14 +587,16 @@ console.log(JSON.stringify({
             self.assertIn(bytes.fromhex(label_hex), combined_bytes)
         for route in [
             "/api/config",
-            "/api/login/deezer",
-            "/api/login/soundcloud",
+            "/api/library/status",
+            "/api/library/scan",
+            "/api/library/confirm",
             "/api/sc/account",
             "/api/sc/account/import",
             "/api/report",
             "/api/playlists",
             "/api/errors",
             "/api/errors/retry",
+            "/api/remote-actions",
             "/api/search",
             "/api/search/download",
             "/api/sc/sources",
@@ -602,6 +611,8 @@ console.log(JSON.stringify({
             "/api/jobs",
         ]:
             self.assertIn(route, combined)
+        self.assertNotIn("/api/login/deezer", combined)
+        self.assertNotIn("/api/login/soundcloud", combined)
         self.assertNotIn("/api/login/deezer/password", combined)
         self.assertNotIn("loginPassword", combined)
         self.assertNotIn("loginEmail", combined)

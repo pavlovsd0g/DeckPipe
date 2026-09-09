@@ -111,7 +111,7 @@ class PlaylistScanIsolationTests(unittest.TestCase):
             self.assertEqual("missing", result[0]["status"])
             self.assertEqual("missing", saved["tracks"]["4"]["status"])
 
-    def test_fuzzy_index_keeps_short_title_candidate_when_rarest_token_is_decoy(self) -> None:
+    def test_shortened_title_does_not_adopt_a_different_version(self) -> None:
         with tempfile.TemporaryDirectory(prefix="deckpipe-fuzzy-qa-") as temporary:
             playlist = Path(temporary) / "playlist"
             playlist.mkdir()
@@ -125,12 +125,12 @@ class PlaylistScanIsolationTests(unittest.TestCase):
                 [{"id": "fuzzy", "title": "Song (Radio Edit)", "artist": "Artist", "album": "", "duration": 180}],
             )
 
-            self.assertEqual("ok", result[0]["status"])
-            self.assertEqual(correct.name, result[0]["file"])
+            self.assertEqual("missing", result[0]["status"])
+            self.assertEqual("", result[0]["file"])
             counters = library.get_last_scan_counters()
             self.assertEqual(1, counters["enumerations"])
             self.assertEqual(3, counters["normalized_stems"])
-            self.assertLess(counters["candidate_checks"], 3)
+            self.assertEqual(0, counters["candidate_checks"])
 
     def test_provider_collision_scan_keeps_deezer_and_soundcloud_identities_separate(self) -> None:
         with tempfile.TemporaryDirectory(prefix="deckpipe-provider-collision-") as temporary:
@@ -270,6 +270,7 @@ class ErrorListingCoverageTests(unittest.TestCase):
             with (
                 patch.object(main, "_local_sources", return_value=[{"id": "fixture", "title": "Ready API"}]),
                 patch.object(library, "playlist_dir", return_value=playlist),
+                patch.object(main, "_require_music_root", return_value=playlist),
             ):
                 listed = main.api_local_playlists()
 

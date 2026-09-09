@@ -7,6 +7,7 @@ import os
 import threading
 import uuid
 from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
 
@@ -29,6 +30,7 @@ _FIELD_TO_RECORD = {
 }
 _ALLOWED_RECORDS = frozenset(_FIELD_TO_RECORD.values())
 _WRITE_LOCK = threading.RLock()
+_AUTH_TRANSACTION_LOCAL = threading.local()
 
 
 class SecureStoreError(RuntimeError):
@@ -234,6 +236,56 @@ class SecureCredentialStore:
         self._dpapi = dpapi if dpapi is not None else _default_dpapi()
         self._replace = replace
 
+    @property
+    def auth_journal_path(self):
+        return self.path.with_name(self.path.name + '.auth-rollback.json')
+
+    def _require_recovered(self):
+        if self.auth_journal_path.exists() and not getattr(_AUTH_TRANSACTION_LOCAL, 'active', False):
+            raise SecureStoreError('auth transaction recovery required')
+
+    def recover_auth_transaction(self, restore_metadata):
+        """Recover an interrupted commit before any credential can be consumed.
+
+        The journal contains the previous encrypted DPAPI envelope and public
+        account metadata only. All credential readers fail closed until recovery.
+        """
+        with _WRITE_LOCK:
+            if not self.auth_journal_path.exists():
+                return
+            journal = _read_json_file(self.auth_journal_path)
+            if not isinstance(journal, dict) or set(journal) != {'version', 'encrypted_store', 'metadata'} or journal['version'] != 1:
+                raise SecureStoreError('auth recovery journal is unreadable')
+            original = journal['encrypted_store']
+            if original is None:
+                self.path.unlink(missing_ok=True)
+            else:
+                _validate_file_payload(original)
+                _atomic_write_json(self.path, original, self._replace)
+            restore_metadata(journal['metadata'])
+            self.auth_journal_path.unlink()
+
+    @contextmanager
+    def auth_transaction(self, snapshot_metadata, restore_metadata):
+        with _WRITE_LOCK:
+            self.recover_auth_transaction(restore_metadata)
+            original = _read_json_file(self.path) if self.path.exists() else None
+            if original is not None:
+                _validate_file_payload(original)
+            journal = {'version': 1, 'encrypted_store': original, 'metadata': snapshot_metadata()}
+            _atomic_write_json(self.auth_journal_path, journal)
+            _AUTH_TRANSACTION_LOCAL.active = True
+            try:
+                yield
+                self.auth_journal_path.unlink()
+            except BaseException:
+                # If recovery itself fails, keep the durable journal and block
+                # all future credential reads/writes until a retry succeeds.
+                self.recover_auth_transaction(restore_metadata)
+                raise
+            finally:
+                _AUTH_TRANSACTION_LOCAL.active = False
+
     def _read_records(self) -> dict[str, str]:
         if not self.path.exists():
             return {}
@@ -282,6 +334,7 @@ class SecureCredentialStore:
             raise SecureStoreError("secure credential value must be a non-empty string")
         record = _record_name(field)
         with _WRITE_LOCK:
+            self._require_recovered()
             records = self._read_records()
             records[record] = value
             self._write_records(records)
@@ -289,11 +342,23 @@ class SecureCredentialStore:
     def get_secret(self, field: str) -> str | None:
         record = _record_name(field)
         with _WRITE_LOCK:
+            self._require_recovered()
             return self._read_records().get(record)
+
+    def delete_secret(self, field: str) -> None:
+        """Remove only the selected credential; retain unrelated provider records."""
+        record = _record_name(field)
+        with _WRITE_LOCK:
+            self._require_recovered()
+            records = self._read_records()
+            if record in records:
+                del records[record]
+                self._write_records(records)
 
     def has_secret(self, field: str) -> bool:
         record = _record_name(field)
         with _WRITE_LOCK:
+            self._require_recovered()
             return record in self._read_records()
 
     def set_deezer_arl(self, value: str) -> None:

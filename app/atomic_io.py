@@ -14,6 +14,7 @@ STAGING_MARKER = ".deckpipe-stage-"
 PARTIAL_MARKER = ".part"
 JsonValidator = Callable[[object], object]
 replace_file = os.replace
+move_new_file = os.rename
 
 _LOCKS_GUARD = threading.Lock()
 _LOCKS: dict[str, threading.RLock] = {}
@@ -169,13 +170,19 @@ def atomic_write_json(
             return
 
         previous = None
+        previous_source = None
         bak = backup_path(path)
         if path.exists():
             try:
                 previous = _read_json(path, validator)
+                previous_source = path
             except AtomicIOError:
                 if bak.exists():
                     previous = _read_json(bak, validator)
+                    previous_source = bak
+        elif bak.exists():
+            previous = _read_json(bak, validator)
+            previous_source = bak
 
         if previous is None:
             try:
@@ -187,14 +194,16 @@ def atomic_write_json(
                 raise AtomicIOError("atomic JSON write failed") from None
             return
 
-        _replace_json_payload(bak, previous, replace=replace)
+        if previous_source != bak:
+            _replace_json_payload(bak, previous, replace=replace)
         try:
             _replace_json_payload(path, candidate, replace=replace)
         except Exception:
-            try:
-                _replace_json_payload(path, previous, replace=replace)
-            except Exception:
-                pass
+            if previous_source == path:
+                try:
+                    _replace_json_payload(path, previous, replace=replace)
+                except Exception:
+                    pass
             raise AtomicIOError("atomic JSON write failed") from None
 
 
@@ -262,8 +271,10 @@ def publish_staged_file(stage_path: Path, final_path: Path) -> Path:
         raise AtomicIOError("invalid staged publication")
     with file_lock(final_path):
         try:
+            if final_path.exists():
+                raise FileExistsError(final_path)
             fsync_file(stage_path)
-            replace_file(stage_path, final_path)
+            move_new_file(stage_path, final_path)
             _fsync_parent(final_path)
         except Exception:
             raise AtomicIOError("staged publication failed") from None

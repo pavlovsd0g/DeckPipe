@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 import os
 import re
@@ -615,20 +616,43 @@ def _numbering_on() -> bool:
     return bool(load_config().get("numbering", True))
 
 
+def _publication_identity(track: dict) -> str:
+    provider = re.sub(r"[^A-Za-z0-9_-]+", "_", str(track.get("provider") or "deezer")).strip("_-")[:32] or "provider"
+    raw_id = str(track.get("id") or "track")
+    safe_id = re.sub(r"[^A-Za-z0-9_-]+", "_", raw_id).strip("_-")[:32] or "track"
+    digest = hashlib.sha256(f"{provider}\0{raw_id}".encode("utf-8")).hexdigest()[:8]
+    return f"{provider}-{safe_id}-{digest}"
+
+
+def _allocate_publication_path(desired: Path, track: dict | None = None) -> Path:
+    desired = Path(desired)
+    if not desired.exists():
+        return desired
+    identity = _publication_identity(track or {})
+    stem = desired.stem[: max(1, 170 - len(identity))].rstrip(" .") or "track"
+    candidate = desired.with_name(f"{stem} [{identity}]{desired.suffix}")
+    sequence = 2
+    while candidate.exists():
+        candidate = desired.with_name(f"{stem} [{identity}-{sequence}]{desired.suffix}")
+        sequence += 1
+    return candidate
+
+
 def _final_download_path(pl_dir: Path, t: dict, stage_path: Path, job: dict, counter: dict) -> tuple[Path, int | None]:
     final = final_path_from_stage(stage_path)
     if not _numbering_on():
-        return final, None
+        return _allocate_publication_path(final, t), None
     ext = final.suffix.lstrip(".")
     if job.get("mode") == "playlist_order" and t.get("position"):
         num = int(t["position"])
     else:
         counter["n"] += 1
         num = counter["base"] + counter["n"]
-    return Path(pl_dir) / numbered_name(num, counter["digits"], t.get("artist", ""), t["title"], ext), num
+    desired = Path(pl_dir) / numbered_name(num, counter["digits"], t.get("artist", ""), t["title"], ext)
+    return _allocate_publication_path(desired, t), num
 
 
-def _wav_step(fpath: Path, reference_duration: float):
+def _wav_step(fpath: Path, reference_duration: float, identity: dict | None = None):
     from .converter import convert_to_wav
 
     stage = None
@@ -638,7 +662,7 @@ def _wav_step(fpath: Path, reference_duration: float):
         if not v_ok:
             cleanup_owned_stages(stage)
             return None, _public_error("conversion")
-        final = publish_staged_file(stage, final_path_from_stage(stage))
+        final = publish_staged_file(stage, _allocate_publication_path(final_path_from_stage(stage), identity))
         return final, ""
     except Exception:
         cleanup_owned_stages(stage)
@@ -681,26 +705,49 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
 
     prev = load_sidecar(pl_dir).get("tracks", {}).get(track_key(tid, provider), {})
     if prev.get("status") == "verify_failed_convert":
-        src = Path(pl_dir) / prev.get("source_file", "")
-        if src.exists() and src.suffix.lower() != ".wav":
-            src_actual = prev.get("duration_actual") or expected
-            wav, werr = _wav_step(src, src_actual)
-            if wav:
-                if _wav_mode() == "wav_delete":
-                    _publish_wav_delete_state(
-                        pl_dir,
-                        tid,
-                        src,
-                        provider,
-                        {"file": wav.name, "format": "wav", "status": "ok", "error": "", "converted_at": _now()},
-                    )
-                else:
-                    _set_track(pl_dir, tid, file=wav.name, format="wav",
-                               status="ok", error="", converted_at=_now(),
-                               source_deleted=False, provider=provider)
-                return True, "", "wav"
-            _set_track(pl_dir, tid, status="verify_failed_convert", error=werr, provider=provider)
+        source_name = prev.get("source_file", "")
+        source_entry = {"status": "ok", "file": source_name}
+        src = Path(pl_dir) / source_name if isinstance(source_name, str) else Path(pl_dir)
+        if not is_ready_entry(pl_dir, source_entry) or src.suffix.lower() == ".wav":
+            werr = _public_error("conversion")
+            _set_track(
+                pl_dir,
+                tid,
+                source_file=source_name if isinstance(source_name, str) else "",
+                status="verify_failed_convert",
+                error=werr,
+                provider=provider,
+            )
             return False, werr, "wav"
+        src_actual = prev.get("duration_actual") or expected
+        wav, werr = _wav_step(src, src_actual, t)
+        if wav:
+            if _wav_mode() == "wav_delete":
+                _publish_wav_delete_state(
+                    pl_dir,
+                    tid,
+                    src,
+                    provider,
+                    {"file": wav.name, "format": "wav", "status": "ok", "error": "", "converted_at": _now()},
+                )
+            else:
+                _set_track(pl_dir, tid, file=wav.name, format="wav",
+                           status="ok", error="", converted_at=_now(),
+                           source_deleted=False, provider=provider)
+            return True, "", "wav"
+        _set_track(pl_dir, tid, status="verify_failed_convert", error=werr, provider=provider)
+        return False, werr, "wav"
+
+    from .catalog_service import existing_download, reconcile_reused_download, LibraryUnavailable
+
+    try:
+        existing = existing_download(t)
+    except LibraryUnavailable as exc:
+        return False, str(exc), ""
+    if existing:
+        # Cross-folder references belong to the catalog, never the local sidecar.
+        reconcile_reused_download(pl_dir, t)
+        return True, "", existing["locations"][0]["format"]
 
     ok, err, quality, actual = False, "", "", 0.0
     infos_duration = expected
@@ -776,7 +823,7 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
     if num:
         base_entry["position"] = num
     if _wav_mode() != "source" and src_format != "wav":
-        wav, werr = _wav_step(published, actual)
+        wav, werr = _wav_step(published, actual, t)
         if wav is None:
             _set_track(pl_dir, tid, **base_entry, file=published.name, format=src_format,
                        source_file=source_file_name, status="verify_failed_convert", error=werr)
@@ -811,6 +858,8 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
 
 def _worker(generation: int, stop_event: threading.Event):
     global _active_worker_item
+    from .catalog_service import validate_destination, LibraryUnavailable
+    from .library_catalog import MusicRootRequired
     while not stop_event.is_set():
         with _lock:
             if generation != _worker_generation:
@@ -830,6 +879,7 @@ def _worker(generation: int, stop_event: threading.Event):
                 tracks = pending_track_ids(job_id)
                 job_snapshot = copy.deepcopy(job)
             pl_dir = playlist_dir(job_snapshot["playlist_id"], job_snapshot["title"])
+            validate_destination(pl_dir, require_online=True)
             pl_dir.mkdir(parents=True, exist_ok=True)
             ds_holder = {"ds": None}
             pl_total = int(tracks[0].get("total") or len(tracks)) if tracks else len(tracks)
@@ -853,12 +903,12 @@ def _worker(generation: int, stop_event: threading.Event):
             }, _generation=generation)
         except _StaleWorker:
             return
-        except Exception:
+        except Exception as exc:
             try:
                 mark_terminal(
                     job_id,
                     outcome="failed",
-                    error={"code": "worker_fatal", "message": "Worker failed"},
+                    error={"code": exc.code, "message": str(exc)} if isinstance(exc, (MusicRootRequired, LibraryUnavailable)) else {"code": "worker_fatal", "message": "Worker failed"},
                     _generation=generation,
                 )
             except Exception:
@@ -986,7 +1036,11 @@ def _flip_worker(job_id: str, to_wav: bool, workers: int):
                     if not v_ok:
                         cleanup_owned_stages(stage)
                         return tid, None, _public_error("conversion")
-                    wav = stage if not is_partial_path(stage) else publish_staged_file(stage, final_path_from_stage(stage))
+                    identity = {"id": tid, "provider": e.get("provider", "deezer")}
+                    wav = stage if not is_partial_path(stage) else publish_staged_file(
+                        stage,
+                        _allocate_publication_path(final_path_from_stage(stage), identity),
+                    )
                     return tid, wav, ""
                 except Exception:
                     cleanup_owned_stages(stage)

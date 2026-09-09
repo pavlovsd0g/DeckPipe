@@ -539,6 +539,11 @@ class DurableJobJournalTests(unittest.TestCase):
         import app.jobs as jobs
 
         self.jobs = importlib.reload(jobs)
+        # These tests isolate durable worker/journal transitions. The actual
+        # common-root and unplugged-drive boundary is exercised in catalog workflow.
+        destination_guard = patch('app.catalog_service.validate_destination')
+        destination_guard.start()
+        self.addCleanup(destination_guard.stop)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -1329,7 +1334,7 @@ class DurableJobJournalTests(unittest.TestCase):
                     stage.write_bytes(b"source")
                     return stage, "FLAC", {"DURATION": "180", "SNG_TITLE": "Title 1", "ART_NAME": "Artist 1"}
 
-            def fake_wav_step(fpath: Path, _actual: float):
+            def fake_wav_step(fpath: Path, _actual: float, _identity: dict | None = None):
                 nonlocal conversion_done
                 self.assertEqual(source, fpath)
                 conversion_done = True

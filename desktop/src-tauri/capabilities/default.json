@@ -4,7 +4,7 @@
   "description": "DeckPipe default capabilities",
   "windows": ["main"],
   "permissions": [
-    "allow-service-login",
+    "allow-auth-broker",
     "allow-backend-connection"
   ]
 }

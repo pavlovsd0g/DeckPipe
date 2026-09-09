@@ -90,6 +90,12 @@ var searchTarget = null;
 var searchFilter = "all";
 var searchSel = {};
 var searchExpanded = {};
+var libraryConfigured = false;
+var libraryReady = false;
+var libraryPollGeneration = 0;
+var activeAuthRequest = null;
+var authPollTimer = null;
+var nativeAccounts = {};
 var $ = (s) => document.querySelector(s);
 var RB_APPLY_CONFIRMATION_TOKEN = "APPLY_REKORDBOX_CHANGES";
 var LOGIN_CANCELLED = "DECKPIPE_LOGIN_CANCELLED";
@@ -164,7 +170,8 @@ async function api(path, opts = {}) {
   }
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ detail: response.statusText }));
-    const detail = payload.detail || response.statusText || `HTTP ${response.status}`;
+    const rawDetail = payload.detail;
+    const detail = typeof rawDetail === "object" && rawDetail !== null ? rawDetail.message || rawDetail.code || `HTTP ${response.status}` : rawDetail || response.statusText || `HTTP ${response.status}`;
     throw Object.assign(new Error(detail), {
       kind: classifyApiFailure(path, response.status, detail),
       status: response.status,
@@ -301,7 +308,7 @@ function statusIcon(status) {
   if (status === "ok") {
     icon.classList.add("ok");
     icon.textContent = "✔";
-  } else if (status === "error") {
+  } else if (["error", "ambiguous", "offline"].includes(status)) {
     icon.classList.add("err");
     icon.textContent = "⚠";
   } else {
@@ -343,11 +350,17 @@ function openDialog(initialFocus) {
   target.focus();
 }
 function closeLogin() {
+  if (authPollTimer) clearTimeout(authPollTimer);
+  authPollTimer = null;
+  const requestId = activeAuthRequest;
+  activeAuthRequest = null;
+  if (requestId) invoke("auth_cancel", { requestId }).catch((error) => showError(error, "security"));
   setHidden($("#modalOverlay"), true);
   releaseDialogFocus();
 }
 async function loadConfig() {
   const config = await api("/api/config");
+  libraryConfigured = config.music_root_configured === true;
   $("#musicRoot").value = config.music_root || "";
   $("#wavMode").value = config.wav_mode || "source";
   $("#numbering").checked = !!config.numbering;
@@ -355,107 +368,105 @@ async function loadConfig() {
   setAuthActive($("#btnLoginDeezer"), !!(config.user && config.user.email));
   $("#btnLoginSc").textContent = config.sc_user ? `SC: ${config.sc_user}` : "SC: вход";
   setAuthActive($("#btnLoginSc"), !!config.sc_user);
+  if (isPackagedAppOrigin()) {
+    const state = await invoke("auth_status", { requestId: null });
+    nativeAccounts = state.accounts || {};
+    for (const [provider, selector] of [["deezer", "#btnLoginDeezer"], ["sc", "#btnLoginSc"]]) {
+      const account = nativeAccounts[provider];
+      if (!account) continue;
+      $(selector).textContent = account.connected ? `${provLabel(provider)}: ${account.account?.name || "подключён"}` : `${provLabel(provider)}: вход`;
+      setAuthActive($(selector), !!account.connected);
+    }
+  }
+  if (!libraryConfigured) {
+    libraryReady = false;
+    renderRootSetup();
+  }
+  return config;
 }
 async function openLogin(service) {
   loginService = service;
-  if (isPackagedAppOrigin()) {
-    await tauriLogin(service);
+  clearError();
+  if (!isPackagedAppOrigin()) {
+    showError(new Error("Вход через браузер доступен в приложении DeckPipe для Windows."), "security");
     return;
   }
-  clearError();
+  const state = await invoke("auth_status", { requestId: null });
+  nativeAccounts = state.accounts || {};
+  const account = nativeAccounts[service];
+  if (!account?.connected) return tauriLogin(service);
+  renderLoginDialog(service);
+  setResultState("ok");
+  $("#loginResult").textContent = `Подключён: ${account.account?.name || provLabel(service)}`;
+  setHidden($("#btnLogout"), false);
+}
+function renderLoginDialog(service) {
+  loginService = service;
+  $("#loginTitle").textContent = `Вход в ${provLabel(service)}`;
   $("#loginResult").textContent = "";
   setResultState(null);
-  $("#loginToken").value = "";
   setHidden($("#scImport"), true);
-  const steps = [];
-  if (service === "deezer") {
-    $("#loginTitle").textContent = "Вход в Deezer";
-    steps.push(
-      create("strong", { text: "Вручную:" }),
-      text(" F12 → Application → Cookies → "),
-      create("strong", { text: "arl" }),
-      text(" на deezer.com → вставить ниже")
-    );
-    $("#loginToken").placeholder = "arl cookie";
-  } else {
-    $("#loginTitle").textContent = "Вход в SoundCloud";
-    steps.push(
-      create("strong", { text: "Вручную:" }),
-      text(" F12 → Application → Cookies → "),
-      create("strong", { text: "oauth_token" }),
-      text(" на soundcloud.com → вставить ниже")
-    );
-    $("#loginToken").placeholder = "oauth_token cookie";
-  }
-  replaceChildren($("#loginSteps"), steps);
-  openDialog($("#loginToken"));
-  if (service === "sc" && $("#btnLoginSc").textContent.startsWith("SC: ") && $("#btnLoginSc").classList.contains("auth-active")) {
-    setResultState("ok");
-    $("#loginResult").textContent = "✔ уже выполнен вход — выберите, что импортировать";
-    await loadScAccount();
-  }
+  setHidden($("#btnLogout"), !nativeAccounts[service]?.connected);
+  replaceChildren($("#loginSteps"), [
+    create("p", { text: "Войдите на сайте сервиса в обычном браузере, затем нажмите «Подключить к DeckPipe» в браузерном помощнике." }),
+    create("p", { className: "dim", text: "При первом подключении установите помощник по инструкции. Пароль вводится только на сайте сервиса." })
+  ]);
+  openDialog($("#btnAuthStart"));
 }
 async function tauriLogin(service) {
   try {
-    const token = await invoke("service_login", { service });
-    const url = service === "deezer" ? "/api/login/deezer" : "/api/login/soundcloud";
-    const body = service === "deezer" ? { arl: token } : { oauth_token: token };
-    const result = await api(url, { body });
-    showStatus(`Вход выполнен: ${result.email || result.username}`);
-    await loadConfig();
-    if (service === "sc") switchTab("sc");
-    else await loadPlaylists();
+    if (activeAuthRequest) await invoke("auth_cancel", { requestId: activeAuthRequest });
+    if (authPollTimer) clearTimeout(authPollTimer);
+    activeAuthRequest = null;
+    renderLoginDialog(service);
+    const state = await invoke("auth_begin", { provider: service });
+    activeAuthRequest = state.requestId;
+    await renderAuthState(state);
   } catch (error) {
     if (!isLoginCancelled(error)) showError(error, "security");
   }
 }
-async function doLogin() {
-  const token = $("#loginToken").value.trim();
-  let url, body;
-  if (loginService === "deezer") {
-    if (!token) return;
-    url = "/api/login/deezer";
-    body = { arl: token };
-  } else {
-    if (!token) return;
-    url = "/api/login/soundcloud";
-    body = { oauth_token: token };
-  }
-  try {
-    const result = await api(url, { body });
+async function renderAuthState(state) {
+  if (state.status === "connected") {
+    activeAuthRequest = null;
     setResultState("ok");
-    $("#loginResult").textContent = loginService === "deezer" ? `✔ ${result.email}` : `✔ ${result.username}`;
+    $("#loginResult").textContent = `Подключён: ${state.account?.name || provLabel(state.provider)}`;
+    setHidden($("#btnLogout"), false);
+    showStatus($("#loginResult").textContent);
     await loadConfig();
-    if (loginService === "sc") await loadScAccount();
-    else {
-      closeLogin();
-      await loadPlaylists();
+    if (libraryConfigured) await loadPlaylists();
+    return;
+  }
+  if (!["waiting_browser", "waiting_helper", "validating"].includes(state.status)) {
+    activeAuthRequest = null;
+    setResultState("error");
+    $("#loginResult").textContent = { expired: "Время входа истекло. Откройте браузер снова.", cancelled: "Вход отменён.", failed: "Вход не завершён. Повторите подключение." }[state.status] || "Вход не завершён. Повторите подключение.";
+    return;
+  }
+  $("#loginResult").textContent = state.status === "validating" ? "Проверяем подключение…" : "Ожидаем подключение из браузера…";
+  const requestId = activeAuthRequest;
+  authPollTimer = setTimeout(async () => {
+    if (!requestId || requestId !== activeAuthRequest) return;
+    try {
+      const next = await invoke("auth_status", { requestId });
+      if (requestId === activeAuthRequest) await renderAuthState(next);
+    } catch (error) {
+      activeAuthRequest = null;
+      showError(error, "security");
     }
-  } catch (error) {
-    setResultState("error");
-    $("#loginResult").textContent = describeError(error, "security");
-    showError(error, "security");
-  }
+  }, 1e3);
 }
-async function loadScAccount() {
-  try {
-    const data = await api("/api/sc/account");
-    const items = [data.likes, ...data.playlists].filter(Boolean);
-    replaceChildren($("#scAccountList"), items.map((item) => create("label", { className: "scacc" }, [
-      create("input", {
-        type: "checkbox",
-        className: "scacc-cb",
-        dataset: { id: item.id, title: item.title, url: item.url, count: item.count || 0 }
-      }),
-      text(`${item.title} `),
-      create("span", { className: "dim", text: `(${item.count ?? "?"})` })
-    ])));
-    setHidden($("#scImport"), false);
-  } catch (error) {
-    setResultState("error");
-    $("#loginResult").textContent = describeError(error, "security");
-    showError(error, "security");
-  }
+async function logoutProvider() {
+  if (activeAuthRequest) await invoke("auth_cancel", { requestId: activeAuthRequest });
+  activeAuthRequest = null;
+  if (authPollTimer) clearTimeout(authPollTimer);
+  await invoke("auth_logout", { provider: loginService });
+  current = null;
+  tracks = [];
+  closeLogin();
+  await loadConfig();
+  showStatus(`Аккаунт ${provLabel(loginService)} отключён. Музыка сохранена на диске.`);
+  if (libraryConfigured) await loadPlaylists();
 }
 async function importScAccount() {
   const items = [...document.querySelectorAll(".scacc-cb:checked")].map((checkbox) => ({
@@ -490,9 +501,60 @@ async function sendReport() {
 }
 async function saveRoot() {
   await api("/api/config", { body: { music_root: $("#musicRoot").value } });
-  showStatus("Корень библиотеки сохранен");
+  await loadConfig();
+  current = null;
+  tracks = [];
+  setFlexVisible($("#toolbar"), false);
+  setEmpty("Общая папка подключена. Выберите плейлист слева.");
+  await scanLibrary();
   await loadPlaylists();
-  if (current) await loadTracks(current);
+}
+function renderRootSetup() {
+  setFlexVisible($("#toolbar"), false);
+  replaceChildren($("#playlists"), create("div", { className: "list-pad dim", text: "Сначала подключите музыкальную библиотеку." }));
+  replaceChildren($("#tracks"), create("section", { className: "root-setup" }, [
+    create("h2", { text: "Где хранится ваша музыка?" }),
+    create("p", { text: "Выберите общую папку со всей музыкой. DeckPipe найдёт треки во вложенных папках и покажет их в плейлистах и «Лайках» без повторной загрузки." }),
+    button("Выбрать общую папку…", "choose-root"),
+    create("p", { className: "dim", text: "Затем можно привязать к отдельному плейлисту свою папку, даже если их названия различаются." })
+  ]));
+}
+async function chooseRoot() {
+  const result = await api("/api/browse");
+  if (!result.path) return;
+  $("#musicRoot").value = result.path;
+  await saveRoot();
+}
+async function scanLibrary() {
+  if (!libraryConfigured) {
+    renderRootSetup();
+    return false;
+  }
+  const generation = ++libraryPollGeneration;
+  libraryReady = false;
+  let state = await api("/api/library/scan", { body: {} });
+  while (generation === libraryPollGeneration) {
+    $("#libraryState").textContent = state.state === "scanning" ? `Сканируем общую библиотеку… файлов: ${state.files || 0}` : `В каталоге: ${state.files || 0} файлов${state.error ? ` · ${state.error}` : ""}`;
+    if (state.state !== "scanning") {
+      libraryReady = state.state === "ready";
+      if (state.error) showError(new Error(state.error), "state");
+      return libraryReady;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    state = await api("/api/library/status");
+  }
+  return false;
+}
+function requireLibraryReady() {
+  if (!libraryConfigured) {
+    renderRootSetup();
+    return false;
+  }
+  if (!libraryReady) {
+    showError(new Error("Дождитесь сканирования общей папки или подключите недоступный носитель."), "state");
+    return false;
+  }
+  return true;
 }
 function playlistControl(title, cover, bodyChildren, action, dataset, active) {
   return create("button", {
@@ -504,6 +566,10 @@ function playlistControl(title, cover, bodyChildren, action, dataset, active) {
   }, [cover, create("span", { className: "pl-body" }, bodyChildren)]);
 }
 async function loadPlaylists() {
+  if (!libraryConfigured) {
+    renderRootSetup();
+    return;
+  }
   try {
     clearError();
     if (tab === "sc") return await loadScSources();
@@ -518,7 +584,7 @@ async function loadPlaylists() {
       return playlistControl(playlist.title, cover, [
         create("span", { className: "t", text: playlist.title }),
         create("span", { className: "c" }, [
-          text(`${playlist.ok || 0}/${playlist.count}`),
+          text(`${playlist.count} треков · в папке: ${playlist.ok || 0}`),
           playlist.errors ? create("span", { className: "badge-err", text: ` ⚠ ${playlist.errors}` }) : null
         ])
       ], "select-playlist", { id: playlist.id, title: playlist.title }, active);
@@ -529,15 +595,21 @@ async function loadPlaylists() {
   }
 }
 async function loadErrors() {
-  const errors = await api("/api/errors");
+  const [localResult, remoteResult] = await Promise.allSettled([api("/api/errors?include_status=true"), api("/api/remote-actions")]);
+  const localValue = localResult.status === "fulfilled" ? localResult.value : [];
+  const errors = Array.isArray(localValue) ? localValue : localValue.items || [];
+  const warnings = Array.isArray(localValue) ? [] : localValue.errors || [];
+  for (const warning of warnings) showError(new Error(warning.message), "state");
+  const remote = remoteResult.status === "fulfilled" ? remoteResult.value.filter((action) => action.state !== "succeeded") : [];
+  for (const result of [localResult, remoteResult]) if (result.status === "rejected") showError(result.reason, "state");
   window._errors = errors;
-  if (!errors.length) {
-    replaceChildren($("#playlists"), create("div", { id: "empty", text: "Ошибок нет" }));
+  if (!errors.length && !remote.length) {
+    replaceChildren($("#playlists"), create("div", { id: "empty", text: warnings.length || [localResult, remoteResult].some((r) => r.status === "rejected") ? "Список ошибок загружен не полностью" : "Ошибок нет" }));
     return;
   }
-  const children = [
+  const children = errors.length ? [
     create("div", { className: "list-pad" }, button(`Повторить все (${errors.length})`, "retry-all", { className: "full-width" }))
-  ];
+  ] : [];
   errors.forEach((errorItem, index) => {
     children.push(create("div", { className: "pl pl-static" }, [
       create("span", { className: "pl-fill" }, [
@@ -552,7 +624,23 @@ async function loadErrors() {
       })
     ]));
   });
+  remote.forEach((action) => children.push(create("div", { className: "pl pl-static" }, [
+    create("span", { className: "pl-fill" }, [
+      create("span", { className: "t", text: "Добавление в плейлист Deezer" }),
+      create("span", { className: "c", text: `Плейлист ${action.target_id} · ${action.track_ids.length} треков` }),
+      create("span", { className: "badge-err", text: action.last_error?.message || "Добавление ещё не завершено" })
+    ]),
+    button("Повторить", "retry-remote", { className: "ghost button-small", dataset: { id: action.id } })
+  ])));
   replaceChildren($("#playlists"), children);
+}
+async function retryRemote(id) {
+  try {
+    const result = await api(`/api/remote-actions/${encodeURIComponent(id)}/retry`, { body: {} });
+    if (result.state === "succeeded") showStatus("Плейлист Deezer обновлён. Повторная загрузка файлов не требовалась.");
+  } finally {
+    await loadErrors();
+  }
 }
 async function retryOne(index) {
   const errorItem = window._errors[index];
@@ -578,6 +666,10 @@ function switchTab(nextTab) {
   setFlexVisible($("#searchFilters"), nextTab === "search");
   current = null;
   setFlexVisible($("#toolbar"), false);
+  if (!libraryConfigured) {
+    renderRootSetup();
+    return;
+  }
   if (nextTab === "search") {
     setEmpty("Слева — цель (плейлист Deezer / источник SC / локальный плейлист / своя папка). Ищите треки, отмечайте чекбоксами или качайте по одному. Альбомы и сеты раскрываются по клику — внутри треки качаются поштучно или все сразу.");
     setSearchFilter(searchFilter);
@@ -588,11 +680,18 @@ function switchTab(nextTab) {
   loadPlaylists();
 }
 async function loadSearchTargets() {
-  const [deezerRows, scRows, localRows] = await Promise.all([
+  if (!libraryConfigured) {
+    renderRootSetup();
+    return;
+  }
+  const results = await Promise.allSettled([
     api("/api/playlists"),
     api("/api/sc/sources"),
     api("/api/local/playlists")
   ]);
+  const [deezerRows, scRows, localRows] = results.map((result) => result.status === "fulfilled" ? result.value : []);
+  const failures = results.filter((result) => result.status === "rejected");
+  if (failures.length) showError(new Error(failures.map((result) => result.reason.message).join("; ")));
   const rows = [
     ...deezerRows.map((item) => ({ key: item.id, title: item.title, provider: "deezer", count: item.count })),
     ...scRows.map((item) => ({ key: `sc:${item.id}`, title: item.title, provider: "sc", count: item.count })),
@@ -794,6 +893,10 @@ function renderSearch() {
   for (const [service, label] of [["deezer", "Deezer"], ["sc", "SoundCloud"]]) {
     const serviceData = data[service];
     if (!serviceData) continue;
+    if (serviceData.errors?.length) sections.push(create("div", {
+      className: "live-region error-region",
+      text: `${label}: ${serviceData.errors.map((error) => error.message || error.code).join("; ")}`
+    }));
     if ((searchFilter === "all" || searchFilter === "tracks") && serviceData.tracks.length) {
       sections.push(createSearchSection(`${label} — треки`, serviceData.tracks.map((track, index) => trackRow(service, index, track))));
     }
@@ -812,6 +915,7 @@ function renderSearch() {
   _renderBasket();
 }
 function _dlPayload(trackList) {
+  if (!requireLibraryReady()) return null;
   if (!searchTarget) {
     showError(new Error("Слева выберите цель (плейлист или папку)"), "state");
     return null;
@@ -825,37 +929,42 @@ async function dlSearchTrack(service, index) {
   const track = window._search[service].tracks[index];
   const body = _dlPayload([{ id: track.id, title: track.title, artist: track.artist, duration: track.duration, url: track.url, provider: service }]);
   if (!body) return;
-  await api("/api/search/download", { body });
-  showStatus("Трек поставлен в очередь");
-  startPolling();
+  showDownloadResult(await api("/api/search/download", { body }));
 }
 async function dlAlbumTrack(service, index, trackIndex) {
   const track = searchExpanded[`${service}:${index}`].tracks[trackIndex];
   const body = _dlPayload([{ id: track.id, title: track.title, artist: track.artist, duration: track.duration, url: track.url, provider: service }]);
   if (!body) return;
-  await api("/api/search/download", { body });
-  showStatus("Трек поставлен в очередь");
-  startPolling();
+  showDownloadResult(await api("/api/search/download", { body }));
 }
 async function dlWholeAlbum(service, index) {
   const album = window._search[service].albums[index];
   const albumTracks = searchExpanded[`${service}:${index}`].tracks;
   const body = _dlPayload(albumTracks.map((track) => ({ id: track.id, title: track.title, artist: track.artist, duration: track.duration, url: track.url, provider: service })));
   if (!body) return;
-  await api("/api/search/download", { body });
-  showStatus(`«${album.title}» поставлен в очередь (${albumTracks.length} треков)`);
-  startPolling();
+  showDownloadResult(await api("/api/search/download", { body }));
 }
 async function dlBasket() {
   const selected = Object.values(searchSel).map((track) => ({ id: track.id, title: track.title, artist: track.artist, duration: track.duration, url: track.url, provider: track.provider }));
   const body = _dlPayload(selected);
   if (!body) return;
-  await api("/api/search/download", { body });
-  showStatus(`Поставлено в очередь: ${selected.length} тр.`);
+  showDownloadResult(await api("/api/search/download", { body }));
   searchSel = {};
   _renderBasket();
   renderSearch();
-  startPolling();
+}
+function showDownloadResult(result) {
+  const parts = [result.job_id ? "Локальная загрузка поставлена в очередь." : "Новые файлы скачивать не требуется."];
+  if (result.already_present) parts.push(`Уже есть в библиотеке: ${result.already_present}.`);
+  if (result.needs_attention) parts.push(`Требуют выбора или проверки: ${result.needs_attention}.`);
+  const remote = result.remote_action;
+  if (remote?.state === "succeeded") parts.push("Плейлист Deezer обновлён.");
+  if (remote && remote.state !== "succeeded") {
+    parts.push("Добавление в Deezer не завершено. Повтор доступен во вкладке «Ошибки».");
+    showError(new Error(remote.last_error?.message || "Deezer: добавление ожидает повтора."), "state");
+  }
+  showStatus(parts.join(" "));
+  if (result.job_id) startPolling();
 }
 async function addDzTrack(index) {
   if (!searchTarget || searchTarget.provider !== "deezer") {
@@ -869,7 +978,8 @@ async function addDzTrack(index) {
 async function loadScSources() {
   try {
     await api("/api/sc/sync-account", { body: {} });
-  } catch {
+  } catch (error) {
+    showError(error, "security");
   }
   const sources = await api("/api/sc/sources");
   if (!sources.length) {
@@ -881,7 +991,7 @@ async function loadScSources() {
     return playlistControl(source.title, create("img", { attrs: { alt: "" } }), [
       create("span", { className: "t", text: source.title }),
       create("span", { className: "c" }, [
-        text(`${source.ok || 0}/${source.count ?? "?"}`),
+        text(`${source.count ?? "?"} треков · в папке: ${source.ok || 0}`),
         source.errors ? create("span", { className: "badge-err", text: ` ⚠ ${source.errors}` }) : null
       ])
     ], "select-sc-source", { id: source.id, title: source.title }, active);
@@ -910,6 +1020,10 @@ function selectPlaylist(id, title) {
   loadTracks(current);
 }
 async function loadTracks(playlist) {
+  if (!libraryConfigured) {
+    renderRootSetup();
+    return;
+  }
   setFlexVisible($("#toolbar"), true);
   $("#pltitle").textContent = playlist.title;
   setEmpty("Загрузка… (большие плейлисты — до ~20 сек)");
@@ -926,8 +1040,8 @@ async function loadTracks(playlist) {
 }
 function renderTracks() {
   const ok = tracks.filter((track) => track.status === "ok").length;
-  const err = tracks.filter((track) => track.status === "error").length;
-  const miss = tracks.length - ok - err;
+  const miss = tracks.filter((track) => track.status === "missing").length;
+  const err = tracks.length - ok - miss;
   $("#plstats").textContent = `✔ ${ok} · ✖ ${miss} · ⚠ ${err}`;
   const flipped = tracks.filter((track) => track.flipped).length;
   $("#flipBtn").textContent = flipped ? `⇄ FLAC (${flipped} в WAV)` : "⇄ WAV";
@@ -940,7 +1054,8 @@ function renderTracks() {
     create("th", { text: "Исполнитель" }),
     create("th", { text: "Альбом" }),
     create("th", { text: "⏱" }),
-    create("th", { text: "Формат" })
+    create("th", { text: "Формат" }),
+    create("th", { text: "Расположение файла" })
   ]));
   const tbody = create("tbody");
   tracks.forEach((track, index) => {
@@ -949,14 +1064,30 @@ function renderTracks() {
     if (badge) formatCell.append(badge);
     if (track.flipped) formatCell.append(create("span", { className: "fmt fmt-wav", text: "→wav" }));
     if (track.mp3_source) formatCell.append(create("span", { className: "fmt fmt-mp3src", text: "mp3", title: "mp3-источник: после конвертации в WAV кью могут сместиться на ~26 мс" }));
+    const locationCell = create("td", { className: "track-location" });
+    if (track.file_path) {
+      locationCell.append(create("span", { className: "location-label", text: track.location_scope === "library" ? "Есть в общей библиотеке" : "В папке плейлиста" }));
+      locationCell.append(create("span", { className: "file-path", text: track.file_path, title: track.file_path }));
+    } else if (track.status === "ambiguous" && track.locations?.length) {
+      locationCell.append(create("label", { className: "sr-only", attrs: { for: `location-${index}` }, text: `Файл для ${track.title}` }));
+      locationCell.append(create(
+        "select",
+        { id: `location-${index}`, attrs: { "aria-label": `Выберите файл для ${track.title}` } },
+        track.locations.map((location) => create("option", { value: location.path, text: location.path }))
+      ));
+      locationCell.append(button("Использовать этот файл", "confirm-location", { className: "ghost button-small", dataset: { index } }));
+    } else {
+      locationCell.append(create("span", { className: "dim", text: track.status === "offline" ? "Носитель недоступен" : "—" }));
+    }
     tbody.append(create("tr", {}, [
-      create("td", {}, create("input", { type: "checkbox", className: "trk", disabled: track.status === "ok", dataset: { i: index }, attrs: { "aria-label": `Выбрать ${track.title}` } })),
+      create("td", {}, create("input", { type: "checkbox", className: "trk", disabled: track.status !== "missing", dataset: { i: index }, attrs: { "aria-label": `Выбрать ${track.title}` } })),
       create("td", {}, statusIcon(track.status)),
       create("td", {}, [text(track.title), track.error ? create("div", { className: "errtext", text: track.error }) : null]),
       create("td", { text: track.artist }),
       create("td", { className: "dim", text: track.album }),
       create("td", { className: "dim", text: fmtDur(track.duration) }),
-      formatCell
+      formatCell,
+      locationCell
     ]));
   });
   table.append(thead, tbody);
@@ -970,62 +1101,84 @@ function toggleAll(value) {
 function selectedTracks(onlyMissing = false) {
   const indexes = [...document.querySelectorAll(".trk:checked")].map((checkbox) => Number(checkbox.dataset.i));
   let selected = indexes.map((index) => tracks[index]);
-  if (onlyMissing) selected = selected.filter((track) => track.status !== "ok");
-  return selected.map((track) => ({ id: track.id, title: track.title, artist: track.artist, duration: track.duration, url: track.url, total: tracks.length }));
+  if (onlyMissing) selected = selected.filter((track) => track.status === "missing");
+  return selected.map((track) => ({
+    id: track.id,
+    title: track.title,
+    artist: track.artist,
+    duration: track.duration,
+    url: track.url,
+    provider: track.provider || (current?.kind === "sc" ? "sc" : "deezer"),
+    total: tracks.length
+  }));
+}
+async function confirmLocation(index) {
+  const selected = $(`#location-${index}`).value;
+  if (!selected) return;
+  await api("/api/library/confirm", { body: { track: tracks[index], path: selected } });
+  if (current) await loadTracks(current);
 }
 function downloadUrl(mode) {
   const base = current.kind === "sc" ? `/api/sc/sources/${current.id}/download` : `/api/playlists/${current.id}/download?title=${encodeURIComponent(current.title)}`;
   return base + (base.includes("?") ? "&" : "?") + "mode=" + mode;
 }
 async function downloadSelected() {
+  if (!requireLibraryReady()) return;
   const selected = selectedTracks(true);
   if (!selected.length) {
     showError(new Error("Ничего не выбрано (уже скачанные пропускаются)"), "state");
     return;
   }
-  await api(downloadUrl("append"), { body: { tracks: selected } });
-  showStatus("Выбранные треки поставлены в очередь");
-  startPolling();
+  showDownloadResult(await api(downloadUrl("append"), { body: { tracks: selected } }));
 }
 async function syncPlaylistOrder() {
-  const order = tracks.map((track) => track.id);
+  if (!requireLibraryReady()) return;
+  const order = tracks.map((track) => (track.provider || current.kind) === "sc" ? `sc:${String(track.id).replace(/^sc:/, "")}` : track.id);
   const key = current.kind === "sc" ? `sc:${current.id}` : current.id;
   const renumber = await api(
     `/api/playlists/${key}/renumber?title=${encodeURIComponent(current.title)}`,
     { body: { order, total: tracks.length } }
   );
-  const missing = tracks.filter((track) => track.status !== "ok").map((track) => ({
+  const missing = tracks.filter((track) => track.status === "missing").map((track) => ({
     id: track.id,
     title: track.title,
     artist: track.artist,
     duration: track.duration,
     url: track.url,
+    provider: track.provider || (current.kind === "sc" ? "sc" : "deezer"),
     position: tracks.indexOf(track) + 1,
     total: tracks.length
   }));
   if (!missing.length) {
-    showStatus(`Порядок применён (переименовано: ${renumber.renamed}). Всё уже скачано.`);
-    rescan();
+    const unresolved = tracks.filter((track) => track.status !== "ok").length;
+    showStatus(`Порядок применён к файлам в папке плейлиста (переименовано: ${renumber.renamed}). ` + (unresolved ? `Требуют проверки: ${unresolved}.` : "Все треки найдены в библиотеке."));
+    await rescan();
     return;
   }
   if (!confirm(`Перенумеровано: ${renumber.renamed}. Скачать ${missing.length} треков?`)) {
     rescan();
     return;
   }
-  await api(downloadUrl("playlist_order"), { body: { tracks: missing } });
-  showStatus("Синк по порядку поставлен в очередь");
-  startPolling();
+  showDownloadResult(await api(downloadUrl("playlist_order"), { body: { tracks: missing } }));
 }
 async function syncAppend() {
-  const missing = tracks.filter((track) => track.status !== "ok").map((track) => ({ id: track.id, title: track.title, artist: track.artist, duration: track.duration, url: track.url, total: tracks.length }));
+  if (!requireLibraryReady()) return;
+  const missing = tracks.filter((track) => track.status === "missing").map((track) => ({
+    id: track.id,
+    title: track.title,
+    artist: track.artist,
+    duration: track.duration,
+    url: track.url,
+    provider: track.provider || (current.kind === "sc" ? "sc" : "deezer"),
+    total: tracks.length
+  }));
   if (!missing.length) {
-    showStatus("Всё уже скачано");
+    const unresolved = tracks.filter((track) => track.status !== "ok").length;
+    showStatus(unresolved ? `Требуют проверки: ${unresolved}. Выберите совпадения или откройте ошибки.` : "Все треки найдены в библиотеке.");
     return;
   }
   if (!confirm(`Скачать ${missing.length} треков (новые — вниз списка)?`)) return;
-  await api(downloadUrl("append"), { body: { tracks: missing } });
-  showStatus("Новые треки поставлены в очередь");
-  startPolling();
+  showDownloadResult(await api(downloadUrl("append"), { body: { tracks: missing } }));
 }
 async function rbSync() {
   const key = current.kind === "sc" ? `sc:${current.id}` : current.id;
@@ -1112,6 +1265,7 @@ async function bindPath() {
   await loadPlaylists();
 }
 async function rescan() {
+  await scanLibrary();
   if (!current) return;
   await loadTracks(current);
   await loadPlaylists();
@@ -1121,6 +1275,7 @@ function renderJobs(jobs) {
     create("strong", { text: job.title }),
     text(`: ${job.done}/${job.total}`),
     job.failed ? create("span", { className: "err", text: ` (ошибок: ${job.failed})` }) : null,
+    job.terminal_error ? create("span", { className: "err", text: ` — ${job.terminal_error.message}` }) : null,
     job.current ? create("span", { className: "dim", text: ` — ${job.current}` }) : null,
     create("progress", { className: "bar", attrs: { max: "100", value: progressValue(job.done, job.total) } })
   ])));
@@ -1153,6 +1308,9 @@ function clearBasket() {
 var clickActions = Object.freeze({
   "open-login": (el) => openLogin(el.dataset.service),
   "save-root": () => saveRoot(),
+  "choose-root": () => chooseRoot(),
+  "scan-library": () => rescan(),
+  "confirm-location": (el) => confirmLocation(Number(el.dataset.index)),
   "send-report": () => sendReport(),
   "switch-tab": (el) => switchTab(el.dataset.tab),
   "add-sc-source": () => addScSource(),
@@ -1169,12 +1327,15 @@ var clickActions = Object.freeze({
     if (event.target === el) closeLogin();
   },
   "close-login": () => closeLogin(),
-  "do-login": () => doLogin(),
+  "do-login": () => tauriLogin(loginService),
+  "auth-setup": () => invoke("auth_open_setup"),
+  "logout-provider": () => logoutProvider(),
   "import-sc-account": () => importScAccount(),
   "select-playlist": (el) => selectPlaylist(el.dataset.id, el.dataset.title),
   "select-sc-source": (el) => selectScSource(el.dataset.id, el.dataset.title),
   "retry-all": () => retryAll(),
   "retry-one": (el) => retryOne(Number(el.dataset.index)),
+  "retry-remote": (el) => retryRemote(el.dataset.id),
   "create-target-playlist": (el) => createTargetPlaylist(el.dataset.kind),
   "choose-custom-dir": () => chooseCustomDir(),
   "set-search-target": (el) => setSearchTarget(Number(el.dataset.index)),
@@ -1230,6 +1391,8 @@ $("#searchInput").addEventListener("keydown", (event) => {
 async function init() {
   try {
     await loadConfig();
+    if (!libraryConfigured) return;
+    await scanLibrary();
     await loadPlaylists();
   } catch (error) {
     showError(error, "local");

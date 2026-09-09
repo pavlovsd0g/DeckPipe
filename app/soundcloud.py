@@ -4,6 +4,7 @@
 import time
 from http.cookiejar import Cookie
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 import yt_dlp
@@ -11,12 +12,26 @@ import imageio_ffmpeg
 
 from .atomic_io import cleanup_owned_stages, is_partial_path, make_staged_path
 from .deezer_client import sanitize_filename, get_soundcloud_oauth
+from .provider_errors import (
+    detail_from_exception,
+    provider_collection_incomplete,
+    provider_exception,
+    provider_pagination_invalid,
+)
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 SC_API = "https://api-v2.soundcloud.com"
 
 _cache = {}  # url -> (ts, data)
 TTL = 600  # 10 мин: рейт-лимит SC делает повторные резолвы дорогими
+PROVIDER_PAGE_LIMIT = 1000
+
+
+class ProviderCollection(list):
+    def __init__(self, items=(), *, errors: list[dict] | None = None, account_id: str | None = None):
+        super().__init__(items)
+        self.errors = list(errors or [])
+        self.account_id = account_id
 
 
 # ---------- авторизация ----------
@@ -64,45 +79,32 @@ def _params(**kw) -> dict:
 
 def sc_validate(token: str) -> dict:
     """Проверяет oauth_token на /me (с ретраями при рейт-лимите)."""
-    try:
-        return _api_get("/me", token)
-    except Exception:
-        raise RuntimeError("SoundCloud token was not accepted")
+    return _api_get("/me", token)
 
 
 def sc_account_playlists(token: str) -> list:
     """Свои + лайкнутые плейлисты: [{id,title,url,count}].
-    Толерантно к 403/рейт-лимиту: возвращает то, что удалось получить."""
+    Частичная выдача возвращается вместе с безопасным списком errors."""
     me = sc_validate(token)
     uid = me["id"]
-    out = []
+    out, errors = [], []
     # свои плейлисты
     try:
-        url = f"{SC_API}/users/{uid}/playlists"
-        while url:
-            r = requests.get(url, headers=_headers(token),
-                             params=_params(limit=50, linked_partitioning=1) if SC_API in url else None,
-                             timeout=20)
-            r.raise_for_status()
-            d = r.json()
+        for d in _account_pages(f"{SC_API}/users/{uid}/playlists", token):
             for p in d.get("collection", []):
+                if not isinstance(p, dict) or p.get("id") is None:
+                    raise provider_collection_incomplete("soundcloud")
                 out.append({"id": str(p["id"]), "title": p.get("title") or "?",
                             "url": p.get("permalink_url"), "count": p.get("track_count", 0)})
-            url = d.get("next_href")
-    except Exception:
-        pass
+    except Exception as exc:
+        errors.append(detail_from_exception("soundcloud", exc))
     # лайкнутые плейлисты (библиотека)
     try:
-        url = f"{SC_API}/me/library/all"
         seen = {p["id"] for p in out}
-        while url:
-            r = requests.get(url, headers=_headers(token),
-                             params=_params(limit=50, linked_partitioning=1) if SC_API in url else None,
-                             timeout=20)
-            if r.status_code != 200:
-                break
-            d = r.json()
+        for d in _account_pages(f"{SC_API}/me/library/all", token):
             for it in d.get("collection", []):
+                if not isinstance(it, dict):
+                    raise provider_collection_incomplete("soundcloud")
                 if it.get("type") not in ("playlist-like", "playlist"):
                     continue
                 p = it.get("playlist") or it
@@ -111,10 +113,47 @@ def sc_account_playlists(token: str) -> list:
                     seen.add(pid)
                     out.append({"id": pid, "title": "♥ " + (p.get("title") or "?"),
                                 "url": p["permalink_url"], "count": p.get("track_count", 0)})
-            url = d.get("next_href")
+    except Exception as exc:
+        errors.append(detail_from_exception("soundcloud", exc))
+    return ProviderCollection(out, errors=errors, account_id=str(uid))
+
+
+def _trusted_sc_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        return (
+            parsed.scheme == "https"
+            and parsed.hostname == "api-v2.soundcloud.com"
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.port in (None, 443)
+        )
     except Exception:
-        pass
-    return out
+        return False
+
+
+def _account_pages(first_url: str, token: str):
+    url, params, seen = first_url, _params(limit=50, linked_partitioning=1), set()
+    for _page_number in range(PROVIDER_PAGE_LIMIT):
+        if not isinstance(url, str) or not _trusted_sc_url(url) or url in seen:
+            raise provider_pagination_invalid("soundcloud")
+        seen.add(url)
+        try:
+            r = requests.get(url, headers=_headers(token) if token else {}, params=params, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as exc:
+            raise provider_exception("soundcloud", exc) from None
+        if not isinstance(data, dict) or not isinstance(data.get("collection"), list):
+            raise provider_collection_incomplete("soundcloud")
+        yield data
+        next_url = data.get("next_href")
+        if not next_url:
+            return
+        if not isinstance(next_url, str) or not _trusted_sc_url(next_url):
+            raise provider_pagination_invalid("soundcloud")
+        url, params = next_url, None
+    raise provider_collection_incomplete("soundcloud")
 
 
 def _soundcloud_cookiejar(token: str):
@@ -191,43 +230,69 @@ def _api_get(path: str, token: str | None, **params) -> dict:
     h = _headers(token) if token else {}
     last = None
     for attempt in range(4):
-        r = requests.get(f"{SC_API}{path}", headers=h, params=_params(**params), timeout=30)
+        try:
+            r = requests.get(f"{SC_API}{path}", headers=h, params=_params(**params), timeout=30)
+        except Exception as exc:
+            raise provider_exception("soundcloud", exc) from None
         if r.status_code == 200:
-            return r.json()
+            try:
+                return r.json()
+            except Exception as exc:
+                raise provider_exception("soundcloud", exc) from None
         last = f"HTTP {r.status_code}"
         if r.status_code in (403, 429) and attempt < 3:
             time.sleep(5 * (attempt + 1) ** 2)  # рейт-лимит SC: 5с, 20с, 45с
             continue
-        r.raise_for_status()
-    raise RuntimeError(last or "ошибка API")
+        try:
+            r.raise_for_status()
+        except Exception as exc:
+            raise provider_exception("soundcloud", exc) from None
+    raise provider_exception("soundcloud", RuntimeError(last or "provider request failed"))
 
 
 def search(q: str) -> dict:
     """Поиск SoundCloud: треки/сеты/юзеры через api-v2."""
     token = sc_oauth_token()
-    out = {"tracks": [], "albums": [], "artists": []}
+    out = {"tracks": [], "albums": [], "artists": [], "errors": []}
     try:
         d = _api_get("/search/tracks", token, q=q, limit=10)
-        out["tracks"] = [_track_from_api(t) for t in d.get("collection", [])]
-    except Exception:
-        pass
+        collection, incomplete = _search_collection(d)
+        out["tracks"] = [_track_from_api(t) for t in collection]
+        if incomplete:
+            out["errors"].append(provider_collection_incomplete("soundcloud").detail)
+    except Exception as exc:
+        out["errors"].append(detail_from_exception("soundcloud", exc))
     try:
         d = _api_get("/search/albums", token, q=q, limit=5)
+        collection, incomplete = _search_collection(d)
         out["albums"] = [{"id": str(p.get("id")), "title": p.get("title") or "?",
                           "artist": (p.get("user") or {}).get("username", ""),
                           "url": p.get("permalink_url") or "",
                           "count": p.get("track_count", 0)}
-                         for p in d.get("collection", [])]
-    except Exception:
-        pass
+                         for p in collection]
+        if incomplete:
+            out["errors"].append(provider_collection_incomplete("soundcloud").detail)
+    except Exception as exc:
+        out["errors"].append(detail_from_exception("soundcloud", exc))
     try:
         d = _api_get("/search/users", token, q=q, limit=5)
+        collection, incomplete = _search_collection(d)
         out["artists"] = [{"id": str(u.get("id")), "name": u.get("username") or "?",
                            "url": u.get("permalink_url") or ""}
-                          for u in d.get("collection", [])]
-    except Exception:
-        pass
+                          for u in collection]
+        if incomplete:
+            out["errors"].append(provider_collection_incomplete("soundcloud").detail)
+    except Exception as exc:
+        out["errors"].append(detail_from_exception("soundcloud", exc))
     return out
+
+
+def _search_collection(data: object) -> tuple[list[dict], bool]:
+    if not isinstance(data, dict) or not isinstance(data.get("collection"), list):
+        raise provider_collection_incomplete("soundcloud")
+    raw = data["collection"]
+    valid = [item for item in raw if isinstance(item, dict) and item.get("id") is not None]
+    return valid, len(valid) != len(raw)
 
 
 def resolve(url: str, use_cache: bool = True) -> dict:
@@ -241,7 +306,8 @@ def resolve(url: str, use_cache: bool = True) -> dict:
         data = _resolve_likes(url)
     else:
         data = _resolve_api(url, token)
-    _cache[url] = (time.time(), data)
+    if not data.get("errors"):
+        _cache[url] = (time.time(), data)
     return data
 
 
@@ -250,24 +316,35 @@ def _resolve_api(url: str, token: str | None) -> dict:
     obj = _api_get("/resolve", token, url=url)
     kind = obj.get("kind")
     if kind == "playlist":
+        raw_tracks = obj.get("tracks")
+        if not isinstance(raw_tracks, list):
+            raise provider_collection_incomplete("soundcloud")
+        tracks, errors = [], []
+        for item in raw_tracks:
+            if not isinstance(item, dict) or item.get("id") is None:
+                errors.append(provider_collection_incomplete("soundcloud").detail)
+                continue
+            tracks.append(_track_from_api(item))
         return {"id": str(obj["id"]), "title": obj.get("title") or "playlist",
-                "tracks": [_track_from_api(t) for t in obj.get("tracks", []) if t.get("id")]}
+                "tracks": tracks, "errors": errors}
     if kind == "user":
-        tracks, next_url = [], f"/users/{obj['id']}/tracks"
-        params = _params(limit=200, linked_partitioning=1)
-        while next_url:
-            r = requests.get(next_url if next_url.startswith("http") else f"{SC_API}{next_url}",
-                             headers=_headers(token) if token else {},
-                             params=params if next_url.startswith("/") else None, timeout=30)
-            r.raise_for_status()
-            d = r.json()
-            tracks += [_track_from_api(t) for t in d.get("collection", [])]
-            next_url, params = d.get("next_href"), None
-        return {"id": str(obj["id"]), "title": obj.get("username") or "user", "tracks": tracks}
+        tracks, errors = [], []
+        first_url = f"{SC_API}/users/{obj['id']}/tracks"
+        try:
+            for data in _account_pages(first_url, token or ""):
+                for item in data["collection"]:
+                    if not isinstance(item, dict) or item.get("id") is None:
+                        errors.append(provider_collection_incomplete("soundcloud").detail)
+                        continue
+                    tracks.append(_track_from_api(item))
+        except Exception as exc:
+            errors.append(detail_from_exception("soundcloud", exc))
+        return {"id": str(obj["id"]), "title": obj.get("username") or "user",
+                "tracks": tracks, "errors": errors}
     if kind == "track":
         return {"id": str(obj["id"]), "title": obj.get("title") or "track",
-                "tracks": [_track_from_api(obj)]}
-    raise RuntimeError(f"неизвестный тип ресурса: {kind}")
+                "tracks": [_track_from_api(obj)], "errors": []}
+    raise provider_collection_incomplete("soundcloud")
 
 
 def _resolve_likes(url: str) -> dict:
@@ -285,9 +362,10 @@ def _resolve_likes(url: str) -> dict:
         info = y.extract_info(url, download=False)
     if not info:
         raise RuntimeError("yt-dlp не смог прочитать лайки")
-    tracks = []
+    tracks, errors = [], []
     for e in (info.get("entries") or []):
-        if not e:
+        if not isinstance(e, dict) or e.get("id") is None:
+            errors.append(provider_collection_incomplete("soundcloud").detail)
             continue
         tracks.append({
             "id": str(e.get("id")),
@@ -314,10 +392,11 @@ def _resolve_likes(url: str) -> dict:
                 if full:
                     t["artist"] = (full.get("user") or {}).get("username", t["artist"])
                     t["duration"] = int((full.get("duration") or 0) / 1000)
-        except Exception:
-            pass
+        except Exception as exc:
+            errors.append(detail_from_exception("soundcloud", exc))
         time.sleep(0.4)  # пейсинг против рейт-лимита
-    return {"id": "likes", "title": info.get("title") or "❤ Лайки", "tracks": tracks}
+    return {"id": "likes", "title": info.get("title") or "❤ Лайки",
+            "tracks": tracks, "errors": errors}
 
 
 def download_track(track: dict, out_dir: Path):

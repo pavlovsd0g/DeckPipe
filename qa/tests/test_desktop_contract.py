@@ -107,13 +107,14 @@ class DesktopContractTests(unittest.TestCase):
         self.assertEqual(["main"], capability["windows"])
         self.assertNotIn("remote", capability)
         self.assertEqual(
-            ["allow-service-login", "allow-backend-connection"],
+            ["allow-auth-broker", "allow-backend-connection"],
             capability["permissions"],
         )
 
-        login_permission = read_text(TAURI / "permissions" / "service-login.toml")
+        login_permission = read_text(TAURI / "permissions" / "auth-broker.toml")
         backend_permission = read_text(TAURI / "permissions" / "backend-connection.toml")
-        self.assertIn('commands = { allow = ["service_login"] }', login_permission)
+        self.assertIn('"auth_begin", "auth_status", "auth_cancel", "auth_logout", "auth_open_setup"', login_permission)
+        self.assertNotIn('service_login', login_permission)
         self.assertIn('commands = { allow = ["backend_connection"] }', backend_permission)
 
     def test_rust_main_owns_memory_only_connection_and_sidecar_lifecycle(self) -> None:
@@ -149,13 +150,15 @@ class DesktopContractTests(unittest.TestCase):
         self.assertIn("tauri_plugin_single_instance::init", rust)
         self.assertNotRegex(rust, r"println!\([^)]*token|eprintln!\([^)]*token", "token must not be logged")
 
-    def test_login_window_cancel_uses_stable_sentinel_not_localized_error_text(self) -> None:
+    def test_browser_auth_does_not_return_cookie_or_build_embedded_login_window(self) -> None:
         rust = read_text(TAURI / "src" / "main.rs")
 
-        self.assertIn("LOGIN_CANCELLED", rust)
-        self.assertIn("DECKPIPE_LOGIN_CANCELLED", rust)
-        self.assertNotIn("login window closed", rust)
-        self.assertRegex(rust, r"None\s*=>\s*return\s+Err\(LOGIN_CANCELLED\.into\(\)\)")
+        self.assertNotIn('w.cookies()', rust)
+        self.assertNotIn('WebviewUrl::External', rust)
+        self.assertNotIn('service_login', rust)
+        self.assertIn('auth_cancel', rust)
+        self.assertIn('DECKPIPE_AUTH_BROKER_TOKEN', rust)
+        self.assertIn('PublicStatus', rust)
 
     def test_backend_uses_single_prebound_listener_and_same_socket_for_uvicorn(self) -> None:
         run_backend = importlib.import_module("run_backend")

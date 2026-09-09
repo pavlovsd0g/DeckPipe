@@ -20,6 +20,13 @@ dependencies = [
   "yt-dlp==2026.7.4",
 ]
 
+[tool.setuptools]
+packages = ["app"]
+py-modules = ["run_backend"]
+
+[tool.setuptools.package-data]
+app = ["static/*.html", "static/*.js", "static/*.css"]
+
 [tool.deckpipe.release]
 version_file = "release/version.json"
 runtime_lock = "requirements.lock"

@@ -1,10 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use deckpipe::{
+    auth_broker::{provider_url, PublicStatus},
+    auth_runtime::AuthRuntime,
+};
 use rand::{rngs::OsRng, RngCore};
 use serde::Serialize;
 use std::{
     env,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tauri::{
@@ -16,7 +20,6 @@ use tauri_plugin_shell::ShellExt;
 use tokio::time::timeout;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
-const LOGIN_CANCELLED: &str = "DECKPIPE_LOGIN_CANCELLED";
 const CHILD_ENV_ALLOWLIST: &[&str] = &[
     "APPDATA",
     "LOCALAPPDATA",
@@ -62,43 +65,75 @@ async fn backend_connection(
 }
 
 #[tauri::command]
-async fn service_login(app: tauri::AppHandle, service: String) -> Result<String, String> {
-    let (url, cookie_name, title) = match service.as_str() {
-        "deezer" => ("https://www.deezer.com/login", "arl", "Deezer"),
-        "sc" => ("https://soundcloud.com/sign-in", "oauth_token", "SoundCloud"),
-        _ => return Err("unknown service".into()),
-    };
-    let label = format!("login-{service}");
-    let win = WebviewWindowBuilder::new(
-        &app,
-        label.clone(),
-        WebviewUrl::External(url.parse().map_err(|e| format!("{e}"))?),
-    )
-    .title(format!("DeckPipe login: {title}"))
-    .inner_size(500.0, 780.0)
-    .build()
-    .map_err(|_| "login window unavailable".to_string())?;
-
-    for _ in 0..300 {
-        match app.get_webview_window(&label) {
-            None => return Err(LOGIN_CANCELLED.into()),
-            Some(w) => {
-                if let Ok(cookies) = w.cookies() {
-                    if let Some(c) = cookies
-                        .iter()
-                        .find(|c| c.name() == cookie_name && !c.value().is_empty())
-                    {
-                        let value = c.value().to_string();
-                        let _ = w.close();
-                        return Ok(value);
-                    }
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+async fn auth_begin(
+    app: tauri::AppHandle,
+    window: WebviewWindow,
+    auth: State<'_, AuthRuntime>,
+    provider: String,
+) -> Result<PublicStatus, String> {
+    require_main(&window)?;
+    let url = provider_url(&provider).map_err(str::to_owned)?;
+    let status = auth.begin(&provider).await.map_err(str::to_owned)?;
+    #[allow(deprecated)]
+    if app.shell().open(url, None).is_err() {
+        auth.fail(&status.request_id, "AUTH_BROWSER_UNAVAILABLE")
+            .await;
+        return Err("AUTH_BROWSER_UNAVAILABLE".into());
     }
-    let _ = win.close();
-    Err("login timed out".into())
+    Ok(status)
+}
+
+fn require_main(window: &WebviewWindow) -> Result<(), String> {
+    if window.label() == "main" {
+        Ok(())
+    } else {
+        Err("AUTH_FORBIDDEN".into())
+    }
+}
+#[tauri::command]
+async fn auth_status(
+    window: WebviewWindow,
+    auth: State<'_, AuthRuntime>,
+    request_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    require_main(&window)?;
+    auth.public_status(request_id.as_deref())
+        .await
+        .map_err(str::to_owned)
+}
+#[tauri::command]
+async fn auth_cancel(
+    window: WebviewWindow,
+    auth: State<'_, AuthRuntime>,
+    request_id: String,
+) -> Result<PublicStatus, String> {
+    require_main(&window)?;
+    auth.cancel(&request_id).await.map_err(str::to_owned)
+}
+#[tauri::command]
+async fn auth_logout(
+    window: WebviewWindow,
+    auth: State<'_, AuthRuntime>,
+    provider: String,
+) -> Result<PublicStatus, String> {
+    require_main(&window)?;
+    auth.logout(&provider).await.map_err(str::to_owned)
+}
+#[tauri::command]
+fn auth_open_setup(app: tauri::AppHandle, window: WebviewWindow) -> Result<(), String> {
+    require_main(&window)?;
+    let resources = app
+        .path()
+        .resource_dir()
+        .map_err(|_| "AUTH_SETUP_UNAVAILABLE".to_string())?;
+    let folder = resources.join("auth-helper");
+    if !folder.join("README.md").is_file() {
+        return Err("AUTH_SETUP_UNAVAILABLE".into());
+    }
+    #[allow(deprecated)]
+    app.shell()
+        .open(folder.to_string_lossy().to_string(), None)
+        .map_err(|_| "AUTH_SETUP_UNAVAILABLE".into())
 }
 
 fn retain_sidecar_child(state: &ManagedSidecar, child: CommandChild) -> Result<(), String> {
@@ -148,7 +183,9 @@ fn parse_port_line(text: &str) -> Result<Option<u16>, String> {
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err("backend startup failed".into());
     }
-    let port: u16 = value.parse().map_err(|_| "backend startup failed".to_string())?;
+    let port: u16 = value
+        .parse()
+        .map_err(|_| "backend startup failed".to_string())?;
     if port == 0 {
         return Err("backend startup failed".into());
     }
@@ -185,25 +222,34 @@ fn generate_launch_token() -> String {
     hex::encode(token_bytes)
 }
 
-fn sidecar_environment(token: &str) -> Vec<(String, String)> {
+fn sidecar_environment(token: &str, broker_token: &str) -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = CHILD_ENV_ALLOWLIST
         .iter()
-        .filter_map(|name| env::var(name).ok().map(|value| ((*name).to_string(), value)))
+        .filter_map(|name| {
+            env::var(name)
+                .ok()
+                .map(|value| ((*name).to_string(), value))
+        })
         .collect();
     pairs.push(("DECKPIPE_API_TOKEN".into(), token.to_string()));
+    pairs.push((
+        "DECKPIPE_AUTH_BROKER_TOKEN".into(),
+        broker_token.to_string(),
+    ));
     pairs.push(("DECKPIPE_PARENT_PID".into(), std::process::id().to_string()));
     pairs
 }
 
-fn start_backend(app: &tauri::App) -> Result<BackendConnection, String> {
+fn start_backend(app: &tauri::App) -> Result<(BackendConnection, String), String> {
     let token = generate_launch_token();
+    let broker_token = generate_launch_token();
     let sidecar = app.state::<ManagedSidecar>();
     let shell = app.shell();
     let (mut rx, child) = shell
         .sidecar("deckpipe-backend")
         .map_err(|_| "backend startup failed".to_string())?
         .env_clear()
-        .envs(sidecar_environment(&token))
+        .envs(sidecar_environment(&token, &broker_token))
         .args(["--host", "127.0.0.1", "--port", "0"])
         .spawn()
         .map_err(|_| "backend startup failed".to_string())?;
@@ -232,10 +278,13 @@ fn start_backend(app: &tauri::App) -> Result<BackendConnection, String> {
         }
     });
 
-    Ok(BackendConnection {
-        base_url: format!("http://127.0.0.1:{port}"),
-        token,
-    })
+    Ok((
+        BackendConnection {
+            base_url: format!("http://127.0.0.1:{port}"),
+            token,
+        },
+        broker_token,
+    ))
 }
 
 fn build_main_window(app: &tauri::App) -> Result<(), String> {
@@ -261,11 +310,35 @@ fn main() {
         }))
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
-            service_login,
+            auth_begin,
+            auth_status,
+            auth_cancel,
+            auth_logout,
+            auth_open_setup,
             backend_connection
         ])
         .setup(|app| {
-            let connection = start_backend(app)?;
+            let (connection, broker_token) = start_backend(app)?;
+            let auth = AuthRuntime::new(
+                connection.base_url.clone(),
+                connection.token.clone(),
+                broker_token,
+            )?;
+            app.manage(auth.clone());
+            let handle = app.handle().clone();
+            let focus = Arc::new(move || {
+                if let Some(window) = handle.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            });
+            tauri::async_runtime::spawn(async move {
+                let failure = auth.clone();
+                if auth.serve(focus).await.is_err() {
+                    failure.bridge_failed();
+                }
+            });
             let connection_state = app.state::<BackendConnectionState>();
             if let Err(error) = store_backend_connection(&connection_state, connection) {
                 let sidecar = app.state::<ManagedSidecar>();

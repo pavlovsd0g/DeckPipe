@@ -1,48 +1,39 @@
-# Сборка DeckPipe
+# Сборка и проверка DeckPipe на Windows
 
-## Dev (веб-версия)
+Поддерживаемая цель — Windows x64, CPython 3.12, Rust/Tauri и Node.js. Используйте VS Build Tools с компонентами C++. Версии Python-пакетов и хеши зафиксированы в `requirements.lock` и `requirements-build.lock`, зависимости JS — в двух `package-lock.json`.
 
-```bash
-python -m venv .venv
-.venv/Scripts/pip install fastapi "uvicorn[standard]" requests pycryptodome mutagen \
-  imageio-ffmpeg deezer-python-gql yt-dlp pyrekordbox pillow
-npm run dev    # http://localhost:7100
+## Проверки исходников
+
+В отдельном профиле приложения, без пользовательской музыки и авторизации:
+
+```powershell
+$env:DECKPIPE_DATA_DIR = 'D:\DeckPipe-RC-Lab\qa-evidence\developer-profile'
+$env:DECKPIPE_API_TOKEN = 'synthetic-test-only'
+$env:DECKPIPE_BOUND_PORT = '7100'
+$env:PYTHONDONTWRITEBYTECODE = '1'
+node frontend/build.mjs
+& 'D:\DeckPipe-RC-Lab\tool-cache\offline-proof\Scripts\python.exe' -m unittest discover -s qa/tests -p 'test_*.py'
+node --test qa/tests/auth_helper.test.cjs
 ```
 
-## Десктоп (Windows): Tauri + Python sidecar
+Один тест сравнивает сгенерированные ресурсы с **HEAD** и `git archive HEAD`. После изменения frontend сначала соберите и закоммитьте `app/static` и `desktop/ui`; отличие незакоммиченных ресурсов от HEAD должно выявляться, а не скрываться.
 
-Требования: Rust (rustup), VS Build Tools (C++ workload), Node.
+PowerShell-проверки: `qa/tests/DeckPipe.QA.Tests.ps1`, `DeckPipe.Release.Tests.ps1`, `DeckPipe.Orchestrator.Tests.ps1`. Нативные проверки: `cargo test --offline --manifest-path desktop/src-tauri/Cargo.toml`. Новому checkout перед обычной сборкой Tauri нужен второй sidecar: `release/auth-helper/Build-AuthHelper.ps1` собирает нативный помощник браузера. Сначала также подготовьте backend EXE через release pipeline.
 
-```bash
-# 1. бэкенд -> onefile exe
-.venv/Scripts/python -m PyInstaller --noconfirm --onefile --name deckpipe-backend \
-  --collect-all yt_dlp --collect-all deezer_python_gql --collect-all imageio_ffmpeg \
-  --collect-all uvicorn --collect-all sqlcipher3 \
-  --add-data "app/static;app/static" \
-  --hidden-import pyrekordbox --hidden-import mutagen --hidden-import Crypto \
-  --hidden-import app.main --hidden-import app.jobs --hidden-import app.library \
-  --hidden-import app.deezer_client --hidden-import app.soundcloud --hidden-import app.tagger \
-  --hidden-import app.converter --hidden-import app.bugreport --hidden-import app.rekordbox \
-  --hidden-import uvicorn.loops.auto --hidden-import uvicorn.protocols.http.auto \
-  --hidden-import uvicorn.protocols.websockets.auto --hidden-import uvicorn.lifespan.on \
-  run_backend.py
-cp dist/deckpipe-backend.exe desktop/src-tauri/binaries/deckpipe-backend-x86_64-pc-windows-msvc.exe
+## Воспроизводимая сборка кандидата
 
-# 2. Tauri
-cd desktop
-npm install
-set CARGO_TARGET_DIR=D:\cargo-target\deckpipe   # без пробелов в пути!
-npm run build
-# готовое: %CARGO_TARGET_DIR%\release\bundle\nsis\DeckPipe_*_x64-setup.exe (+ MSI)
+Полный процесс: [release/README.md](release/README.md). Сборщик экспортирует закоммиченный HEAD в отдельную папку лаборатории, устанавливает зависимости из проверенного wheelhouse, собирает backend, помощник входа, интерфейс и установщики. Перед запуском должен быть закоммичен весь проверяемый исходный код.
+
+```powershell
+& ./release/build.ps1 `
+  -StagingDirectory 'D:\DeckPipe-RC-Lab\staging\NEW-UNIQUE-CANDIDATE' `
+  -PythonExe 'D:\DeckPipe-RC-Lab\tool-cache\offline-proof\Scripts\python.exe' `
+  -WheelhouseDirectory 'D:\DeckPipe-RC-Lab\wheelhouse' `
+  -UnsignedEngineeringCandidate
 ```
 
-## macOS (когда понадобится)
+Инженерный кандидат без подписи не является разрешением на распространение. Проверка должна показывать незакрытые условия подписи. Старый кандидат и его pin/evidence нельзя заменять результатом другой сборки. Для авторизованного private-beta применяется отдельный `-PrivateBetaCandidate` и существующая политика; публичный выпуск требует подписи и timestamp.
 
-Тот же пайплайн: PyInstaller `--onefile` на mac (tarball universal2 при желании),
-имя sidecar — `deckpipe-backend-aarch64-apple-darwin`, `npm run build` соберёт `.app`/DMG.
-Для распространения нужна нотаризация (Apple Developer, $99/год).
+## Приёмка настоящей установки
 
-## Конфиг
-
-- dev: `config.local.json` в корне проекта
-- сборка: `%APPDATA%\DeckPipe\config.local.json` (Windows) / `~/Library/Application Support/DeckPipe` (mac)
+Подпись Mozilla XPI, регистрация нативного помощника пользователем, установка расширения и его разрешения, вход в реальные Deezer/SoundCloud, сохранение авторизации после перезапуска, загрузка и повторная синхронизация. Затем — установка/обновление/удаление приложения на чистой Windows и отдельная приёмка Rekordbox. Автоматические тесты используют синтетические данные и не закрывают эти сценарии.
