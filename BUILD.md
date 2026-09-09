@@ -20,6 +20,8 @@ node --test qa/tests/auth_helper.test.cjs
 
 PowerShell-проверки: `qa/tests/DeckPipe.QA.Tests.ps1`, `DeckPipe.Release.Tests.ps1`, `DeckPipe.Orchestrator.Tests.ps1`. Нативные проверки: `cargo test --offline --manifest-path desktop/src-tauri/Cargo.toml`. Новому checkout перед обычной сборкой Tauri нужен второй sidecar: `release/auth-helper/Build-AuthHelper.ps1` собирает нативный помощник браузера. Сначала также подготовьте backend EXE через release pipeline.
 
+Для проверки **собранного EXE** изоляция отличается: frozen backend намеренно игнорирует `DECKPIPE_DATA_DIR`. Перед его запуском задайте дочернему процессу отдельные `APPDATA` и `LOCALAPPDATA` внутри новой папки лаборатории; профиль будет создан в `APPDATA/DeckPipe`. Не переносите туда рабочую конфигурацию или авторизацию. Тест исходников с `DECKPIPE_DATA_DIR` не доказывает изоляцию собранного приложения.
+
 ## Воспроизводимая сборка кандидата
 
 Полный процесс: [release/README.md](release/README.md). Сборщик экспортирует закоммиченный HEAD в отдельную папку лаборатории, устанавливает зависимости из проверенного wheelhouse, собирает backend, помощник входа, интерфейс и установщики. Перед запуском должен быть закоммичен весь проверяемый исходный код.

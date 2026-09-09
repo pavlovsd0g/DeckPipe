@@ -24,6 +24,7 @@ from .atomic_io import is_partial_path
 AUDIO_EXTENSIONS = {'.flac', '.mp3', '.wav', '.aiff', '.aif', '.m4a', '.aac', '.opus', '.ogg'}
 _LOCK_GUARD = threading.Lock()
 _SCAN_LOCKS: dict[str, threading.RLock] = {}
+_SCHEMA_LOCKS: dict[str, threading.RLock] = {}
 
 
 class MusicRootRequired(ValueError):
@@ -113,7 +114,11 @@ class MusicCatalog:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with _LOCK_GUARD:
             self.scan_lock = _SCAN_LOCKS.setdefault(_path_key(self.path), threading.RLock())
-        with self._connection() as db:
+            schema_lock = _SCHEMA_LOCKS.setdefault(_path_key(self.path), threading.RLock())
+        # Two first-run readers must not race while switching the new database
+        # into WAL. Keep schema setup separate from the long-running scan lock
+        # so status readers can still observe the previous committed snapshot.
+        with schema_lock, self._connection() as db:
             db.execute('PRAGMA journal_mode=WAL')
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS roots (
