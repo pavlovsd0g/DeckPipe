@@ -154,6 +154,20 @@ await opening;
 if(!$('#modalOverlay').classList.contains('hidden')) throw new Error('late account status reopened a closed dialog');
 ''')
 
+    def test_late_open_login_status_rejection_is_ignored_after_close(self):
+        self.run_probe(r'''
+let rejectStatus;
+const pendingStatus=new Promise((resolve,reject)=>{rejectStatus=reject;});
+globalThis.__invokeImpl=async(name,body)=>name==='auth_status'&&body.requestId===null ? pendingStatus : {};
+clearError();
+const opening=openLogin('deezer');
+closeLogin();
+rejectStatus(new Error('stale status rejected'));
+await opening;
+if(!$('#modalOverlay').classList.contains('hidden')) throw new Error('late status rejection reopened the dialog');
+if($('#errorRegion').textContent) throw new Error('late status rejection surfaced after dialog close');
+''')
+
     def test_late_open_login_status_cannot_replace_a_new_provider_dialog(self):
         self.run_probe(r'''
 let resolveStatus;
@@ -186,6 +200,41 @@ resolveBegin({requestId:'late-close',provider:'deezer',status:'connected',accoun
 await starting;
 if($('#loginResult').textContent.includes('Late Deezer')) throw new Error('late begin response rendered a closed dialog as connected');
 if(!$('#modalOverlay').classList.contains('hidden')) throw new Error('late begin response reopened the dialog');
+''')
+
+    def test_late_begin_rejection_cannot_override_replacement_attempt(self):
+        self.run_probe(r'''
+let rejectOld;
+const pendingOld=new Promise((resolve,reject)=>{rejectOld=reject;});
+globalThis.setTimeout=()=>1;
+globalThis.__invokeImpl=async(name,body)=>{
+  if(name==='auth_begin'&&body.provider==='deezer') return pendingOld;
+  if(name==='auth_begin') return {requestId:'sc-new',provider:'sc',status:'waiting_browser'};
+  return {};
+};
+clearError();
+const oldLogin=tauriLogin('deezer');
+await Promise.resolve();
+await tauriLogin('sc');
+rejectOld(new Error('stale begin rejected'));
+await oldLogin;
+if(activeAuthRequest!=='sc-new') throw new Error('late rejection replaced the active request');
+if($('#errorRegion').textContent) throw new Error('late rejection was rendered over the replacement attempt');
+''')
+
+    def test_late_begin_rejection_cannot_surface_after_dialog_close(self):
+        self.run_probe(r'''
+let rejectBegin;
+const pendingBegin=new Promise((resolve,reject)=>{rejectBegin=reject;});
+globalThis.__invokeImpl=async(name)=>name==='auth_begin' ? pendingBegin : {};
+clearError();
+const starting=tauriLogin('deezer');
+await Promise.resolve();
+closeLogin();
+rejectBegin(new Error('stale begin rejected'));
+await starting;
+if(!$('#modalOverlay').classList.contains('hidden')) throw new Error('late rejection reopened the dialog');
+if($('#errorRegion').textContent) throw new Error('late rejection surfaced after dialog close');
 ''')
 
     def test_change_account_forgets_selected_session_before_new_begin(self):

@@ -364,7 +364,13 @@ async function openLogin(service) {
     showError(new Error('Вход через браузер доступен в приложении DeckPipe для Windows.'), 'security');
     return;
   }
-  const state = await invoke('auth_status', {requestId: null});
+  let state;
+  try {
+    state = await invoke('auth_status', {requestId: null});
+  } catch (error) {
+    if (epoch === authAttemptEpoch && !isLoginCancelled(error)) showError(error, 'security');
+    return;
+  }
   if (epoch !== authAttemptEpoch) return;
   nativeAccounts = state.accounts || {};
   const account = nativeAccounts[service];
@@ -405,8 +411,8 @@ async function cancelAuthAttempt() {
 }
 
 async function tauriLogin(service) {
+  const epoch = authAttemptEpoch + 1;
   try {
-    const epoch = authAttemptEpoch + 1;
     await cancelAuthAttempt();
     if (epoch !== authAttemptEpoch) return;
     renderLoginDialog(service);
@@ -418,7 +424,7 @@ async function tauriLogin(service) {
     activeAuthRequest = state.requestId;
     await renderAuthState(state, epoch);
   } catch (error) {
-    if (!isLoginCancelled(error)) showError(error, 'security');
+    if (epoch === authAttemptEpoch && !isLoginCancelled(error)) showError(error, 'security');
   }
 }
 
