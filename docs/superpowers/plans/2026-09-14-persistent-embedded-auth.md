@@ -74,10 +74,23 @@ release payload => deckpipe.exe + backend.exe, no auth-host/extension resources
 **Ownership:** controller; plans/spec, main audit artifacts, isolated evidence/probe runner, reviewed commits, clean candidate build. Independent final review is mandatory.
 
 - [x] Review Task 1 and Task 2 separately and resolve material findings before integration freeze; use task briefs/reports/diff packages in this plan's ledger directory.
-- [ ] Run the real synthetic WebView2 probe across complete process restart in a Cyrillic lab profile, check persistent cookie/localStorage, profile separation, ordinary close preservation and explicit clear. Record session-cookie limits separately; do not relabel synthetic data as provider acceptance.
-- [ ] Commit the reviewed complete source/updated generated assets, run full Python/PowerShell suites, frontend build and offline Rust tests. Confirm main user file unchanged and Stage C source unchanged.
-- [ ] Obtain final review of the full authentication change from the recorded base; fix material findings through the implementing worker and rerun covering checks.
-- [ ] Freeze source and build a new unsigned engineering candidate into a unique lab staging directory. Read back actual MSI, verify no extension/native-host payload, run extracted backend smoke in isolated child profiles and preserve signing-gate status.
-- [ ] Update visible plan/report with current source, actual checks, artifact links and explicit remaining live-login/installer acceptance. Prepare user-owned provider login steps only after all engineering work is concrete and reviewable.
+- [x] Run the real synthetic WebView2 probe across complete process restart in a Cyrillic lab profile, check persistent cookie/localStorage, profile separation, ordinary close preservation and explicit clear. Record session-cookie limits separately; do not relabel synthetic data as provider acceptance.
+- [x] Commit the reviewed complete source/updated generated assets, run full Python/PowerShell suites, frontend build and offline Rust tests. Confirm main user file unchanged and Stage C source unchanged.
+- [x] Obtain final review of the full authentication change from the recorded base; fix material findings through the implementing worker and rerun covering checks.
+- [x] Freeze source and build a new unsigned engineering candidate into a unique lab staging directory. Read back actual MSI, verify no extension/native-host payload, run extracted backend smoke in isolated child profiles and preserve signing-gate status.
+- [x] Update visible plan/report with current source, actual checks, artifact links and explicit remaining live-login/installer acceptance. Prepare user-owned provider login steps only after all engineering work is concrete and reviewable.
 
 No redundant confirmation is needed between tasks. No merge, push, live registration, account signup or public release is included.
+
+## Engineering acceptance record
+
+Frozen implementation/candidate revision: `f8d76a562dc746d3f68fb15b564c16af39fc6c34`. Later closure edits are documentation only; the candidate and its test evidence retain this source revision.
+
+- Full source gate: Python 285 total (284 pass, one Windows symlink-privilege skip), PowerShell 62, Rust 19, frontend/archive parity and formatting PASS; tracked source clean at the gate and build.
+- Final independent review: one FR-1 continuation finding fixed in a single wave and approved on scoped re-review, with no open material findings.
+- Fresh real WebView2 proof: 11/11, including full child-process shutdown, persistent cookie/localStorage, Cyrillic profile path, changed EXE directory and selective clearing. No provider-account claims.
+- Windows candidate: `D:\DeckPipe-RC-Lab\staging\embedded-auth-20260914-f8d76a5-engineering`. MSI payload has only the two application EXEs, no helper/extension. Candidate/readback proof 23/23 and extracted backend 17/17 PASS.
+- The first lab comparison incorrectly required raw byte equality between MSI and standalone main EXEs. Pinned Tauri intentionally changes its bundle marker from `UNK` to `MSI`; final comparison proves the marker accounts for all three differing bytes. Original failure and diagnosis retained, artifact bytes unchanged.
+- Public-release verifier: exit 2 / `BLOCKED` for signing and timestamp. Live login/2FA/CAPTCHA, popup-only login routes, actual downloads and installer/update acceptance remain separate. Stage C stays deferred.
+
+Machine evidence and diagnostic history: `D:\DeckPipe-RC-Lab\qa-evidence\embedded-auth-20260914`. Current user-facing result: [sections 1–4 report](<D:/Claude Code/Projects/deezer-rekordbox-sync/audit/deckpipe-sections-1-4-result-2026-09-14.md>).
