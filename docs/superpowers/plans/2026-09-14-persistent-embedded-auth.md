@@ -22,13 +22,13 @@
 
 ### Task 1: Persistent native browser and cancellation-safe authentication
 
-**Ownership / files:** `desktop/src-tauri/src/auth_broker.rs`, `auth_runtime.rs`, new `auth_browser.rs`, `main.rs`, `lib.rs`, `permissions/auth-broker.toml`, `Cargo.toml`, `Cargo.lock` only if removing now-unused feature/dependencies requires it, `desktop/src-tauri/tests/auth_protocol.rs`, new native tests/example under `desktop/src-tauri/examples/auth_webview_probe.rs`; remove `src/bin/deckpipe-auth-host.rs`, `browser_bridge.rs`, `native_ipc.rs`. `app/auth_broker.py` and `qa/tests/test_auth_broker.py` only if needed for the validation-round cancellation contract. Do not edit frontend/release scripts or tauri.conf.json resources in this task.
+**Ownership / files:** `desktop/src-tauri/src/auth_broker.rs`, `auth_runtime.rs`, new `auth_browser.rs`, `main.rs`, `lib.rs`, `build.rs`, `permissions/auth-broker.toml`, generated `gen/schemas/acl-manifests.json`, `Cargo.toml`, `Cargo.lock` only if removing now-unused feature/dependencies requires it, `desktop/src-tauri/tests/auth_protocol.rs`, new native tests/example under `desktop/src-tauri/examples/auth_webview_probe.rs`; remove `src/bin/deckpipe-auth-host.rs`, `browser_bridge.rs`, `native_ipc.rs`. `app/auth_broker.py` and `qa/tests/test_auth_broker.py` only if needed for the validation-round cancellation contract. Do not edit frontend/release scripts or tauri.conf.json resources in this task.
 
 **Consumes:** backend `/api/internal/auth/{complete,commit,discard,logout,status}`. `complete` receives `{requestId,provider,credential}` and returns validationId/account; `commit` receives `{requestId,validationId}`; both launch bearer and private broker header remain mandatory.
 
 **Produces:** `auth_begin(provider)`, `auth_status(requestId?)`, `auth_cancel(requestId)`, `auth_logout(provider)` with PublicStatus per spec; top-level `authMode:"embedded"`, safe accounts and no helper. Logout means forgetting selected provider's DPAPI session and browser data. Old `auth_open_setup` removed. Native module contains the one profile/window factory used by production and synthetic WebView2 proof.
 
-- [ ] Write and run a failing native behavior test before changing production: profile selection/cookie ownership and stale completion after cancel are the first target cases.
+- [x] Write and run a failing native behavior test before changing production: profile selection/cookie ownership and stale completion after cancel are the first target cases.
 
 ```text
 profile(LocalAppData, deezer) == LocalAppData/DeckPipe/AuthBrowser/deezer
@@ -37,13 +37,13 @@ begin(deezer); validate(synthetic_old); cancel(request); finish_validation()
 => no backend commit and no public credential
 ```
 
-- [ ] Replace native-messaging claims with an in-process, request-bound browser attempt. Native reading is scoped to the provider's HTTPS origin/cookie and exact domains. Use real async Tauri window APIs; no synchronous event-handler deadlocks.
-- [ ] Preserve the private prepare/commit transaction and serialize the final commit against replacement/cancel/logout. Allow a new credential after a rejected stale cookie; tombstone timed-out or cancelled backend validation rounds. Never retry identical rejected material every poll tick.
-- [ ] Create fixed persistent provider directories with `.data_directory(profile).incognito(false)`, no extension privileges; block unsafe navigation and handle HTTPS login popups in the same isolated profile with identical restrictions. Keep remote windows outside main capabilities.
-- [ ] Implement explicit selected-provider logout/clear and failure handling. The main UI receives an error if browser data cannot be cleared; cancellation cannot restore a logged-out account later. A normal close/cancel does not clear the profile.
-- [ ] Add covering tests for expiry, replacement, wrong provider/domain/window, invalid-then-new credential, clear failure, selective cleanup and no-secret public results. Replace former native-host protocol tests with the new boundary tests.
-- [ ] Add an unshipped example/probe using the same production browser/profile code with synthetic local content; document CLI in the report. It must prove real WebView2 persistence across process restart and selected-profile clearing. Production login still accepts only fixed provider URLs; no runtime test override.
-- [ ] Run offline locked Cargo tests/fmt, relevant backend tests, self-review, and report test commands/results and remaining concerns to the controller. No live login or main-profile reads.
+- [x] Replace native-messaging claims with an in-process, request-bound browser attempt. Native reading is scoped to the provider's HTTPS origin/cookie and exact domains. Use real async Tauri window APIs; no synchronous event-handler deadlocks.
+- [x] Preserve the private prepare/commit transaction and serialize the final commit against replacement/cancel/logout. Allow a new credential after a rejected stale cookie; tombstone timed-out or cancelled backend validation rounds. Never retry identical rejected material every poll tick.
+- [x] Create fixed persistent provider directories with `.data_directory(profile).incognito(false)`, no extension privileges; block unsafe navigation and handle HTTPS login popups in the same isolated profile with identical restrictions. Keep remote windows outside main capabilities.
+- [x] Implement explicit selected-provider logout/clear and failure handling. The main UI receives an error if browser data cannot be cleared; cancellation cannot restore a logged-out account later. A normal close/cancel does not clear the profile.
+- [x] Add covering tests for expiry, replacement, wrong provider/domain/window, invalid-then-new credential, clear failure, selective cleanup and no-secret public results. Replace former native-host protocol tests with the new boundary tests.
+- [x] Add an unshipped example/probe using the same production browser/profile code with synthetic local content; document CLI in the report. It must prove real WebView2 persistence across process restart and selected-profile clearing. Production login still accepts only fixed provider URLs; no runtime test override.
+- [x] Run offline locked Cargo tests/fmt, relevant backend tests, self-review, and report test commands/results and remaining concerns to the controller. No live login or main-profile reads.
 
 ### Task 2: Interface and extension-free Windows packaging
 
@@ -53,7 +53,7 @@ begin(deezer); validate(synthetic_old); cancel(request); finish_validation()
 
 **Produces:** one flow for both providers; no Firefox/helper instructions, no `auth_open_setup`, no host executable or extension resources in installers.
 
-- [ ] Write failing frontend behavior and package assertions before the implementation.
+- [x] Write failing frontend behavior and package assertions before the implementation.
 
 ```text
 click Connect(SC) => invoke auth_begin({provider:'sc'}) once
@@ -64,10 +64,10 @@ change account => auth_logout selected provider, then auth_begin that provider
 release payload => deckpipe.exe + backend.exe, no auth-host/extension resources
 ```
 
-- [ ] Replace login copy/buttons, expose remembered-session explanation and explicit "Выйти и забыть вход" / account-switch behavior without technical token fields. Preserve cancellation and visible recoverable errors; prevent stale async responses from overriding new attempts.
-- [ ] Remove the obsolete native host build step/features and extension resources. Remove only the specified tracked obsolete files, using explicit paths; never run live unregister or recursive deletion against a computed profile path.
-- [ ] Update meaningful current contract tests to the new boundary; retain security assertions and cancellation/no-secret coverage, remove obsolete tests rather than falsely satisfying old implementation-string checks.
-- [ ] Rebuild frontend outputs, run affected JS/Python/PowerShell suites, and provide controller report. Commit boundary is controlled by the controller because the full frontend archive test compares generated assets to HEAD.
+- [x] Replace login copy/buttons, expose remembered-session explanation and explicit "Выйти и забыть вход" / account-switch behavior without technical token fields. Preserve cancellation and visible recoverable errors; prevent stale async responses from overriding new attempts.
+- [x] Remove the obsolete native host build step/features and extension resources. Remove only the specified tracked obsolete files, using explicit paths; never run live unregister or recursive deletion against a computed profile path.
+- [x] Update meaningful current contract tests to the new boundary; retain security assertions and cancellation/no-secret coverage, remove obsolete tests rather than falsely satisfying old implementation-string checks.
+- [x] Rebuild frontend outputs, run affected JS/Python/PowerShell suites, and provide controller report. Commit boundary is controlled by the controller because the full frontend archive test compares generated assets to HEAD.
 
 ### Task 3: Integrated proof, candidate and current report
 
