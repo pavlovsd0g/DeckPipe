@@ -74,6 +74,35 @@ class AuthTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(service._candidates, {})
 
+    def test_cancelled_private_round_does_not_poison_new_cookie_round(self):
+        service = self.service()
+        started, release = threading.Event(), threading.Event()
+        errors = []
+        def validate(provider, credential):
+            if credential == 'synthetic-old':
+                started.set()
+                release.wait(2)
+            return {'id': credential.rsplit('-', 1)[-1]}
+        service.validate = validate
+        def old_round():
+            try:
+                service.prepare('private-old-round', 'sc', 'synthetic-old')
+            except ValueError as error:
+                errors.append(str(error))
+        worker = threading.Thread(target=old_round)
+        worker.start()
+        self.assertTrue(started.wait(1))
+        service.discard('private-old-round')
+        candidate = service.prepare('private-new-round', 'sc', 'synthetic-new')
+        account = service.commit('private-new-round', candidate['validationId'])
+        release.set()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, ['AUTH_CANCELLED'])
+        self.assertEqual(account['id'], 'new')
+        self.assertEqual(self.writes, [('sc', 'synthetic-new')])
+        self.assertEqual(service._candidates, {})
+
     def test_validation_finishing_after_timer_cannot_create_candidate(self):
         service = self.service()
         service.validation_ttl = 0.03

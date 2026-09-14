@@ -1,16 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use deckpipe::{
-    auth_broker::{provider_url, PublicStatus},
-    auth_runtime::AuthRuntime,
-};
+use deckpipe::{auth_broker::PublicStatus, auth_browser::AuthBrowser, auth_runtime::AuthRuntime};
 use rand::{rngs::OsRng, RngCore};
 use serde::Serialize;
-use std::{
-    env,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{env, sync::Mutex, time::Duration};
 use tauri::{
     async_runtime::{block_on, Receiver},
     Manager, RunEvent, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
@@ -68,19 +61,13 @@ async fn backend_connection(
 async fn auth_begin(
     app: tauri::AppHandle,
     window: WebviewWindow,
-    auth: State<'_, AuthRuntime>,
     provider: String,
 ) -> Result<PublicStatus, String> {
     require_main(&window)?;
-    let url = provider_url(&provider).map_err(str::to_owned)?;
-    let status = auth.begin(&provider).await.map_err(str::to_owned)?;
-    #[allow(deprecated)]
-    if app.shell().open(url, None).is_err() {
-        auth.fail(&status.request_id, "AUTH_BROWSER_UNAVAILABLE")
-            .await;
-        return Err("AUTH_BROWSER_UNAVAILABLE".into());
-    }
-    Ok(status)
+    app.state::<AuthBrowser>()
+        .begin(app.clone(), &provider)
+        .await
+        .map_err(str::to_owned)
 }
 
 fn require_main(window: &WebviewWindow) -> Result<(), String> {
@@ -103,37 +90,27 @@ async fn auth_status(
 }
 #[tauri::command]
 async fn auth_cancel(
+    app: tauri::AppHandle,
     window: WebviewWindow,
-    auth: State<'_, AuthRuntime>,
     request_id: String,
 ) -> Result<PublicStatus, String> {
     require_main(&window)?;
-    auth.cancel(&request_id).await.map_err(str::to_owned)
+    app.state::<AuthBrowser>()
+        .cancel(app.clone(), &request_id)
+        .await
+        .map_err(str::to_owned)
 }
 #[tauri::command]
 async fn auth_logout(
+    app: tauri::AppHandle,
     window: WebviewWindow,
-    auth: State<'_, AuthRuntime>,
     provider: String,
 ) -> Result<PublicStatus, String> {
     require_main(&window)?;
-    auth.logout(&provider).await.map_err(str::to_owned)
-}
-#[tauri::command]
-fn auth_open_setup(app: tauri::AppHandle, window: WebviewWindow) -> Result<(), String> {
-    require_main(&window)?;
-    let resources = app
-        .path()
-        .resource_dir()
-        .map_err(|_| "AUTH_SETUP_UNAVAILABLE".to_string())?;
-    let folder = resources.join("auth-helper");
-    if !folder.join("README.md").is_file() {
-        return Err("AUTH_SETUP_UNAVAILABLE".into());
-    }
-    #[allow(deprecated)]
-    app.shell()
-        .open(folder.to_string_lossy().to_string(), None)
-        .map_err(|_| "AUTH_SETUP_UNAVAILABLE".into())
+    app.state::<AuthBrowser>()
+        .logout(app.clone(), &provider)
+        .await
+        .map_err(str::to_owned)
 }
 
 fn retain_sidecar_child(state: &ManagedSidecar, child: CommandChild) -> Result<(), String> {
@@ -314,7 +291,6 @@ fn main() {
             auth_status,
             auth_cancel,
             auth_logout,
-            auth_open_setup,
             backend_connection
         ])
         .setup(|app| {
@@ -324,21 +300,8 @@ fn main() {
                 connection.token.clone(),
                 broker_token,
             )?;
-            app.manage(auth.clone());
-            let handle = app.handle().clone();
-            let focus = Arc::new(move || {
-                if let Some(window) = handle.get_webview_window("main") {
-                    let _ = window.unminimize();
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
-            });
-            tauri::async_runtime::spawn(async move {
-                let failure = auth.clone();
-                if auth.serve(focus).await.is_err() {
-                    failure.bridge_failed();
-                }
-            });
+            app.manage(AuthBrowser::new(auth.clone())?);
+            app.manage(auth);
             let connection_state = app.state::<BackendConnectionState>();
             if let Err(error) = store_backend_connection(&connection_state, connection) {
                 let sidecar = app.state::<ManagedSidecar>();

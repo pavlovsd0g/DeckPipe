@@ -1,4 +1,4 @@
 [[permission]]
 identifier = "allow-auth-broker"
 description = "Begin, observe, cancel and disconnect browser authorization without exposing credentials."
-commands.allow = ["auth_begin", "auth_status", "auth_cancel", "auth_logout", "auth_open_setup"]
+commands.allow = ["auth_begin", "auth_status", "auth_cancel", "auth_logout"]

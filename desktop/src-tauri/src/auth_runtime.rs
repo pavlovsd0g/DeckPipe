@@ -1,18 +1,11 @@
-use crate::{
-    auth_broker::{provider_url, random_id, Broker, PublicStatus},
-    browser_bridge::{parse_request, read_bytes, write_value, NativeRequest},
-    native_ipc,
-};
+use crate::auth_broker::{provider_url, Broker, PublicStatus};
 use serde_json::{json, Value};
 use std::{
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
-    },
+    future::Future,
+    sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct AuthRuntime {
@@ -22,48 +15,6 @@ pub struct AuthRuntime {
     launch_token: String,
     broker_token: String,
     started: Instant,
-    bridge_failed: Arc<AtomicBool>,
-    helper_connections: Arc<AtomicUsize>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Read, Write};
-
-    #[tokio::test]
-    async fn failed_logout_revokes_claim_before_late_callback() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut input = [0; 4096];
-            stream.read(&mut input).unwrap();
-            stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").unwrap();
-        });
-        let runtime = AuthRuntime::new(
-            format!("http://{address}"),
-            "test-launch".into(),
-            "test-broker".into(),
-        )
-        .unwrap();
-        runtime.begin("sc").await.unwrap();
-        let claim = runtime.broker.lock().await.claim("test-helper", 0).unwrap();
-        assert!(runtime.logout("sc").await.is_err());
-        assert!(runtime
-            .complete(
-                "test-helper",
-                &claim.request_id,
-                "sc",
-                &claim.state,
-                "synthetic-secret".into()
-            )
-            .await
-            .is_err());
-        assert!(!runtime.broker.lock().await.can_commit(&claim.request_id, 0));
-        assert_eq!(runtime.status(None).await.unwrap().status, "idle");
-        server.join().unwrap();
-    }
 }
 impl AuthRuntime {
     pub fn new(
@@ -84,25 +35,39 @@ impl AuthRuntime {
             launch_token,
             broker_token,
             started: Instant::now(),
-            bridge_failed: Arc::new(AtomicBool::new(false)),
-            helper_connections: Arc::new(AtomicUsize::new(0)),
         })
     }
     fn now(&self) -> u64 {
         self.started.elapsed().as_secs()
     }
+    fn discard_later(&self, round: Option<String>) {
+        if let Some(round) = round {
+            let runtime = self.clone();
+            tokio::spawn(async move {
+                let _ = runtime.backend("discard", json!({"requestId":round})).await;
+            });
+        }
+    }
     pub async fn begin(&self, provider: &str) -> Result<PublicStatus, &'static str> {
-        self.broker.lock().await.begin(provider, self.now())
+        provider_url(provider)?;
+        let mut broker = self.broker.lock().await;
+        let old = broker.active_round();
+        let status = broker.begin(provider, self.now())?;
+        self.discard_later(old);
+        Ok(status)
     }
     pub async fn status(&self, request: Option<&str>) -> Result<PublicStatus, &'static str> {
-        self.broker.lock().await.status(request, self.now())
+        let mut broker = self.broker.lock().await;
+        let status = broker.status(request, self.now())?;
+        if !status.pending() {
+            self.discard_later(broker.take_round());
+        }
+        Ok(status)
     }
     pub async fn public_status(&self, request: Option<&str>) -> Result<Value, &'static str> {
         let mut status = serde_json::to_value(self.status(request).await?)
             .map_err(|_| "AUTH_INVALID_RESPONSE")?;
-        let failed = self.bridge_failed.load(Ordering::Relaxed);
-        let connected = self.helper_connections.load(Ordering::Relaxed) > 0;
-        status["helper"] = json!({"browser":"firefox","state":if failed{"unavailable"}else if connected{"connected"}else{"not_connected"},"setupRequired":!connected,"setupAvailable":true});
+        status["authMode"] = json!("embedded");
         if request.is_none() {
             let accounts = self.backend("status", json!({})).await?;
             let mut safe = json!({});
@@ -115,30 +80,46 @@ impl AuthRuntime {
         }
         Ok(status)
     }
-    pub fn bridge_failed(&self) {
-        self.bridge_failed.store(true, Ordering::Relaxed);
-    }
     pub async fn cancel(&self, request: &str) -> Result<PublicStatus, &'static str> {
-        let status = self.broker.lock().await.cancel(request, self.now())?;
-        let _ = self.backend("discard", json!({"requestId":request})).await;
+        let mut broker = self.broker.lock().await;
+        let status = broker.cancel(request, self.now())?;
+        self.discard_later(broker.take_round());
         Ok(status)
     }
-    pub async fn logout(&self, provider: &str) -> Result<PublicStatus, &'static str> {
+    pub async fn logout_with_clear<F>(
+        &self,
+        provider: &str,
+        clear: F,
+    ) -> Result<PublicStatus, &'static str>
+    where
+        F: Future<Output = Result<(), &'static str>>,
+    {
         provider_url(provider)?;
+        // Final commit and logout are ordered on this lock. Validation I/O never
+        // owns it. Revoke first even if either persistent-store operation fails.
         let mut broker = self.broker.lock().await;
-        broker.logout(provider);
-        self.backend("logout", json!({"provider":provider})).await?;
-        Ok(PublicStatus {
-            request_id: String::new(),
-            provider: provider.into(),
-            status: "idle".into(),
-            expires_in: 0,
-            account: None,
-            error_code: None,
-        })
+        if broker.status(None, self.now())?.provider == provider {
+            self.discard_later(broker.take_round());
+            broker.logout(provider);
+        }
+        let backend = self.backend("logout", json!({"provider":provider})).await;
+        let cleared = clear.await;
+        cleared?;
+        backend?;
+        Ok(PublicStatus::idle(provider))
+    }
+    pub async fn notice(&self, request: &str, code: &'static str) {
+        self.broker.lock().await.notice(request, code, self.now());
     }
     pub async fn fail(&self, request: &str, code: &'static str) {
-        self.broker.lock().await.fail(request, code, self.now());
+        let mut broker = self.broker.lock().await;
+        broker.fail(request, code, self.now());
+        if broker
+            .status(Some(request), self.now())
+            .is_ok_and(|s| !s.pending())
+        {
+            self.discard_later(broker.take_round());
+        }
     }
     async fn backend(&self, operation: &str, body: Value) -> Result<Value, &'static str> {
         let response = self
@@ -167,167 +148,406 @@ impl AuthRuntime {
         }
         serde_json::from_slice(&bytes).map_err(|_| "AUTH_INVALID_RESPONSE")
     }
-    async fn complete(
+    pub async fn complete(
         &self,
-        connection: &str,
+        window: &str,
         request: &str,
         provider: &str,
-        state: &str,
         credential: String,
-    ) -> Result<Value, &'static str> {
-        self.broker
-            .lock()
-            .await
-            .validate(request, provider, state, connection, self.now())?;
+    ) -> Result<PublicStatus, &'static str> {
+        let round = self.broker.lock().await.validate(
+            request,
+            provider,
+            window,
+            &credential,
+            self.now(),
+        )?;
+        // Each validation uses a new *private* backend request ID. AuthService
+        // tombstones rejected/timed-out rounds permanently for their lifetime;
+        // a different cookie can retry without reopening an older transaction.
         let prepared = self
             .backend(
                 "complete",
-                json!({"requestId":request,"provider":provider,"credential":credential}),
+                json!({"requestId":round,"provider":provider,"credential":credential}),
             )
             .await;
         let prepared = match prepared {
-            Ok(value) => value,
-            Err(code) => {
-                self.fail(request, code).await;
-                // A timed-out HTTP request can still finish provider validation
-                // in Python. Tombstone it there before returning to the helper.
-                let _ = self.backend("discard", json!({"requestId":request})).await;
+            Ok(value)
+                if value["validationId"]
+                    .as_str()
+                    .is_some_and(|v| !v.is_empty()) =>
+            {
+                value
+            }
+            result => {
+                let code = result.err().unwrap_or("AUTH_INVALID_RESPONSE");
+                self.discard_later(Some(round.clone()));
+                self.broker
+                    .lock()
+                    .await
+                    .rejected(request, &round, code, self.now());
                 return Err(code);
             }
         };
-        let validation = prepared
-            .get("validationId")
-            .and_then(Value::as_str)
-            .ok_or("AUTH_INVALID_RESPONSE")?;
         let mut broker = self.broker.lock().await;
-        if !broker.can_commit(request, self.now()) {
-            drop(broker);
-            let _ = self.backend("discard", json!({"requestId":request})).await;
+        if !broker.can_commit(request, &round, self.now()) {
+            self.discard_later(Some(round));
             return Err("AUTH_CANCELLED");
         }
-        // Commit does no provider I/O. Hold the attempt lock across the bounded
-        // store transaction so begin/cancel/logout cannot race its final write.
-        let commit_time = self.now();
+        // Commit contains no provider I/O. Holding the native lock orders its
+        // final transaction before replacement/cancel/logout. Authorization time
+        // is used if a successful response crosses the attempt deadline.
+        let authorized_at = self.now();
         let committed = self
             .backend(
                 "commit",
-                json!({"requestId":request,"validationId":validation}),
+                json!({"requestId":round,"validationId":prepared["validationId"]}),
             )
             .await;
-        let committed = match committed {
-            Ok(value) => value,
-            Err(code) => {
+        match committed {
+            Ok(value) if value["account"].is_object() => {
+                broker.succeed(request, &round, value["account"].clone(), authorized_at)
+            }
+            result => {
+                let code = result.err().unwrap_or("AUTH_INVALID_RESPONSE");
+                // An uncertain commit must never be retried automatically.
+                // Tombstone while still ordered against logout/replacement.
+                let _ = self.backend("discard", json!({"requestId":round})).await;
                 broker.fail(request, code, self.now());
-                return Err(code);
-            }
-        };
-        let account = committed
-            .get("account")
-            .cloned()
-            .ok_or("AUTH_INVALID_RESPONSE")?;
-        // A commit accepted before the deadline is final even if its response
-        // crosses the deadline: use the timestamp at authorization of commit.
-        let status = broker.succeed(request, account, commit_time)?;
-        Ok(json!({"ok":true,"status":status}))
-    }
-    async fn handle(
-        &self,
-        connection: &str,
-        request: NativeRequest,
-    ) -> Result<Value, &'static str> {
-        match request {
-            NativeRequest::Hello { .. } => {
-                let status = self.status(None).await?;
-                if !matches!(status.status.as_str(), "waiting_browser" | "waiting_helper") {
-                    return Err("NO_PENDING_LOGIN");
-                }
-                Ok(json!({"ok":true,"status":status}))
-            }
-            NativeRequest::ClaimPending { .. } => Ok(
-                json!({"ok":true,"claim":self.broker.lock().await.claim(connection,self.now())?}),
-            ),
-            NativeRequest::Complete {
-                request_id,
-                provider,
-                state,
-                credential,
-                ..
-            } => {
-                self.complete(connection, &request_id, &provider, &state, credential)
-                    .await
+                Err(code)
             }
         }
     }
-    pub async fn serve(
-        self,
-        on_connected: Arc<dyn Fn() + Send + Sync>,
-    ) -> Result<(), &'static str> {
-        let name = native_ipc::pipe_name()?;
-        let expected = std::env::current_exe()
-            .map_err(|_| "AUTH_HOST_UNAVAILABLE")?
-            .with_file_name("deckpipe-auth-host.exe");
-        let mut listener = native_ipc::create_server(&name, true)?;
-        let capacity = Arc::new(Semaphore::new(4));
-        loop {
-            listener
-                .connect()
-                .await
-                .map_err(|_| "AUTH_PIPE_UNAVAILABLE")?;
-            let pipe = listener;
-            listener = native_ipc::create_server(&name, false)?;
-            let runtime = self.clone();
-            let expected = expected.clone();
-            let notify = on_connected.clone();
-            let Ok(permit) = capacity.clone().try_acquire_owned() else {
-                continue;
-            };
-            tokio::spawn(async move {
-                let _permit = permit;
-                runtime.connection(pipe, expected, notify).await;
-            });
-        }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::Semaphore,
+    };
+
+    struct Fixture {
+        entered: Semaphore,
+        release: Semaphore,
+        block_validation: bool,
+        block_commit: AtomicBool,
+        commit_entered: Semaphore,
+        commit_release: Semaphore,
+        fail_logout: AtomicBool,
+        completes: AtomicUsize,
+        commits: AtomicUsize,
+        operations: Mutex<Vec<(String, Value)>>,
     }
-    async fn connection(
-        &self,
-        mut pipe: tokio::net::windows::named_pipe::NamedPipeServer,
-        expected: PathBuf,
-        notify: Arc<dyn Fn() + Send + Sync>,
-    ) {
-        if native_ipc::verify_client(&pipe, &expected).is_err() {
-            return;
-        }
-        self.helper_connections.fetch_add(1, Ordering::Relaxed);
-        let connection = random_id();
-        loop {
-            let bytes =
-                match tokio::time::timeout(Duration::from_secs(305), read_bytes(&mut pipe)).await {
-                    Ok(Ok(b)) => b,
-                    _ => break,
+    async fn fixture(block_validation: bool) -> (AuthRuntime, Arc<Fixture>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = Arc::new(Fixture {
+            entered: Semaphore::new(0),
+            release: Semaphore::new(0),
+            block_validation,
+            block_commit: AtomicBool::new(false),
+            commit_entered: Semaphore::new(0),
+            commit_release: Semaphore::new(0),
+            fail_logout: AtomicBool::new(false),
+            completes: AtomicUsize::new(0),
+            commits: AtomicUsize::new(0),
+            operations: Mutex::new(Vec::new()),
+        });
+        let server = state.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
                 };
-            let request = match parse_request(&bytes) {
-                Ok(r) => r,
-                Err(_) => break,
-            };
-            let response = self.handle(&connection, request).await;
-            let connected = response.as_ref().is_ok_and(|r| {
-                r.get("status")
-                    .and_then(|s| s.get("status"))
-                    .and_then(Value::as_str)
-                    == Some("connected")
-            });
-            let value = match response {
-                Ok(v) => v,
-                Err(code) => json!({"ok":false,"errorCode":code}),
-            };
-            if write_value(&mut pipe, &value).await.is_err() {
-                break;
+                let server = server.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let (end, length) = loop {
+                        let mut chunk = [0; 4096];
+                        let n = stream.read(&mut chunk).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let header = String::from_utf8_lossy(&bytes[..pos]).to_lowercase();
+                            assert!(header.contains("authorization: bearer test-launch"));
+                            assert!(header.contains("x-deckpipe-auth-broker: test-broker"));
+                            let length: usize = header
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .unwrap()
+                                .trim()
+                                .parse()
+                                .unwrap();
+                            break (pos + 4, length);
+                        }
+                    };
+                    while bytes.len() < end + length {
+                        let mut chunk = [0; 4096];
+                        let n = stream.read(&mut chunk).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&chunk[..n]);
+                    }
+                    let header = String::from_utf8_lossy(&bytes[..end]);
+                    let operation = header
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .rsplit('/')
+                        .next()
+                        .unwrap()
+                        .to_owned();
+                    let body: Value = serde_json::from_slice(&bytes[end..end + length]).unwrap();
+                    server
+                        .operations
+                        .lock()
+                        .await
+                        .push((operation.clone(), body.clone()));
+                    let mut code = "200 OK";
+                    let result = match operation.as_str() {
+                        "complete" => {
+                            server.completes.fetch_add(1, Ordering::SeqCst);
+                            server.entered.add_permits(1);
+                            if body["credential"] == "invalid" {
+                                code = "400 Bad Request";
+                                json!({})
+                            } else {
+                                if server.block_validation {
+                                    server.release.acquire().await.unwrap().forget();
+                                }
+                                json!({"validationId":"test-validation","account":{"id":"safe","name":"Safe"}})
+                            }
+                        }
+                        "commit" => {
+                            server.commits.fetch_add(1, Ordering::SeqCst);
+                            server.commit_entered.add_permits(1);
+                            if server.block_commit.load(Ordering::SeqCst) {
+                                server.commit_release.acquire().await.unwrap().forget();
+                            }
+                            json!({"account":{"id":"safe","name":"Safe","credential":"synthetic-sentinel"}})
+                        }
+                        "logout" if server.fail_logout.load(Ordering::SeqCst) => {
+                            code = "500 Internal Server Error";
+                            json!({})
+                        }
+                        "status" => {
+                            json!({"accounts":{"sc":{"connected":true,"account":{"id":"safe","name":"Safe","credential":"synthetic-sentinel"},"token":"synthetic-sentinel"}}})
+                        }
+                        _ => json!({"ok":true}),
+                    };
+                    let body = serde_json::to_vec(&result).unwrap();
+                    let header = format!("HTTP/1.1 {code}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
             }
-            if connected {
-                notify();
-                break;
+        });
+        (
+            AuthRuntime::new(
+                format!("http://{address}"),
+                "test-launch".into(),
+                "test-broker".into(),
+            )
+            .unwrap(),
+            state,
+        )
+    }
+    async fn start_validation(
+        runtime: &AuthRuntime,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<Result<PublicStatus, &'static str>>,
+    ) {
+        let status = runtime.begin("sc").await.unwrap();
+        let request = status.request_id.clone();
+        let auth = runtime.clone();
+        let task = tokio::spawn(async move {
+            auth.complete(
+                &format!("auth-{request}"),
+                &request,
+                "sc",
+                "synthetic-sentinel".into(),
+            )
+            .await
+        });
+        (status.request_id, task)
+    }
+
+    #[tokio::test]
+    async fn cancel_returns_during_provider_io_and_no_late_commit() {
+        let (runtime, server) = fixture(true).await;
+        let (request, task) = start_validation(&runtime).await;
+        server.entered.acquire().await.unwrap().forget();
+        let result = tokio::time::timeout(Duration::from_millis(200), runtime.cancel(&request))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.status, "cancelled");
+        server.release.add_permits(1);
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(server.commits.load(Ordering::SeqCst), 0);
+        assert!(!serde_json::to_string(&result)
+            .unwrap()
+            .contains("synthetic-sentinel"));
+    }
+
+    #[tokio::test]
+    async fn replacement_and_logout_revoke_validation_even_when_logout_fails() {
+        for action in ["replace", "logout", "logout-failed"] {
+            let (runtime, server) = fixture(true).await;
+            let (_, task) = start_validation(&runtime).await;
+            server.entered.acquire().await.unwrap().forget();
+            if action == "replace" {
+                runtime.begin("deezer").await.unwrap();
+            } else {
+                server
+                    .fail_logout
+                    .store(action == "logout-failed", Ordering::SeqCst);
+                let outcome = runtime.logout_with_clear("sc", async { Ok(()) }).await;
+                assert_eq!(outcome.is_err(), action == "logout-failed");
             }
+            server.release.add_permits(1);
+            assert!(task.await.unwrap().is_err());
+            assert_eq!(server.commits.load(Ordering::SeqCst), 0);
         }
-        self.broker.lock().await.disconnected(&connection);
-        self.helper_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    #[tokio::test]
+    async fn invalid_then_new_cookie_uses_unique_backend_round_and_never_retries_identical_material(
+    ) {
+        let (runtime, server) = fixture(false).await;
+        let status = runtime.begin("sc").await.unwrap();
+        let w = format!("auth-{}", status.request_id);
+        assert!(runtime
+            .complete(&w, &status.request_id, "sc", "invalid".into())
+            .await
+            .is_err());
+        assert_eq!(
+            runtime.status(None).await.unwrap().status,
+            "waiting_browser"
+        );
+        for _ in 0..5 {
+            assert!(matches!(
+                runtime
+                    .complete(&w, &status.request_id, "sc", "invalid".into())
+                    .await,
+                Err("AUTH_UNCHANGED_CREDENTIAL")
+            ));
+        }
+        assert_eq!(server.completes.load(Ordering::SeqCst), 1);
+        let connected = runtime
+            .complete(&w, &status.request_id, "sc", "synthetic-sentinel".into())
+            .await
+            .unwrap();
+        assert_eq!(connected.status, "connected");
+        assert_eq!(server.commits.load(Ordering::SeqCst), 1);
+        let operations = server.operations.lock().await;
+        let rounds: Vec<_> = operations
+            .iter()
+            .filter(|(op, _)| op == "complete")
+            .map(|(_, body)| body["requestId"].as_str().unwrap())
+            .collect();
+        assert_ne!(rounds[0], rounds[1]);
+        assert!(!rounds.contains(&status.request_id.as_str()));
+        assert!(!serde_json::to_string(&connected)
+            .unwrap()
+            .contains("synthetic-sentinel"));
+    }
+
+    #[tokio::test]
+    async fn clear_failure_is_visible_and_logout_is_provider_selective() {
+        let (runtime, server) = fixture(true).await;
+        let (_, task) = start_validation(&runtime).await;
+        server.entered.acquire().await.unwrap().forget();
+        assert!(matches!(
+            runtime
+                .logout_with_clear("sc", async { Err("AUTH_BROWSER_CLEAR_FAILED") })
+                .await,
+            Err("AUTH_BROWSER_CLEAR_FAILED")
+        ));
+        server.release.add_permits(1);
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(server.commits.load(Ordering::SeqCst), 0);
+        let operations = server.operations.lock().await;
+        let logouts: Vec<_> = operations.iter().filter(|(op, _)| op == "logout").collect();
+        assert_eq!(logouts.len(), 1);
+        assert_eq!(logouts[0].1["provider"], "sc");
+        drop(operations);
+        let status = runtime.public_status(None).await.unwrap();
+        assert_eq!(status["authMode"], "embedded");
+        assert!(status.get("helper").is_none());
+        assert!(!status.to_string().contains("synthetic-sentinel"));
+    }
+
+    #[tokio::test]
+    async fn browser_clear_is_attempted_even_if_backend_logout_fails() {
+        let (runtime, server) = fixture(false).await;
+        server.fail_logout.store(true, Ordering::SeqCst);
+        let cleared = Arc::new(AtomicBool::new(false));
+        let marker = cleared.clone();
+        assert!(runtime
+            .logout_with_clear("deezer", async move {
+                marker.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .is_err());
+        assert!(cleared.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn expiry_during_provider_io_discards_late_result() {
+        let (mut runtime, server) = fixture(true).await;
+        let (_, task) = start_validation(&runtime).await;
+        server.entered.acquire().await.unwrap().forget();
+        runtime.started -= Duration::from_secs(301);
+        assert_eq!(runtime.status(None).await.unwrap().status, "expired");
+        server.release.add_permits(1);
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(server.commits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn final_commit_is_ordered_before_logout_transaction() {
+        let (runtime, server) = fixture(false).await;
+        server.block_commit.store(true, Ordering::SeqCst);
+        let (_, task) = start_validation(&runtime).await;
+        server.commit_entered.acquire().await.unwrap().forget();
+        let auth = runtime.clone();
+        let mut logout =
+            tokio::spawn(async move { auth.logout_with_clear("sc", async { Ok(()) }).await });
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut logout)
+            .await
+            .is_err());
+        assert!(!server
+            .operations
+            .lock()
+            .await
+            .iter()
+            .any(|(op, _)| op == "logout"));
+        server.commit_release.add_permits(1);
+        assert_eq!(task.await.unwrap().unwrap().status, "connected");
+        assert_eq!(logout.await.unwrap().unwrap().status, "idle");
+        assert_eq!(runtime.status(None).await.unwrap().status, "idle");
+        let operations = server.operations.lock().await;
+        let commit = operations
+            .iter()
+            .position(|(op, _)| op == "commit")
+            .unwrap();
+        let logout = operations
+            .iter()
+            .position(|(op, _)| op == "logout")
+            .unwrap();
+        assert!(commit < logout);
     }
 }
