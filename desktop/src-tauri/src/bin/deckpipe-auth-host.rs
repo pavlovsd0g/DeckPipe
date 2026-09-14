@@ -11,12 +11,17 @@ fn verify_manifest(args: &[String]) -> Result<(), &'static str> {
     valid_host_args(args)?;
     let exe = std::env::current_exe().map_err(|_| "AUTH_HOST_SOURCE_REJECTED")?;
     let manifest = Path::new(&args[0]);
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or("AUTH_HOST_SOURCE_REJECTED")?;
+    let expected_manifest = local_app_data
+        .join("DeckPipe")
+        .join("AuthHelper")
+        .join("native-host.firefox.json");
     if !manifest.is_absolute()
-        || manifest.canonicalize().ok()
-            != exe
-                .with_file_name("native-host.firefox.json")
-                .canonicalize()
-                .ok()
+        || manifest.canonicalize().ok() != expected_manifest.canonicalize().ok()
+        || !exe.with_file_name("deckpipe.exe").is_file()
     {
         return Err("AUTH_HOST_SOURCE_REJECTED");
     }

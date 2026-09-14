@@ -18,7 +18,19 @@ node --test qa/tests/auth_helper.test.cjs
 
 Один тест сравнивает сгенерированные ресурсы с **HEAD** и `git archive HEAD`. После изменения frontend сначала соберите и закоммитьте `app/static` и `desktop/ui`; отличие незакоммиченных ресурсов от HEAD должно выявляться, а не скрываться.
 
-PowerShell-проверки: `qa/tests/DeckPipe.QA.Tests.ps1`, `DeckPipe.Release.Tests.ps1`, `DeckPipe.Orchestrator.Tests.ps1`. Для нативных проверок сначала задайте `$env:DECKPIPE_AUTH_TEST_DIR = 'D:\DeckPipe-RC-Lab\qa-evidence\native-protocol'`, затем выполните `cargo test --offline --manifest-path desktop/src-tauri/Cargo.toml`. Нативный помощник — Cargo-бинарник, автоматически включаемый Tauri. Backend EXE остаётся внешним sidecar; новому checkout сначала нужно подготовить его через release pipeline. `release/auth-helper/Build-AuthHelper.ps1` отдельно собирает помощник для предварительной проверки и самостоятельного пакета.
+PowerShell-проверки: `qa/tests/DeckPipe.QA.Tests.ps1`, `DeckPipe.Release.Tests.ps1`, `DeckPipe.Orchestrator.Tests.ps1`, `DeckPipe.AuthSetup.Tests.ps1`. Последний набор запускает настоящие скрипты регистрации на временных файлах, подменяя только обращения к реестру; рабочая регистрация Firefox не изменяется.
+
+Для нативных проверок в текущей офлайн-лаборатории задайте все пути явно:
+
+```powershell
+$env:CARGO_HOME = 'D:\DeckPipe-RC-Lab\tool-cache\cargo-home'
+$env:RUSTUP_HOME = 'D:\DeckPipe-RC-Lab\tool-cache\rustup-home'
+$env:CARGO_TARGET_DIR = 'D:\DeckPipe-RC-Lab\build\auth-broker-target'
+$env:DECKPIPE_AUTH_TEST_DIR = 'D:\DeckPipe-RC-Lab\qa-evidence\native-protocol'
+cargo test --offline --locked --manifest-path desktop/src-tauri/Cargo.toml
+```
+
+Нативный помощник — Cargo-бинарник, автоматически включаемый Tauri. Backend EXE остаётся внешним sidecar; новому checkout сначала нужно подготовить его через release pipeline. `release/auth-helper/Build-AuthHelper.ps1` отдельно собирает помощник для предварительной проверки и самостоятельного пакета.
 
 Для проверки **собранного EXE** изоляция отличается: frozen backend намеренно игнорирует `DECKPIPE_DATA_DIR`. Перед его запуском задайте дочернему процессу отдельные `APPDATA` и `LOCALAPPDATA` внутри новой папки лаборатории; профиль будет создан в `APPDATA/DeckPipe`. Не переносите туда рабочую конфигурацию или авторизацию. Тест исходников с `DECKPIPE_DATA_DIR` не доказывает изоляцию собранного приложения.
 

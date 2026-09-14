@@ -123,7 +123,9 @@
 
 ### Task 6: Verify and close only achieved work
 
-- [ ] Run all Python/PowerShell suites; targeted real-file/cross-folder/lifecycle/hostile-request regressions, frontend build, Rust check/test.
-- [ ] Independent review of data integrity and auth boundaries; fix material findings and rerun affected checks.
-- [ ] Build reviewable Windows candidate/helper without replacing pinned old artifacts or installing into user's profile.
-- [ ] Update completion ledger with source revision, new evidence, remaining external Firefox signing/install or live-account gates. Never label A/B complete if a required functional or external gate remains.
+- [x] Run all Python/PowerShell suites; targeted real-file/cross-folder/lifecycle/hostile-request regressions, frontend build, Rust check/test.
+- [x] Independent review of data integrity and auth boundaries; fix material findings and rerun affected checks.
+- [x] Build reviewable Windows candidate/helper without replacing pinned old artifacts or installing into user's profile.
+- [x] Update completion ledger with source revision, new evidence, remaining external Firefox signing/install or live-account gates. Never label A/B complete if a required functional or external gate remains.
+
+Engineering verification above was completed on 9 September at `c1830776b7db9bb6aabf4439cc159216192032c9`; the original ledger and `audit/deckpipe-stages-ab-result-2026-09-09.md` record the evidence and profile-isolation incident. These boxes record that completed engineering work, not live acceptance of Stage B. Continuation authorised on 14 September is tracked in [sections 1–4 continuation](2026-09-14-sections-1-4-continuation.md). Stage C is explicitly deferred.

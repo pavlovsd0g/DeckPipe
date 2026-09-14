@@ -110,6 +110,101 @@ fn cancelled_validation_and_wrong_provider_never_commit() {
     assert!(!broker.can_commit(&second.request_id, 311));
 }
 
+#[test]
+fn actual_native_host_rejects_untrusted_manifest_inputs_before_ipc() {
+    use std::{path::PathBuf, process::Command};
+
+    fn assert_rejected(
+        host: &PathBuf,
+        manifest: &PathBuf,
+        local_app_data: &PathBuf,
+        extension_id: &str,
+    ) {
+        let output = Command::new(host)
+            .arg(manifest)
+            .arg(extension_id)
+            .env("LOCALAPPDATA", local_app_data)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("synthetic-secret"));
+        assert!(output.stdout.len() >= 4);
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout[4..]).unwrap();
+        assert_eq!(
+            response,
+            serde_json::json!({"ok":false,"errorCode":"AUTH_HOST_SOURCE_REJECTED"})
+        );
+    }
+
+    let root = PathBuf::from(
+        std::env::var("DECKPIPE_AUTH_TEST_DIR").expect("isolated lab test directory is required"),
+    )
+    .join(format!(
+        "native-host-rejections-{}",
+        deckpipe::auth_broker::random_id()
+    ));
+    let install = root.join("install");
+    let local_app_data = root.join("local-app-data");
+    std::fs::create_dir_all(&install).unwrap();
+    let host = install.join("deckpipe-auth-host.exe");
+    std::fs::copy(env!("CARGO_BIN_EXE_deckpipe-auth-host"), &host).unwrap();
+    std::fs::copy(
+        std::env::current_exe().unwrap(),
+        install.join("deckpipe.exe"),
+    )
+    .unwrap();
+    let expected = local_app_data
+        .join("DeckPipe")
+        .join("AuthHelper")
+        .join("native-host.firefox.json");
+    std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
+    let valid = serde_json::json!({"name":"com.deckpipe.auth","type":"stdio","path":host,"allowed_extensions":["deckpipe-auth@deckpipe.local"]});
+
+    let arbitrary = root.join("arbitrary.json");
+    std::fs::write(&arbitrary, serde_json::to_vec(&valid).unwrap()).unwrap();
+    assert_rejected(
+        &host,
+        &arbitrary,
+        &local_app_data,
+        "deckpipe-auth@deckpipe.local",
+    );
+
+    let mismatched = serde_json::json!({"name":"com.deckpipe.auth","type":"stdio","path":root.join("other.exe"),"allowed_extensions":["deckpipe-auth@deckpipe.local"],"credential":"synthetic-secret"});
+    std::fs::write(&expected, serde_json::to_vec(&mismatched).unwrap()).unwrap();
+    assert_rejected(
+        &host,
+        &expected,
+        &local_app_data,
+        "deckpipe-auth@deckpipe.local",
+    );
+
+    std::fs::write(
+        &expected,
+        br#"{"name":"com.deckpipe.auth","credential":"synthetic-secret""#,
+    )
+    .unwrap();
+    assert_rejected(
+        &host,
+        &expected,
+        &local_app_data,
+        "deckpipe-auth@deckpipe.local",
+    );
+
+    let oversized = serde_json::json!({"name":"com.deckpipe.auth","type":"stdio","path":host,"allowed_extensions":["deckpipe-auth@deckpipe.local"],"padding":"x".repeat(8200)});
+    assert!(serde_json::to_vec(&oversized).unwrap().len() > 8192);
+    std::fs::write(&expected, serde_json::to_vec(&oversized).unwrap()).unwrap();
+    assert_rejected(
+        &host,
+        &expected,
+        &local_app_data,
+        "deckpipe-auth@deckpipe.local",
+    );
+
+    std::fs::write(&expected, serde_json::to_vec(&valid).unwrap()).unwrap();
+    assert_rejected(&host, &expected, &local_app_data, "other@example.invalid");
+}
+
 #[tokio::test]
 async fn native_host_stdio_roundtrip() {
     use deckpipe::{
@@ -126,6 +221,7 @@ async fn native_host_stdio_roundtrip() {
             "native-host-{}",
             deckpipe::auth_broker::random_id()
         ));
+        let local_app_data = directory.join("isolated-local-app-data");
         std::fs::create_dir_all(&directory).unwrap();
         let app = directory.join("deckpipe.exe");
         std::fs::copy(std::env::current_exe().unwrap(), &app).unwrap();
@@ -139,6 +235,7 @@ async fn native_host_stdio_roundtrip() {
             .arg("--exact")
             .arg("native_host_stdio_roundtrip")
             .env("DECKPIPE_NATIVE_TEST_INNER", "1")
+            .env("LOCALAPPDATA", &local_app_data)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -156,7 +253,13 @@ async fn native_host_stdio_roundtrip() {
     let app = std::env::current_exe().unwrap();
     let directory = app.parent().unwrap();
     let host = directory.join("deckpipe-auth-host.exe");
-    let manifest = directory.join("native-host.firefox.json");
+    let manifest = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .expect("isolated LocalAppData is required")
+        .join("DeckPipe")
+        .join("AuthHelper")
+        .join("native-host.firefox.json");
+    std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
     std::fs::write(&manifest,serde_json::to_vec(&serde_json::json!({"name":"com.deckpipe.auth","type":"stdio","path":host,"allowed_extensions":["deckpipe-auth@deckpipe.local"]})).unwrap()).unwrap();
     let mut server = native_ipc::create_server(&native_ipc::pipe_name().unwrap(), true).unwrap();
     let mut child = tokio::process::Command::new(&host)
