@@ -10,6 +10,10 @@
 
 **Spec:** ../specs/2026-09-09-windows-stages-ab-design.md and ../../release-plan-2026-09-09.md sections 1–4.
 
+## Superseding user correction — 14 September
+
+The user explicitly rejected all browser extensions and Mozilla developer registration. Authentication must use whatever external browser Windows has configured by default. The Firefox setup task below records completed historical engineering work, not the current product solution. Its candidate must not be presented as acceptance of section 4. Stop further extension packaging/promotion; the existing tested artifact remains uninstalled. Stage A and provider collection/retry work remain valid; Stage B authentication is reopened for a provider-compatible return flow without extensions. Do not silently substitute an embedded login window or claim that opening a provider login page returns its session to DeckPipe.
+
 ## Global constraints
 
 - Worktree: `D:\Claude Code\Projects\deezer-rekordbox-sync\.worktrees\release-hardening`, branch `codex/release-hardening`, starting revision `c1830776b7db9bb6aabf4439cc159216192032c9`.

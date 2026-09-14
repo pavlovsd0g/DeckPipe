@@ -11,6 +11,18 @@ $script:HostKey = 'HKCU:\Software\Mozilla\NativeMessagingHosts\com.deckpipe.auth
 function Assert-True { param([bool]$Condition, [string]$Message = 'Expected true') if (-not $Condition) { throw $Message } }
 function Assert-Equal { param($Actual, $Expected, [string]$Message = '') if ($Actual -ne $Expected) { throw "$Message Expected '$Expected', got '$Actual'" } }
 function Assert-Throws { param([scriptblock]$Body, [string]$Pattern) try { & $Body } catch { if ($_.Exception.Message -match $Pattern) { return }; throw "Expected '$Pattern', got '$($_.Exception.Message)'" }; throw "Expected error '$Pattern'" }
+function Assert-ThrowsUnauthorizedAccess {
+    param([scriptblock]$Body)
+    try { & $Body } catch {
+        $exception = $_.Exception
+        while ($null -ne $exception) {
+            if ($exception -is [UnauthorizedAccessException]) { return }
+            $exception = $exception.InnerException
+        }
+        throw "Expected UnauthorizedAccessException, got '$($_.Exception.GetType().FullName)'"
+    }
+    throw 'Expected UnauthorizedAccessException'
+}
 function It { param([string]$Name, [scriptblock]$Body) try { & $Body; $script:Passed++; Write-Host "PASS $Name" } catch { $script:Failed++; Write-Host "FAIL $Name :: $($_.Exception.Message)" } }
 
 function Install-RegistryMock {
@@ -318,7 +330,7 @@ try {
         try {
             $env:LOCALAPPDATA = $fixture.Local
             & icacls $fixture.Install /deny "${identity}:(W)" | Out-Null
-            Assert-Throws { [IO.File]::WriteAllText((Join-Path $fixture.Install 'write-probe.txt'), 'blocked') } 'access|denied'
+            Assert-ThrowsUnauthorizedAccess { [IO.File]::WriteAllText((Join-Path $fixture.Install 'write-probe.txt'), 'blocked') }
             $global:DeckPipeAuthSetupRegistry.Present = $false
             $global:DeckPipeAuthSetupRegistry.Value = $null
             & $register -InstallDirectory $fixture.Install
