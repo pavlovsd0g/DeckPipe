@@ -10,11 +10,14 @@ use tokio::sync::Mutex;
 #[derive(Clone)]
 pub struct AuthRuntime {
     broker: Arc<Mutex<Broker>>,
+    transactions: Arc<Mutex<()>>,
     client: reqwest::Client,
     base_url: String,
     launch_token: String,
     broker_token: String,
     started: Instant,
+    #[cfg(test)]
+    preparing_commit: Arc<tokio::sync::Semaphore>,
 }
 impl AuthRuntime {
     pub fn new(
@@ -30,11 +33,14 @@ impl AuthRuntime {
             .map_err(|_| "AUTH_BACKEND_UNAVAILABLE")?;
         Ok(Self {
             broker: Arc::new(Mutex::new(Broker::default())),
+            transactions: Arc::new(Mutex::new(())),
             client,
             base_url,
             launch_token,
             broker_token,
             started: Instant::now(),
+            #[cfg(test)]
+            preparing_commit: Arc::new(tokio::sync::Semaphore::new(0)),
         })
     }
     fn now(&self) -> u64 {
@@ -86,6 +92,16 @@ impl AuthRuntime {
         self.discard_later(broker.take_round());
         Ok(status)
     }
+    pub async fn cancel_provider(&self, provider: &str) -> Result<(), &'static str> {
+        provider_url(provider)?;
+        let mut broker = self.broker.lock().await;
+        let status = broker.status(None, self.now())?;
+        if status.provider == provider && status.pending() {
+            broker.cancel(&status.request_id, self.now())?;
+            self.discard_later(broker.take_round());
+        }
+        Ok(())
+    }
     pub async fn logout_with_clear<F>(
         &self,
         provider: &str,
@@ -95,14 +111,18 @@ impl AuthRuntime {
         F: Future<Output = Result<(), &'static str>>,
     {
         provider_url(provider)?;
-        // Final commit and logout are ordered on this lock. Validation I/O never
-        // owns it. Revoke first even if either persistent-store operation fails.
+        // Revoke before waiting for another provider's backend transaction.
+        // Browser maintenance never owns the broker state or transaction lock.
+        self.cancel_provider(provider).await?;
+        let transaction = self.transactions.lock().await;
         let mut broker = self.broker.lock().await;
         if broker.status(None, self.now())?.provider == provider {
             self.discard_later(broker.take_round());
             broker.logout(provider);
         }
+        drop(broker);
         let backend = self.backend("logout", json!({"provider":provider})).await;
+        drop(transaction);
         let cleared = clear.await;
         cleared?;
         backend?;
@@ -189,6 +209,11 @@ impl AuthRuntime {
                 return Err(code);
             }
         };
+        #[cfg(test)]
+        self.preparing_commit.add_permits(1);
+        // Recheck the attempt only after admission to the backend transaction.
+        // A cancel can revoke while an unrelated provider's logout is in flight.
+        let _transaction = self.transactions.lock().await;
         let mut broker = self.broker.lock().await;
         if !broker.can_commit(request, &round, self.now()) {
             self.discard_later(Some(round));
@@ -238,6 +263,9 @@ mod tests {
         commit_entered: Semaphore,
         commit_release: Semaphore,
         fail_logout: AtomicBool,
+        block_logout: AtomicBool,
+        logout_entered: Semaphore,
+        logout_release: Semaphore,
         completes: AtomicUsize,
         commits: AtomicUsize,
         operations: Mutex<Vec<(String, Value)>>,
@@ -253,6 +281,9 @@ mod tests {
             commit_entered: Semaphore::new(0),
             commit_release: Semaphore::new(0),
             fail_logout: AtomicBool::new(false),
+            block_logout: AtomicBool::new(false),
+            logout_entered: Semaphore::new(0),
+            logout_release: Semaphore::new(0),
             completes: AtomicUsize::new(0),
             commits: AtomicUsize::new(0),
             operations: Mutex::new(Vec::new()),
@@ -339,6 +370,13 @@ mod tests {
                         "logout" if server.fail_logout.load(Ordering::SeqCst) => {
                             code = "500 Internal Server Error";
                             json!({})
+                        }
+                        "logout" => {
+                            server.logout_entered.add_permits(1);
+                            if server.block_logout.load(Ordering::SeqCst) {
+                                server.logout_release.acquire().await.unwrap().forget();
+                            }
+                            json!({"ok":true})
                         }
                         "status" => {
                             json!({"accounts":{"sc":{"connected":true,"account":{"id":"safe","name":"Safe","credential":"synthetic-sentinel"},"token":"synthetic-sentinel"}}})
@@ -549,5 +587,111 @@ mod tests {
             .position(|(op, _)| op == "logout")
             .unwrap();
         assert!(commit < logout);
+    }
+
+    async fn cancel_during_other_profile_cleanup(main_command: bool) {
+        let (runtime, server) = fixture(true).await;
+        let (request, validation) = start_validation(&runtime).await;
+        server.entered.acquire().await.unwrap().forget();
+        let browser = crate::auth_browser::AuthBrowser::new(runtime.clone()).unwrap();
+        let clear_entered = Arc::new(Semaphore::new(0));
+        let clear_release = Arc::new(Semaphore::new(0));
+        let entered = clear_entered.clone();
+        let release = clear_release.clone();
+        let cleaning_browser = browser.clone();
+        let cleanup = tokio::spawn(async move {
+            // This is the same lifecycle coordinator called by the Tauri logout
+            // command; only actual window destruction and native clear are fake.
+            cleaning_browser
+                .logout_with_cleanup("deezer", async { Ok(()) }, async move {
+                    entered.add_permits(1);
+                    release.acquire().await.unwrap().forget();
+                    Ok(())
+                })
+                .await
+        });
+        clear_entered.acquire().await.unwrap().forget();
+        let auth = runtime.clone();
+        let closed = Arc::new(AtomicBool::new(false));
+        let close_marker = closed.clone();
+        let mut cancellation = tokio::spawn(async move {
+            if main_command {
+                // Same method and lock ordering as AuthBrowser::cancel, with
+                // just its request-specific destroy side effect substituted.
+                browser
+                    .cancel_with_close(&request, || close_marker.store(true, Ordering::SeqCst))
+                    .await
+            } else {
+                // Native CloseRequested/Destroyed callbacks call this path.
+                auth.cancel(&request).await
+            }
+        });
+        let prompt = tokio::time::timeout(Duration::from_millis(200), &mut cancellation)
+            .await
+            .ok();
+        // Deliver prepare after cancellation was requested, while other-profile
+        // clear is still held. Signal at native commit authorization makes the
+        // old lifecycle/broker FIFO race deterministic rather than a sleep race.
+        server.release.add_permits(1);
+        runtime.preparing_commit.acquire().await.unwrap().forget();
+        clear_release.add_permits(1);
+        cleanup.await.unwrap().unwrap();
+        let returned_promptly = prompt.is_some();
+        let cancelled = match prompt {
+            Some(result) => result.unwrap().unwrap(),
+            None => cancellation.await.unwrap().unwrap(),
+        };
+        let result = validation.await.unwrap();
+        assert_eq!(
+            server.commits.load(Ordering::SeqCst),
+            0,
+            "cleanup must not admit a completion after cancellation was requested"
+        );
+        assert!(
+            returned_promptly,
+            "cancellation waited for unrelated profile clear"
+        );
+        assert_eq!(cancelled.status, "cancelled");
+        assert!(result.is_err());
+        assert_eq!(closed.load(Ordering::SeqCst), main_command);
+    }
+
+    #[tokio::test]
+    async fn main_cancel_bypasses_delayed_other_provider_cleanup() {
+        cancel_during_other_profile_cleanup(true).await;
+    }
+
+    #[tokio::test]
+    async fn window_close_bypasses_delayed_other_provider_cleanup() {
+        cancel_during_other_profile_cleanup(false).await;
+    }
+
+    #[tokio::test]
+    async fn queued_completion_rechecks_cancel_after_other_backend_logout() {
+        let (runtime, server) = fixture(true).await;
+        let (request, validation) = start_validation(&runtime).await;
+        server.entered.acquire().await.unwrap().forget();
+        server.block_logout.store(true, Ordering::SeqCst);
+        let browser = crate::auth_browser::AuthBrowser::new(runtime.clone()).unwrap();
+        let cleaning = browser.clone();
+        let cleanup = tokio::spawn(async move {
+            cleaning
+                .logout_with_cleanup("deezer", async { Ok(()) }, async { Ok(()) })
+                .await
+        });
+        server.logout_entered.acquire().await.unwrap().forget();
+        server.release.add_permits(1);
+        // Completion is now queued behind backend logout, before cancellation.
+        runtime.preparing_commit.acquire().await.unwrap().forget();
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(200),
+            browser.cancel_with_close(&request, || {}),
+        )
+        .await;
+        server.logout_release.add_permits(1);
+        cleanup.await.unwrap().unwrap();
+        assert_eq!(cancelled.unwrap().unwrap().status, "cancelled");
+        assert!(validation.await.unwrap().is_err());
+        assert_eq!(server.commits.load(Ordering::SeqCst), 0);
     }
 }

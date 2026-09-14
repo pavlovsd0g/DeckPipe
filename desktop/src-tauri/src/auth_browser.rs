@@ -303,11 +303,22 @@ impl AuthBrowser {
         app: tauri::AppHandle,
         request: &str,
     ) -> Result<PublicStatus, &'static str> {
-        let _operation = self.lifecycle.lock().await;
+        self.cancel_with_close(request, || {
+            if let Some(window) = app.get_webview_window(&format!("auth-{request}")) {
+                let _ = window.destroy();
+            }
+        })
+        .await
+    }
+    pub(crate) async fn cancel_with_close(
+        &self,
+        request: &str,
+        close: impl FnOnce(),
+    ) -> Result<PublicStatus, &'static str> {
+        // Request-specific close cannot interfere with a replacement window;
+        // cancellation must not wait for another profile's maintenance lock.
         let status = self.auth.cancel(request).await?;
-        if let Some(window) = app.get_webview_window(&format!("auth-{request}")) {
-            let _ = window.destroy();
-        }
+        close();
         Ok(status)
     }
     pub async fn logout(
@@ -316,6 +327,31 @@ impl AuthBrowser {
         provider: &str,
     ) -> Result<PublicStatus, &'static str> {
         let profile = profile_directory(&self.local_app_data, provider)?;
+        self.logout_with_cleanup(provider, Self::destroy_attempt_windows(&app), async {
+            let window = persistent_window(
+                app.clone(),
+                format!("auth-clear-{}", crate::auth_broker::random_id()),
+                profile,
+                "about:blank".parse().unwrap(),
+                Arc::new(|u| u.as_str() == "about:blank"),
+                Arc::new(|| {}),
+                false,
+            )
+            .await
+            .map_err(|_| "AUTH_BROWSER_CLEAR_FAILED")?;
+            let cleared = clear_browser_data(&window).await;
+            let closed = window.destroy().map_err(|_| "AUTH_BROWSER_CLEAR_FAILED");
+            cleared.and(closed)
+        })
+        .await
+    }
+    pub(crate) async fn logout_with_cleanup(
+        &self,
+        provider: &str,
+        stop: impl std::future::Future<Output = Result<(), &'static str>>,
+        clear: impl std::future::Future<Output = Result<(), &'static str>>,
+    ) -> Result<PublicStatus, &'static str> {
+        self.auth.cancel_provider(provider).await?;
         let _operation = self.lifecycle.lock().await;
         let status = self.auth.status(None).await?;
         // Only the selected service's window is stopped; the other service and
@@ -324,25 +360,8 @@ impl AuthBrowser {
             if status.pending() {
                 self.auth.cancel(&status.request_id).await?;
             }
-            Self::destroy_attempt_windows(&app).await?;
+            stop.await?;
         }
-        self.auth
-            .logout_with_clear(provider, async move {
-                let window = persistent_window(
-                    app,
-                    format!("auth-clear-{}", crate::auth_broker::random_id()),
-                    profile,
-                    "about:blank".parse().unwrap(),
-                    Arc::new(|u| u.as_str() == "about:blank"),
-                    Arc::new(|| {}),
-                    false,
-                )
-                .await
-                .map_err(|_| "AUTH_BROWSER_CLEAR_FAILED")?;
-                let cleared = clear_browser_data(&window).await;
-                let closed = window.destroy().map_err(|_| "AUTH_BROWSER_CLEAR_FAILED");
-                cleared.and(closed)
-            })
-            .await
+        self.auth.logout_with_clear(provider, clear).await
     }
 }
