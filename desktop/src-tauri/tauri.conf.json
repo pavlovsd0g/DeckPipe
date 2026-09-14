@@ -30,10 +30,6 @@
     ],
     "externalBin": [
       "binaries/deckpipe-backend"
-    ],
-    "resources": {
-      "../../release/auth-helper/": "auth-helper/",
-      "../../extension/": "auth-helper/extension/"
-    }
+    ]
   }
 }

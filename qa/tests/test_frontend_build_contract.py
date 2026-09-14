@@ -418,9 +418,10 @@ class FrontendBuildContractTests(unittest.TestCase):
         source = read_text(FRONTEND / "app.js")
         self.assertIn("from '@tauri-apps/api/core'", source)
         self.assertRegex(js, r"invoke\([\"']backend_connection[\"']\)")
-        for command in ["auth_begin", "auth_status", "auth_cancel", "auth_logout", "auth_open_setup"]:
+        for command in ["auth_begin", "auth_status", "auth_cancel", "auth_logout"]:
             self.assertRegex(js, rf"invoke\([\"']{command}[\"']")
         self.assertNotRegex(js, r"invoke\([\"']service_login[\"']")
+        self.assertNotIn("auth_open_setup", js)
         self.assertIn("Authorization", js)
         self.assertIn("Bearer ${connection.token}", js)
         self.assertNotIn("window.__TAURI__", js)

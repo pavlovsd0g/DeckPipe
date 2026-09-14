@@ -113,7 +113,8 @@ class DesktopContractTests(unittest.TestCase):
 
         login_permission = read_text(TAURI / "permissions" / "auth-broker.toml")
         backend_permission = read_text(TAURI / "permissions" / "backend-connection.toml")
-        self.assertIn('"auth_begin", "auth_status", "auth_cancel", "auth_logout", "auth_open_setup"', login_permission)
+        self.assertIn('"auth_begin", "auth_status", "auth_cancel", "auth_logout"', login_permission)
+        self.assertNotIn('auth_open_setup', login_permission)
         self.assertNotIn('service_login', login_permission)
         self.assertIn('commands = { allow = ["backend_connection"] }', backend_permission)
 

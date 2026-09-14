@@ -671,14 +671,6 @@ function Invoke-ReleaseBuild {
             [IO.Directory]::CreateDirectory($sidecarDir) | Out-Null
             Copy-Item -LiteralPath (Join-Path $plan.PyInstallerDistPath 'deckpipe-backend.exe') -Destination (Join-Path $sidecarDir 'deckpipe-backend-x86_64-pc-windows-msvc.exe') -Force
 
-            # git archive excludes generated externalBin files. Bootstrap the
-            # native host from this same exported revision before Tauri bundles it.
-            $helperBuild = Join-Path $plan.SourceRoot 'release\auth-helper\Build-AuthHelper.ps1'
-            & $helperBuild -SourceRoot $plan.SourceRoot -TargetDirectory $plan.CargoTargetDir -Release
-            if (-not (Test-Path -LiteralPath (Join-Path $sidecarDir 'deckpipe-auth-host-x86_64-pc-windows-msvc.exe') -PathType Leaf)) {
-                throw 'build failed: native auth helper was not produced in exported source'
-            }
-
             Push-Location $plan.SourceRoot
             try {
                 & npm ci --offline

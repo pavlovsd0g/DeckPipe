@@ -47,7 +47,7 @@ try { await api('/api/playlists'); throw new Error('expected failure'); }
 catch(error) { if(error.message!=='Сервис недоступен') throw new Error('structured error rendered as object'); }
 ''')
 
-    def test_native_browser_auth_never_returns_credentials_to_api_login(self):
+    def test_embedded_browser_auth_never_returns_credentials_to_api_login(self):
         self.run_probe(r'''
 const calls = [];
 globalThis.__invokeImpl = async (name,body) => {calls.push({name,body}); return {requestId:'fixture',provider:'sc',status:'connected',account:{id:'1',name:'Test user'}};};
@@ -56,8 +56,8 @@ globalThis.fetch = async url => {
   return {ok:true,json:async()=>({music_root:'',music_root_configured:false,sc_user:'Test user'})};
 };
 await tauriLogin('sc');
-if(calls[0].name!=='auth_begin'||calls[0].body.provider!=='sc') throw new Error('default-browser broker not used');
-if(calls.some(call=>call.name==='service_login')) throw new Error('embedded auth still used');
+if(calls[0].name!=='auth_begin'||calls[0].body.provider!=='sc') throw new Error('embedded browser broker not used');
+if(calls.some(call=>call.name==='service_login')) throw new Error('raw credential login API used');
 ''')
 
     def test_native_pending_state_keeps_polling(self):
@@ -67,6 +67,159 @@ globalThis.setTimeout=()=>{scheduled++;return 1;};
 globalThis.__invokeImpl=async()=>({requestId:'pending-1',provider:'deezer',status:'waiting_browser'});
 await tauriLogin('deezer');
 if(activeAuthRequest!=='pending-1'||scheduled!==1) throw new Error('native waiting state was treated as terminal');
+''')
+
+    def test_cancelled_attempt_stops_polling_and_uses_one_cancel_command(self):
+        self.run_probe(r'''
+let scheduled;
+let clearCount=0;
+const calls=[];
+globalThis.setTimeout=callback=>{scheduled=callback;return 73;};
+globalThis.clearTimeout=()=>{clearCount++;};
+globalThis.__invokeImpl=async(name,body)=>{
+  calls.push({name,body});
+  if(name==='auth_begin') return {requestId:'cancel-1',provider:'deezer',status:'waiting_browser'};
+  if(name==='auth_status') throw new Error('cancelled attempt polled again');
+  return {};
+};
+await tauriLogin('deezer');
+closeLogin();
+await Promise.resolve();
+if(calls.filter(call=>call.name==='auth_cancel').length!==1) throw new Error('cancel command was not invoked exactly once');
+if(clearCount!==1) throw new Error('cancelled attempt left its polling timer active');
+await scheduled();
+if(calls.some(call=>call.name==='auth_status')) throw new Error('late timer polled a cancelled attempt');
+''')
+
+    def test_embedded_popup_notice_stays_nonterminal(self):
+        self.run_probe(r'''
+let scheduled=0;
+globalThis.setTimeout=()=>{scheduled++;return 1;};
+globalThis.__invokeImpl=async()=>({requestId:'popup-1',provider:'deezer',status:'waiting_browser',errorCode:'AUTH_POPUP_BLOCKED'});
+await tauriLogin('deezer');
+const message=$('#loginResult').textContent;
+if(!message.includes('во всплывающем окне недоступен')) throw new Error('popup policy notice missing');
+if(message.includes('не удалось')) throw new Error('popup policy was rendered as terminal failure');
+if(scheduled!==1||activeAuthRequest!=='popup-1') throw new Error('popup policy stopped a pending attempt');
+''')
+
+    def test_transient_prepare_failure_retries_with_a_fresh_begin(self):
+        self.run_probe(r'''
+const calls=[];
+let begin=0;
+globalThis.setTimeout=()=>1;
+globalThis.__invokeImpl=async(name,body)=>{
+  calls.push({name,body});
+  if(name==='auth_begin') return {requestId:`retry-${++begin}`,provider:'sc',status:'waiting_browser',errorCode:'AUTH_BACKEND_UNAVAILABLE'};
+  return {};
+};
+await tauriLogin('sc');
+if($('#btnAuthRetry').classList.contains('hidden')) throw new Error('retry remains hidden after transient preparation failure');
+await retryAuthLogin();
+if(calls.filter(call=>call.name==='auth_begin').length!==2) throw new Error('retry did not start a fresh embedded attempt');
+if(activeAuthRequest!=='retry-2') throw new Error('retry did not replace the active attempt');
+''')
+
+    def test_late_cancelled_attempt_cannot_replace_new_account_state(self):
+        self.run_probe(r'''
+let resolveOld;
+const oldResult=new Promise(resolve=>{resolveOld=resolve;});
+globalThis.setTimeout=()=>1;
+globalThis.__invokeImpl=async(name,body)=>{
+  if(name!=='auth_begin') return {};
+  if(body.provider==='deezer') return oldResult;
+  return {requestId:'sc-new',provider:'sc',status:'waiting_browser'};
+};
+const oldLogin=tauriLogin('deezer');
+await Promise.resolve();
+await tauriLogin('sc');
+resolveOld({requestId:'dz-old',provider:'deezer',status:'connected',account:{name:'Stale Deezer'}});
+await oldLogin;
+if(activeAuthRequest!=='sc-new') throw new Error('late response replaced active request');
+if($('#loginResult').textContent.includes('Stale Deezer')) throw new Error('late response rendered a connected stale account');
+''')
+
+    def test_late_open_login_status_cannot_reopen_a_closed_dialog(self):
+        self.run_probe(r'''
+let resolveStatus;
+const pendingStatus=new Promise(resolve=>{resolveStatus=resolve;});
+globalThis.__invokeImpl=async(name,body)=>{
+  if(name==='auth_status'&&body.requestId===null) return pendingStatus;
+  return {};
+};
+const opening=openLogin('deezer');
+closeLogin();
+resolveStatus({accounts:{deezer:{connected:true,account:{name:'Late Deezer'}}}});
+await opening;
+if(!$('#modalOverlay').classList.contains('hidden')) throw new Error('late account status reopened a closed dialog');
+''')
+
+    def test_late_open_login_status_cannot_replace_a_new_provider_dialog(self):
+        self.run_probe(r'''
+let resolveStatus;
+const pendingStatus=new Promise(resolve=>{resolveStatus=resolve;});
+globalThis.__invokeImpl=async(name,body)=>{
+  if(name==='auth_status'&&body.requestId===null) return pendingStatus;
+  return {};
+};
+const opening=openLogin('deezer');
+await Promise.resolve();
+renderLoginDialog('sc');
+authAttemptEpoch++;
+resolveStatus({accounts:{deezer:{connected:true,account:{name:'Late Deezer'}}}});
+await opening;
+if($('#loginTitle').textContent.includes('Deezer')) throw new Error('late account status replaced the newer provider dialog');
+''')
+
+    def test_late_begin_response_after_close_cannot_render_connected(self):
+        self.run_probe(r'''
+let resolveBegin;
+const pendingBegin=new Promise(resolve=>{resolveBegin=resolve;});
+globalThis.setTimeout=()=>1;
+globalThis.__invokeImpl=async(name)=>name==='auth_begin'
+  ? pendingBegin
+  : {};
+const starting=tauriLogin('deezer');
+await Promise.resolve();
+closeLogin();
+resolveBegin({requestId:'late-close',provider:'deezer',status:'connected',account:{name:'Late Deezer'}});
+await starting;
+if($('#loginResult').textContent.includes('Late Deezer')) throw new Error('late begin response rendered a closed dialog as connected');
+if(!$('#modalOverlay').classList.contains('hidden')) throw new Error('late begin response reopened the dialog');
+''')
+
+    def test_change_account_forgets_selected_session_before_new_begin(self):
+        self.run_probe(r'''
+const calls=[];
+globalThis.setTimeout=()=>1;
+loginService='sc';
+nativeAccounts={sc:{connected:true,account:{name:'Old SC'}}};
+globalThis.__invokeImpl=async(name,body)=>{
+  calls.push({name,body});
+  if(name==='auth_begin') return {requestId:'sc-new',provider:'sc',status:'waiting_browser'};
+  return {};
+};
+await changeAuthAccount();
+const logout=calls.findIndex(call=>call.name==='auth_logout');
+const begin=calls.findIndex(call=>call.name==='auth_begin');
+if(logout<0||begin<0||logout>begin) throw new Error('account switch did not forget the selected session before a new login');
+if(calls[logout].body.provider!=='sc') throw new Error('account switch forgot another provider');
+''')
+
+    def test_change_account_surfaces_forget_failure_without_starting_new_login(self):
+        self.run_probe(r'''
+const calls=[];
+loginService='sc';
+nativeAccounts={sc:{connected:true,account:{name:'Old SC'}}};
+globalThis.__invokeImpl=async(name,body)=>{
+  calls.push({name,body});
+  if(name==='auth_logout') throw new Error('AUTH_BROWSER_CLEAR_FAILED');
+  if(name==='auth_begin') throw new Error('new login must not start after forget failure');
+  return {};
+};
+await changeAuthAccount();
+if(!$('#errorRegion').textContent.includes('Не удалось выйти и забыть вход')) throw new Error('forget failure was hidden behind a generic action rejection');
+if(calls.some(call=>call.name==='auth_begin')) throw new Error('new login started after forget failure');
 ''')
 
     def test_partial_remote_write_is_visible_separately_from_download(self):

@@ -16,6 +16,7 @@ let libraryReady = false;
 let libraryPollGeneration = 0;
 let activeAuthRequest = null;
 let authPollTimer = null;
+let authAttemptEpoch = 0;
 let nativeAccounts = {};
 
 const $ = s => document.querySelector(s);
@@ -309,12 +310,8 @@ function openDialog(initialFocus) {
   target.focus();
 }
 
-function closeLogin() {
-  if (authPollTimer) clearTimeout(authPollTimer);
-  authPollTimer = null;
-  const requestId = activeAuthRequest;
-  activeAuthRequest = null;
-  if (requestId) invoke('auth_cancel', {requestId}).catch(error => showError(error, 'security'));
+function closeLogin({cancel = true} = {}) {
+  if (cancel) cancelAuthAttempt().catch(error => showError(error, 'security'));
   setHidden($('#modalOverlay'), true);
   releaseDialogFocus();
 }
@@ -347,13 +344,28 @@ async function loadConfig() {
 }
 
 async function openLogin(service) {
+  const epoch = authAttemptEpoch + 1;
+  const previousRequest = activeAuthRequest;
+  authAttemptEpoch = epoch;
+  activeAuthRequest = null;
+  clearAuthPoll();
   loginService = service;
   clearError();
+  if (previousRequest) {
+    try {
+      await invoke('auth_cancel', {requestId: previousRequest});
+    } catch (error) {
+      if (epoch === authAttemptEpoch) showError(error, 'security');
+      return;
+    }
+  }
+  if (epoch !== authAttemptEpoch) return;
   if (!isPackagedAppOrigin()) {
     showError(new Error('Вход через браузер доступен в приложении DeckPipe для Windows.'), 'security');
     return;
   }
   const state = await invoke('auth_status', {requestId: null});
+  if (epoch !== authAttemptEpoch) return;
   nativeAccounts = state.accounts || {};
   const account = nativeAccounts[service];
   if (!account?.connected) return tauriLogin(service);
@@ -370,66 +382,142 @@ function renderLoginDialog(service) {
   setResultState(null);
   setHidden($('#scImport'), true);
   setHidden($('#btnLogout'), !nativeAccounts[service]?.connected);
+  setHidden($('#btnChangeAccount'), !nativeAccounts[service]?.connected);
+  setHidden($('#btnAuthRetry'), true);
   replaceChildren($('#loginSteps'), [
-    create('p', {text: 'Войдите на сайте сервиса в обычном браузере, затем нажмите «Подключить к DeckPipe» в браузерном помощнике.'}),
-    create('p', {className: 'dim', text: 'При первом подключении установите помощник по инструкции. Пароль вводится только на сайте сервиса.'}),
+    create('p', {text: 'DeckPipe откроет отдельное окно входа. Войдите на странице сервиса в этом окне.'}),
+    create('p', {className: 'dim', text: 'DeckPipe помнит только собственную сессию входа; первая авторизация не использует вход из обычного браузера. Пароль вводится только на сайте сервиса.'}),
   ]);
   openDialog($('#btnAuthStart'));
 }
 
+function clearAuthPoll() {
+  if (authPollTimer) clearTimeout(authPollTimer);
+  authPollTimer = null;
+}
+
+async function cancelAuthAttempt() {
+  const requestId = activeAuthRequest;
+  activeAuthRequest = null;
+  authAttemptEpoch += 1;
+  clearAuthPoll();
+  if (requestId) await invoke('auth_cancel', {requestId});
+}
+
 async function tauriLogin(service) {
   try {
-    if (activeAuthRequest) await invoke('auth_cancel', {requestId: activeAuthRequest});
-    if (authPollTimer) clearTimeout(authPollTimer);
-    activeAuthRequest = null;
+    const epoch = authAttemptEpoch + 1;
+    await cancelAuthAttempt();
+    if (epoch !== authAttemptEpoch) return;
     renderLoginDialog(service);
     const state = await invoke('auth_begin', {provider: service});
+    if (epoch !== authAttemptEpoch) {
+      if (state?.requestId) await invoke('auth_cancel', {requestId: state.requestId});
+      return;
+    }
     activeAuthRequest = state.requestId;
-    await renderAuthState(state);
+    await renderAuthState(state, epoch);
   } catch (error) {
     if (!isLoginCancelled(error)) showError(error, 'security');
   }
 }
 
-async function renderAuthState(state) {
+function waitingAuthNotice(state) {
+  if (state.status === 'validating') return 'Проверяем вход…';
+  const notices = {
+    AUTH_POPUP_BLOCKED: 'Вход во всплывающем окне недоступен. Продолжите вход на странице сервиса в окне DeckPipe.',
+    AUTH_PROVIDER_REJECTED: 'Сервис не принял вход. Войдите снова в этом же окне.',
+    AUTH_BACKEND_UNAVAILABLE: 'Проверка входа временно недоступна. Повторите попытку.',
+    AUTH_INVALID_RESPONSE: 'Сервис вернул неполный ответ. Повторите попытку.',
+  };
+  return notices[state.errorCode] || 'Ожидаем вход в окне DeckPipe…';
+}
+
+function canRetryAuth(state) {
+  return state.status === 'waiting_browser' && ['AUTH_BACKEND_UNAVAILABLE', 'AUTH_INVALID_RESPONSE'].includes(state.errorCode);
+}
+
+async function renderAuthState(state, epoch = authAttemptEpoch) {
+  if (epoch !== authAttemptEpoch || (state.requestId && state.requestId !== activeAuthRequest)) return;
   if (state.status === 'connected') {
     activeAuthRequest = null;
+    clearAuthPoll();
     setResultState('ok');
     $('#loginResult').textContent = `Подключён: ${state.account?.name || provLabel(state.provider)}`;
     setHidden($('#btnLogout'), false);
+    setHidden($('#btnChangeAccount'), false);
+    setHidden($('#btnAuthRetry'), true);
     showStatus($('#loginResult').textContent);
     await loadConfig();
     if (libraryConfigured) await loadPlaylists();
     return;
   }
-  if (!['waiting_browser', 'waiting_helper', 'validating'].includes(state.status)) {
+  if (!['waiting_browser', 'validating'].includes(state.status)) {
     activeAuthRequest = null;
+    clearAuthPoll();
     setResultState('error');
-    $('#loginResult').textContent = ({expired: 'Время входа истекло. Откройте браузер снова.', cancelled: 'Вход отменён.', failed: 'Вход не завершён. Повторите подключение.'})[state.status] || 'Вход не завершён. Повторите подключение.';
+    setHidden($('#btnAuthRetry'), true);
+    $('#loginResult').textContent = ({
+      expired: 'Время входа истекло. Откройте окно входа снова.',
+      cancelled: 'Вход отменён.',
+      failed: ({
+        AUTH_BROWSER_UNAVAILABLE: 'Не удалось открыть окно входа DeckPipe.',
+        AUTH_PROFILE_UNAVAILABLE: 'Не удалось подготовить профиль входа DeckPipe.',
+        AUTH_BROWSER_CLEAR_FAILED: 'Не удалось очистить сохранённый вход.',
+      })[state.errorCode] || 'Вход не завершён. Повторите подключение.',
+    })[state.status] || 'Вход не завершён. Повторите подключение.';
     return;
   }
-  $('#loginResult').textContent = state.status === 'validating' ? 'Проверяем подключение…' : 'Ожидаем подключение из браузера…';
+  setResultState(null);
+  $('#loginResult').textContent = waitingAuthNotice(state);
+  setHidden($('#btnAuthRetry'), !canRetryAuth(state));
   const requestId = activeAuthRequest;
+  clearAuthPoll();
   authPollTimer = setTimeout(async () => {
-    if (!requestId || requestId !== activeAuthRequest) return;
+    if (!requestId || epoch !== authAttemptEpoch || requestId !== activeAuthRequest) return;
     try {
       const next = await invoke('auth_status', {requestId});
-      if (requestId === activeAuthRequest) await renderAuthState(next);
-    } catch (error) { activeAuthRequest = null; showError(error, 'security'); }
+      if (epoch === authAttemptEpoch && requestId === activeAuthRequest) await renderAuthState(next, epoch);
+    } catch (error) {
+      if (epoch === authAttemptEpoch && requestId === activeAuthRequest) {
+        activeAuthRequest = null;
+        showError(error, 'security');
+      }
+    }
   }, 1000);
 }
 
+async function retryAuthLogin() {
+  await tauriLogin(loginService);
+}
+
+async function forgetAuthSession(service) {
+  try {
+    await cancelAuthAttempt();
+    await invoke('auth_logout', {provider: service});
+  } catch {
+    showError(new Error(`Не удалось выйти и забыть вход ${provLabel(service)}. Повторите попытку.`), 'security');
+    return false;
+  }
+  nativeAccounts[service] = {connected: false};
+  return true;
+}
+
 async function logoutProvider() {
-  if (activeAuthRequest) await invoke('auth_cancel', {requestId: activeAuthRequest});
-  activeAuthRequest = null;
-  if (authPollTimer) clearTimeout(authPollTimer);
-  await invoke('auth_logout', {provider: loginService});
+  const service = loginService;
+  if (!await forgetAuthSession(service)) return;
   current = null;
   tracks = [];
-  closeLogin();
+  closeLogin({cancel: false});
   await loadConfig();
-  showStatus(`Аккаунт ${provLabel(loginService)} отключён. Музыка сохранена на диске.`);
+  showStatus(`Аккаунт ${provLabel(service)} отключён. Музыка сохранена на диске.`);
   if (libraryConfigured) await loadPlaylists();
+}
+
+async function changeAuthAccount() {
+  const service = loginService;
+  if (!await forgetAuthSession(service)) return;
+  await tauriLogin(service);
 }
 
 async function loadScAccount() {
@@ -1347,8 +1435,9 @@ const clickActions = Object.freeze({
   'overlay-close': (el, event) => { if (event.target === el) closeLogin(); },
   'close-login': () => closeLogin(),
   'do-login': () => tauriLogin(loginService),
-  'auth-setup': () => invoke('auth_open_setup'),
+  'retry-login': () => retryAuthLogin(),
   'logout-provider': () => logoutProvider(),
+  'change-auth-account': () => changeAuthAccount(),
   'import-sc-account': () => importScAccount(),
   'select-playlist': el => selectPlaylist(el.dataset.id, el.dataset.title),
   'select-sc-source': el => selectScSource(el.dataset.id, el.dataset.title),

@@ -96,9 +96,10 @@
     </div>
     <div id="loginSteps"></div>
     <div class="login-actions">
-      <button id="btnAuthStart" type="button" data-action="do-login">Открыть браузер</button>
-      <button class="ghost" type="button" data-action="auth-setup">Подключить браузер</button>
-      <button id="btnLogout" class="ghost hidden" type="button" data-action="logout-provider">Отключить аккаунт</button>
+      <button id="btnAuthStart" type="button" data-action="do-login">Открыть окно входа</button>
+      <button id="btnAuthRetry" class="ghost hidden" type="button" data-action="retry-login">Повторить попытку</button>
+      <button id="btnChangeAccount" class="ghost hidden" type="button" data-action="change-auth-account">Сменить аккаунт</button>
+      <button id="btnLogout" class="ghost hidden" type="button" data-action="logout-provider">Выйти и забыть вход</button>
       <span id="loginResult" aria-live="polite"></span>
     </div>
     <div id="scImport" class="hidden">
