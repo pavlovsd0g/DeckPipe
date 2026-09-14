@@ -271,6 +271,147 @@ if(!$('#errorRegion').textContent.includes('Не удалось выйти и з
 if(calls.some(call=>call.name==='auth_begin')) throw new Error('new login started after forget failure');
 ''')
 
+    def test_delayed_account_switch_completion_after_close_does_not_reopen_login(self):
+        self.run_probe(r'''
+const calls=[];
+let releaseLogout;
+let logoutStarted;
+const delayedLogout=new Promise(resolve=>{releaseLogout=resolve;});
+const started=new Promise(resolve=>{logoutStarted=resolve;});
+loginService='sc';
+nativeAccounts={sc:{connected:true,account:{name:'Old SC'}}};
+renderLoginDialog('sc');
+globalThis.__invokeImpl=async(name,body)=>{
+  calls.push({name,body});
+  if(name==='auth_logout') { logoutStarted(); return delayedLogout; }
+  if(name==='auth_begin') return {requestId:'new-'+body.provider,provider:body.provider,status:'waiting_browser'};
+  return {};
+};
+const switching=changeAuthAccount();
+await started;
+closeLogin();
+releaseLogout({});
+await switching;
+if(!$('#modalOverlay').classList.contains('hidden')) throw new Error('closed switch reopened the dialog');
+if(calls.some(call=>call.name==='auth_begin')) throw new Error('closed switch began an obsolete provider login');
+''')
+
+    def test_delayed_account_switch_completion_cannot_cancel_or_replace_new_provider(self):
+        self.run_probe(r'''
+const calls=[];
+let releaseLogout;
+let logoutStarted;
+const delayedLogout=new Promise(resolve=>{releaseLogout=resolve;});
+const started=new Promise(resolve=>{logoutStarted=resolve;});
+globalThis.setTimeout=()=>1;
+loginService='sc';
+nativeAccounts={sc:{connected:true,account:{name:'Old SC'}}};
+renderLoginDialog('sc');
+globalThis.__invokeImpl=async(name,body)=>{
+  calls.push({name,body});
+  if(name==='auth_logout') { logoutStarted(); return delayedLogout; }
+  if(name==='auth_begin') return {requestId:'new-'+body.provider,provider:body.provider,status:'waiting_browser'};
+  return {};
+};
+const switching=changeAuthAccount();
+await started;
+closeLogin();
+await tauriLogin('deezer');
+releaseLogout({});
+await switching;
+if(activeAuthRequest!=='new-deezer') throw new Error('old switch replaced the newer request');
+if(calls.some(call=>call.name==='auth_cancel'&&call.body.requestId==='new-deezer')) throw new Error('old switch cancelled the newer request');
+if(calls.filter(call=>call.name==='auth_begin').some(call=>call.body.provider==='sc')) throw new Error('old switch restarted SC after Deezer replacement');
+''')
+
+    def test_delayed_logout_completion_cannot_close_new_provider_dialog(self):
+        self.run_probe(r'''
+const calls=[];
+let releaseLogout;
+let logoutStarted;
+const delayedLogout=new Promise(resolve=>{releaseLogout=resolve;});
+const started=new Promise(resolve=>{logoutStarted=resolve;});
+globalThis.setTimeout=()=>1;
+loadConfig=async()=>({});
+loadPlaylists=async()=>{};
+libraryConfigured=false;
+loginService='sc';
+nativeAccounts={sc:{connected:true,account:{name:'Old SC'}}};
+renderLoginDialog('sc');
+globalThis.__invokeImpl=async(name,body)=>{
+  calls.push({name,body});
+  if(name==='auth_logout') { logoutStarted(); return delayedLogout; }
+  if(name==='auth_begin') return {requestId:'new-'+body.provider,provider:body.provider,status:'waiting_browser'};
+  return {};
+};
+const loggingOut=logoutProvider();
+await started;
+closeLogin();
+await tauriLogin('deezer');
+releaseLogout({});
+await loggingOut;
+if($('#modalOverlay').classList.contains('hidden')) throw new Error('old logout closed the newer Deezer dialog');
+if(activeAuthRequest!=='new-deezer') throw new Error('old logout replaced the newer request');
+''')
+
+    def test_delayed_forget_failure_after_replacement_is_silent_and_does_not_restart_old_provider(self):
+        self.run_probe(r'''
+const calls=[];
+let rejectLogout;
+let logoutStarted;
+const delayedLogout=new Promise((resolve,reject)=>{rejectLogout=reject;});
+const started=new Promise(resolve=>{logoutStarted=resolve;});
+globalThis.setTimeout=()=>1;
+loginService='sc';
+nativeAccounts={sc:{connected:true,account:{name:'Old SC'}}};
+renderLoginDialog('sc');
+clearError();
+globalThis.__invokeImpl=async(name,body)=>{
+  calls.push({name,body});
+  if(name==='auth_logout') { logoutStarted(); return delayedLogout; }
+  if(name==='auth_begin') return {requestId:'new-'+body.provider,provider:body.provider,status:'waiting_browser'};
+  return {};
+};
+const switching=changeAuthAccount();
+await started;
+closeLogin();
+await tauriLogin('deezer');
+rejectLogout(new Error('AUTH_BROWSER_CLEAR_FAILED'));
+await switching;
+if($('#errorRegion').textContent) throw new Error('stale forget failure was rendered over the new provider');
+if(calls.filter(call=>call.name==='auth_begin').some(call=>call.body.provider==='sc')) throw new Error('stale forget failure restarted SC');
+if(activeAuthRequest!=='new-deezer') throw new Error('stale forget failure replaced the newer request');
+''')
+
+    def test_delayed_logout_failure_after_replacement_does_not_hide_new_dialog_or_error(self):
+        self.run_probe(r'''
+const calls=[];
+let rejectLogout;
+let logoutStarted;
+const delayedLogout=new Promise((resolve,reject)=>{rejectLogout=reject;});
+const started=new Promise(resolve=>{logoutStarted=resolve;});
+globalThis.setTimeout=()=>1;
+loginService='sc';
+nativeAccounts={sc:{connected:true,account:{name:'Old SC'}}};
+renderLoginDialog('sc');
+clearError();
+globalThis.__invokeImpl=async(name,body)=>{
+  calls.push({name,body});
+  if(name==='auth_logout') { logoutStarted(); return delayedLogout; }
+  if(name==='auth_begin') return {requestId:'new-'+body.provider,provider:body.provider,status:'waiting_browser'};
+  return {};
+};
+const loggingOut=logoutProvider();
+await started;
+closeLogin();
+await tauriLogin('deezer');
+rejectLogout(new Error('AUTH_BROWSER_CLEAR_FAILED'));
+await loggingOut;
+if($('#modalOverlay').classList.contains('hidden')) throw new Error('stale logout failure hid the new dialog');
+if($('#errorRegion').textContent) throw new Error('stale logout failure was rendered over the new provider');
+if(activeAuthRequest!=='new-deezer') throw new Error('stale logout failure replaced the newer request');
+''')
+
     def test_partial_remote_write_is_visible_separately_from_download(self):
         self.run_probe(r'''
 globalThis.setInterval=()=>1;

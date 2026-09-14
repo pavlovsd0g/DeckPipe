@@ -39,7 +39,7 @@ begin(deezer); validate(synthetic_old); cancel(request); finish_validation()
 
 - [x] Replace native-messaging claims with an in-process, request-bound browser attempt. Native reading is scoped to the provider's HTTPS origin/cookie and exact domains. Use real async Tauri window APIs; no synchronous event-handler deadlocks.
 - [x] Preserve the private prepare/commit transaction and serialize the final commit against replacement/cancel/logout. Allow a new credential after a rejected stale cookie; tombstone timed-out or cancelled backend validation rounds. Never retry identical rejected material every poll tick.
-- [x] Create fixed persistent provider directories with `.data_directory(profile).incognito(false)`, no extension privileges; block unsafe navigation and handle HTTPS login popups in the same isolated profile with identical restrictions. Keep remote windows outside main capabilities.
+- [x] Create fixed persistent provider directories with `.data_directory(profile).incognito(false)`, no extension privileges; block unsafe navigation. Per the approved spec, HTTPS login popups must use the same isolated profile and restrictions or be explicitly refused; this implementation refuses them with a nonterminal notice. Keep remote windows outside main capabilities.
 - [x] Implement explicit selected-provider logout/clear and failure handling. The main UI receives an error if browser data cannot be cleared; cancellation cannot restore a logged-out account later. A normal close/cancel does not clear the profile.
 - [x] Add covering tests for expiry, replacement, wrong provider/domain/window, invalid-then-new credential, clear failure, selective cleanup and no-secret public results. Replace former native-host protocol tests with the new boundary tests.
 - [x] Add an unshipped example/probe using the same production browser/profile code with synthetic local content; document CLI in the report. It must prove real WebView2 persistence across process restart and selected-profile clearing. Production login still accepts only fixed provider URLs; no runtime test override.
@@ -73,7 +73,7 @@ release payload => deckpipe.exe + backend.exe, no auth-host/extension resources
 
 **Ownership:** controller; plans/spec, main audit artifacts, isolated evidence/probe runner, reviewed commits, clean candidate build. Independent final review is mandatory.
 
-- [ ] Review Task 1 and Task 2 separately and resolve material findings before integration freeze; use task briefs/reports/diff packages in this plan's ledger directory.
+- [x] Review Task 1 and Task 2 separately and resolve material findings before integration freeze; use task briefs/reports/diff packages in this plan's ledger directory.
 - [ ] Run the real synthetic WebView2 probe across complete process restart in a Cyrillic lab profile, check persistent cookie/localStorage, profile separation, ordinary close preservation and explicit clear. Record session-cookie limits separately; do not relabel synthetic data as provider acceptance.
 - [ ] Commit the reviewed complete source/updated generated assets, run full Python/PowerShell suites, frontend build and offline Rust tests. Confirm main user file unchanged and Stage C source unchanged.
 - [ ] Obtain final review of the full authentication change from the recorded base; fix material findings through the implementing worker and rerun covering checks.

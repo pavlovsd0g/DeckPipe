@@ -316,8 +316,9 @@ function closeLogin({cancel = true} = {}) {
   releaseDialogFocus();
 }
 
-async function loadConfig() {
+async function loadConfig(expectedAuthEpoch = null) {
   const config = await api('/api/config');
+  if (expectedAuthEpoch !== null && expectedAuthEpoch !== authAttemptEpoch) return null;
   libraryConfigured = config.music_root_configured === true;
   $('#musicRoot').value = config.music_root || '';
   $('#wavMode').value = config.wav_mode || 'source';
@@ -328,6 +329,7 @@ async function loadConfig() {
   setAuthActive($('#btnLoginSc'), !!config.sc_user);
   if (isPackagedAppOrigin()) {
     const state = await invoke('auth_status', {requestId: null});
+    if (expectedAuthEpoch !== null && expectedAuthEpoch !== authAttemptEpoch) return null;
     nativeAccounts = state.accounts || {};
     for (const [provider, selector] of [['deezer', '#btnLoginDeezer'], ['sc', '#btnLoginSc']]) {
       const account = nativeAccounts[provider];
@@ -336,6 +338,7 @@ async function loadConfig() {
       setAuthActive($(selector), !!account.connected);
     }
   }
+  if (expectedAuthEpoch !== null && expectedAuthEpoch !== authAttemptEpoch) return null;
   if (!libraryConfigured) {
     libraryReady = false;
     renderRootSetup();
@@ -497,32 +500,54 @@ async function retryAuthLogin() {
   await tauriLogin(loginService);
 }
 
-async function forgetAuthSession(service) {
+async function forgetAuthSession(service, operationEpoch) {
   try {
     await cancelAuthAttempt();
-    await invoke('auth_logout', {provider: service});
   } catch {
-    showError(new Error(`Не удалось выйти и забыть вход ${provLabel(service)}. Повторите попытку.`), 'security');
+    if (operationEpoch === authAttemptEpoch) {
+      showError(new Error(`Не удалось выйти и забыть вход ${provLabel(service)}. Повторите попытку.`), 'security');
+    }
     return false;
   }
+  if (operationEpoch !== authAttemptEpoch) return false;
+
+  try {
+    await invoke('auth_logout', {provider: service});
+  } catch {
+    if (operationEpoch === authAttemptEpoch) {
+      showError(new Error(`Не удалось выйти и забыть вход ${provLabel(service)}. Повторите попытку.`), 'security');
+    }
+    return false;
+  }
+  if (operationEpoch !== authAttemptEpoch) return false;
   nativeAccounts[service] = {connected: false};
   return true;
 }
 
 async function logoutProvider() {
   const service = loginService;
-  if (!await forgetAuthSession(service)) return;
+  const operationEpoch = authAttemptEpoch + 1;
+  if (!await forgetAuthSession(service, operationEpoch) || operationEpoch !== authAttemptEpoch) return;
   current = null;
   tracks = [];
   closeLogin({cancel: false});
-  await loadConfig();
-  showStatus(`Аккаунт ${provLabel(service)} отключён. Музыка сохранена на диске.`);
-  if (libraryConfigured) await loadPlaylists();
+  try {
+    const config = await loadConfig(operationEpoch);
+    if (!config || operationEpoch !== authAttemptEpoch) return;
+    showStatus(`Аккаунт ${provLabel(service)} отключён. Музыка сохранена на диске.`);
+    if (libraryConfigured) {
+      await loadPlaylists();
+      if (operationEpoch !== authAttemptEpoch) return;
+    }
+  } catch (error) {
+    if (operationEpoch === authAttemptEpoch) showError(error, 'security');
+  }
 }
 
 async function changeAuthAccount() {
   const service = loginService;
-  if (!await forgetAuthSession(service)) return;
+  const operationEpoch = authAttemptEpoch + 1;
+  if (!await forgetAuthSession(service, operationEpoch) || operationEpoch !== authAttemptEpoch) return;
   await tauriLogin(service);
 }
 
