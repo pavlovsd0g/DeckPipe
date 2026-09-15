@@ -194,7 +194,7 @@ class FrontendInteractionContractTests(unittest.TestCase):
         self.assertRegex(js, r"document\.addEventListener\(['\"]keydown['\"]", "keyboard activation and Escape handling must be delegated")
         self.assertRegex(js, r"\bactivateAction\b", "Enter/Space keyboard activation must share the delegated action path")
         self.assertRegex(css, r":focus-visible", "keyboard focus must be visibly styled")
-        for selector in ["#tab-deezer", "#tab-sc", "#tab-search", "#tab-errors", "#musicRoot", "#wavMode"]:
+        for selector in ["#tab-deezer", "#tab-sc", "#tab-local", "#tab-search", "#tab-errors", "#musicRoot", "#wavMode"]:
             self.assertIn(selector[1:], html)
 
     def test_dialog_focus_trap_escape_and_restore_are_implemented(self):
@@ -332,16 +332,16 @@ console.log(JSON.stringify({
         self.assertEqual(len(payload["fetchCalls"]), 1)
         self.assertRegex(payload["fetchCalls"][0]["url"], r"/api/rb/sync\?dry_run=true$")
         self.assertEqual(payload["fetchCalls"][0]["body"], {"playlist_key": "playlist-1", "playlist_title": "Set One"})
-        self.assertEqual(payload["error"], "")
-        self.assertIn("Dry-run", payload["status"])
+        self.assertIn("не разрешены", payload["error"].lower())
+        self.assertIn("Синхронизация", payload["status"])
         self.assertTrue(payload["dryRunSaysNoMutation"], payload["status"])
         self.assertTrue(payload["dryRunSaysNoBackup"], payload["status"])
-        for text in ["add: 2", "remove: 1", "reorder: 3", "metadata: 4", "path: 5", "unresolved: 6"]:
+        for text in ["добавить: 2", "убрать: 1", "изменить порядок: 3", "метаданные: 4", "пути: 5", "не разрешено: 6"]:
             self.assertIn(text, payload["status"])
         self.assertNotIn("undefined", payload["status"])
         self.assertNotRegex(payload["status"], r"added_content|added_to_playlist|result\.playlist|note")
 
-    def test_rekordbox_apply_requires_explicit_confirmation_token_and_reports_backup(self):
+    def test_rekordbox_apply_sends_internal_confirmation_with_viewed_hash_and_reports_backup(self):
         result = run_frontend_app_probe(
             r"""
 const responses = [
@@ -369,9 +369,9 @@ globalThis.fetch = async (url, request) => {
   fetchCalls.push({url, body: JSON.parse(request.body)});
   return {ok: true, json: async () => responses.shift()};
 };
-globalThis.confirm = () => true;
-const prompts = [];
-globalThis.prompt = message => { prompts.push(message); return 'APPLY_REKORDBOX_CHANGES'; };
+        globalThis.confirm = () => true;
+        const prompts = [];
+        globalThis.prompt = message => { prompts.push(message); throw new Error('technical token prompt must not be shown'); };
 current = {kind: 'sc', id: 'source-7', title: 'SC Set'};
 await rbSync();
 console.log(JSON.stringify({fetchCalls, prompts, status: elements.get('#statusRegion').textContent}));
@@ -383,13 +383,16 @@ console.log(JSON.stringify({fetchCalls, prompts, status: elements.get('#statusRe
         self.assertRegex(payload["fetchCalls"][0]["url"], r"/api/rb/sync\?dry_run=true$")
         self.assertRegex(payload["fetchCalls"][1]["url"], r"/api/rb/sync\?dry_run=false&confirmation_token=APPLY_REKORDBOX_CHANGES$")
         self.assertEqual(payload["fetchCalls"][0]["body"], {"playlist_key": "sc:source-7", "playlist_title": "SC Set"})
-        self.assertEqual(payload["fetchCalls"][1]["body"], {"playlist_key": "sc:source-7", "playlist_title": "SC Set"})
-        self.assertEqual(len(payload["prompts"]), 1)
-        self.assertIn("APPLY_REKORDBOX_CHANGES", payload["prompts"][0])
-        self.assertIn("Apply", payload["status"])
-        self.assertIn("applied: yes", payload["status"])
-        self.assertIn("reconciled: yes", payload["status"])
-        self.assertIn("backup: backup-123", payload["status"])
+        self.assertEqual(payload["fetchCalls"][1]["body"], {
+            "playlist_key": "sc:source-7",
+            "playlist_title": "SC Set",
+            "expected_plan_hash": "b" * 64,
+        })
+        self.assertEqual(payload["prompts"], [])
+        self.assertIn("изменения применены", payload["status"].lower())
+        self.assertIn("результат проверен", payload["status"].lower())
+        self.assertIn("Резервная копия создана и проверена", payload["status"])
+        self.assertNotIn("backup-123", payload["status"])
 
     def test_dynamic_add_download_and_search_actions_have_accessible_names(self):
         result = run_frontend_app_probe(

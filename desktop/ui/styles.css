@@ -161,7 +161,7 @@ main {
   background: var(--panel);
   display: grid;
   gap: 6px;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   padding: 8px;
 }
 
@@ -227,6 +227,19 @@ main {
   flex: 0 0 44px;
   height: 44px;
   object-fit: cover;
+  width: 44px;
+}
+
+.local-cover {
+  align-items: center;
+  background: var(--panel-3);
+  border-radius: 6px;
+  color: var(--accent);
+  display: inline-flex;
+  flex: 0 0 44px;
+  font-size: 22px;
+  height: 44px;
+  justify-content: center;
   width: 44px;
 }
 
@@ -426,6 +439,9 @@ th {
 
 #statusRegion {
   background: rgba(41, 185, 166, .16);
+  max-height: 32vh;
+  overflow: auto;
+  white-space: pre-wrap;
 }
 
 .error-region {

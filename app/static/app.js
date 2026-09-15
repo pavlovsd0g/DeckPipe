@@ -97,9 +97,42 @@ var activeAuthRequest = null;
 var authPollTimer = null;
 var authAttemptEpoch = 0;
 var nativeAccounts = {};
+var rbSelectionEpoch = 0;
+var rbOperationGeneration = 0;
+var rbOperationBusy = false;
+var rbMediaMode = null;
 var $ = (s) => document.querySelector(s);
 var RB_APPLY_CONFIRMATION_TOKEN = "APPLY_REKORDBOX_CHANGES";
 var LOGIN_CANCELLED = "DECKPIPE_LOGIN_CANCELLED";
+var RB_ERROR_MESSAGES = Object.freeze({
+  adapter_open_failed: "Не удалось открыть библиотеку Rekordbox. Проверьте установку и профиль Rekordbox.",
+  apply_not_confirmed: "Подтверждение применения отклонено. Изменения не вносились.",
+  ambiguous_playlist_target: "В Rekordbox найдено несколько плейлистов с таким названием. Выберите нужный.",
+  catalog_ambiguous: "Для одного или нескольких треков найдено несколько файлов. Сначала выберите точные совпадения.",
+  catalog_missing: "Для одного или нескольких треков не найдены локальные файлы.",
+  concurrent_apply: "Другая операция Rekordbox уже выполняется. Дождитесь её завершения и повторите просмотр.",
+  local_membership_unavailable: "Состав локального плейлиста недоступен или повреждён. Изменения не применялись.",
+  music_root_required: "Сначала подключите общую музыкальную папку.",
+  music_root_unavailable: "Общая музыкальная папка недоступна. Изменения не применялись.",
+  media_state_unavailable: "Изменения записаны, но текущее состояние файлов не удалось перечитать.",
+  media_bit_depth_conflict: "Для этих файлов уже подготовлен WAV другой разрядности. Проверьте подготовленные файлы.",
+  playlist_not_found: "Выбранный плейлист Rekordbox больше не найден. Обновите просмотр.",
+  preview_required: "Сначала откройте свежий просмотр изменений.",
+  recovery_needed: "Осталась незавершённая операция Rekordbox. Её нужно отдельно восстановить перед новым просмотром.",
+  recovery_restored_preview_required: "Незавершённая операция восстановлена. Перед новыми изменениями нужен свежий просмотр.",
+  reconcile_failed: "Проверка результата Rekordbox не завершилась. Не повторяйте действие вслепую; сначала обновите состояние.",
+  rekordbox_running: "Закройте Rekordbox и повторите действие.",
+  source_incomplete: "Источник загружен не полностью. Изменения не применялись.",
+  source_duplicate_identity: "В источнике повторяется один и тот же трек. Проверьте состав плейлиста.",
+  source_identity_invalid: "В источнике есть трек без надёжного идентификатора. Изменения не применялись.",
+  source_unavailable: "Источник сейчас недоступен. Изменения не применялись.",
+  source_unknown: "Источник плейлиста не найден. Изменения не применялись.",
+  source_unresolved: "Не все треки разрешены в локальные файлы. Изменения не применялись.",
+  stale_preview: "Состав, порядок или файлы изменились после просмотра. Откройте свежий просмотр.",
+  unsupported_recovery_schema: "Формат восстановления не поддерживается этой версией DeckPipe. Нужна ручная диагностика.",
+  wav_not_prepared: "Не для всех треков подготовлены и проверены WAV-файлы.",
+  wav_preparation_failed: "Не удалось подготовить и проверить WAV-файлы. База Rekordbox не изменялась."
+});
 var FORMAT_CLASS_BY_VALUE = Object.freeze({
   aac: "fmt-aac",
   aiff: "fmt-aiff",
@@ -214,6 +247,58 @@ function clearError() {
   const region = $("#errorRegion");
   region.textContent = "";
   region.classList.add("hidden");
+}
+function rbErrorMessage(error) {
+  if (!error) return "";
+  return RB_ERROR_MESSAGES[error.code] || "Операция Rekordbox не завершена. Обновите просмотр и повторите действие.";
+}
+function showRbResultError(result, fallback = "Операция Rekordbox не завершена.") {
+  const unresolved = Array.isArray(result?.unresolved) ? result.unresolved.length : 0;
+  const message = result?.error ? rbErrorMessage(result.error) : unresolved ? `Не разрешены локальные файлы: ${unresolved}. Изменения не применялись.` : fallback;
+  showError(new Error(message), "rekordbox");
+}
+function canonicalSourceKey(kind, id) {
+  const value = String(id ?? "");
+  if (kind === "sc") return `sc:${value.replace(/^sc:/, "")}`;
+  if (kind === "local") return `local:${value.replace(/^local:/, "")}`;
+  return value;
+}
+function captureRbSelection() {
+  if (!current) return null;
+  return {
+    kind: current.kind,
+    id: current.id,
+    title: current.title,
+    key: canonicalSourceKey(current.kind, current.id),
+    epoch: rbSelectionEpoch
+  };
+}
+function setRbOperationBusy(busy) {
+  rbOperationBusy = busy;
+  const syncButton = $("#rbSyncBtn");
+  const wavButton = $("#flipBtn");
+  if (syncButton) syncButton.disabled = busy;
+  if (wavButton) wavButton.disabled = busy;
+}
+function invalidateRbOperation() {
+  rbSelectionEpoch += 1;
+  rbOperationGeneration += 1;
+  rbMediaMode = null;
+  setRbOperationBusy(false);
+}
+function beginRbOperation() {
+  if (rbOperationBusy || !current) return null;
+  const selection = captureRbSelection();
+  const generation = ++rbOperationGeneration;
+  setRbOperationBusy(true);
+  return { generation, selection };
+}
+function rbOperationIsCurrent(operation) {
+  const selected = captureRbSelection();
+  return !!operation && operation.generation === rbOperationGeneration && !!selected && selected.epoch === operation.selection.epoch && selected.key === operation.selection.key && selected.title === operation.selection.title;
+}
+function finishRbOperation(operation) {
+  if (operation && operation.generation === rbOperationGeneration) setRbOperationBusy(false);
 }
 function text(value) {
   return document.createTextNode(String(value ?? ""));
@@ -610,6 +695,7 @@ async function sendReport() {
 async function saveRoot() {
   await api("/api/config", { body: { music_root: $("#musicRoot").value } });
   await loadConfig();
+  invalidateRbOperation();
   current = null;
   tracks = [];
   setFlexVisible($("#toolbar"), false);
@@ -681,6 +767,7 @@ async function loadPlaylists() {
   try {
     clearError();
     if (tab === "sc") return await loadScSources();
+    if (tab === "local") return await loadLocalPlaylists();
     if (tab === "errors") return await loadErrors();
     if (tab === "search") return await loadSearchTargets();
     const playlists = await api("/api/playlists");
@@ -701,6 +788,21 @@ async function loadPlaylists() {
     showError(error, tab === "errors" ? "state" : "local");
     replaceChildren($("#playlists"), create("div", { id: "empty", text: describeError(error) }));
   }
+}
+async function loadLocalPlaylists() {
+  const playlists = await api("/api/local/playlists");
+  if (!playlists.length) {
+    replaceChildren($("#playlists"), create("div", { id: "empty", text: "Локальных плейлистов пока нет. Их можно создать во вкладке «Поиск»." }));
+    return;
+  }
+  replaceChildren($("#playlists"), playlists.map((playlist) => {
+    const key = canonicalSourceKey("local", playlist.key || playlist.id);
+    const active = current && canonicalSourceKey(current.kind, current.id) === key;
+    return playlistControl(playlist.title, create("span", { className: "local-cover", text: "♪", attrs: { "aria-hidden": "true" } }), [
+      create("span", { className: "t", text: playlist.title }),
+      create("span", { className: "c", text: `${playlist.count ?? "?"} треков · локальный источник` })
+    ], "select-local-playlist", { id: key, title: playlist.title }, active);
+  }));
 }
 async function loadErrors() {
   const [localResult, remoteResult] = await Promise.allSettled([api("/api/errors?include_status=true"), api("/api/remote-actions")]);
@@ -764,9 +866,11 @@ async function retryAll() {
   startPolling();
 }
 function switchTab(nextTab) {
+  invalidateRbOperation();
   tab = nextTab;
   $("#tab-deezer").classList.toggle("active", nextTab === "deezer");
   $("#tab-sc").classList.toggle("active", nextTab === "sc");
+  $("#tab-local").classList.toggle("active", nextTab === "local");
   $("#tab-search").classList.toggle("active", nextTab === "search");
   $("#tab-errors").classList.toggle("active", nextTab === "errors");
   setFlexVisible($("#sc-add"), nextTab === "sc");
@@ -784,7 +888,7 @@ function switchTab(nextTab) {
     loadSearchTargets();
     return;
   }
-  setEmpty(nextTab === "errors" ? "Треки с ошибками загрузки/верификации — слева. Кнопка ↻ перезапускает сломавшийся этап." : `Выберите ${nextTab === "sc" ? "источник" : "плейлист"} слева`);
+  setEmpty(nextTab === "errors" ? "Треки с ошибками загрузки/верификации — слева. Кнопка ↻ перезапускает сломавшийся этап." : `Выберите ${nextTab === "sc" ? "источник" : nextTab === "local" ? "локальный плейлист" : "плейлист"} слева`);
   loadPlaylists();
 }
 async function loadSearchTargets() {
@@ -1117,30 +1221,42 @@ async function addScSource() {
   }
   await loadPlaylists();
 }
-function selectScSource(id, title) {
+async function selectScSource(id, title) {
+  invalidateRbOperation();
   current = { kind: "sc", id, title };
-  loadPlaylists();
-  loadTracks(current);
+  await Promise.all([loadPlaylists(), loadTracks(current)]);
 }
-function selectPlaylist(id, title) {
+async function selectPlaylist(id, title) {
+  invalidateRbOperation();
   current = { kind: "deezer", id, title };
-  loadPlaylists();
-  loadTracks(current);
+  await Promise.all([loadPlaylists(), loadTracks(current)]);
+}
+async function selectLocalPlaylist(id, title) {
+  invalidateRbOperation();
+  current = { kind: "local", id: canonicalSourceKey("local", id), title };
+  await Promise.all([loadPlaylists(), loadTracks(current)]);
 }
 async function loadTracks(playlist) {
   if (!libraryConfigured) {
     renderRootSetup();
     return;
   }
+  const selectionEpoch = rbSelectionEpoch;
   setFlexVisible($("#toolbar"), true);
   $("#pltitle").textContent = playlist.title;
   setEmpty("Загрузка… (большие плейлисты — до ~20 сек)");
   try {
-    const url = playlist.kind === "sc" ? `/api/sc/sources/${playlist.id}/tracks` : `/api/playlists/${playlist.id}/tracks?title=${encodeURIComponent(playlist.title)}`;
+    const url = playlist.kind === "sc" ? `/api/sc/sources/${playlist.id}/tracks` : `/api/playlists/${canonicalSourceKey(playlist.kind, playlist.id)}/tracks?title=${encodeURIComponent(playlist.title)}`;
     const data = await api(url);
+    if (selectionEpoch !== rbSelectionEpoch || current !== playlist) return;
     tracks = data.tracks;
     $("#plpath").textContent = data.path || "";
     renderTracks();
+    try {
+      await refreshRbMediaState(playlist, { quiet: true });
+    } catch {
+      if (selectionEpoch === rbSelectionEpoch && current === playlist) renderRbMediaMode("blocked");
+    }
   } catch (error) {
     showError(error, "state");
     setEmpty(`Не удалось загрузить: ${describeError(error, "state")}`, "Повторить", "rescan");
@@ -1151,8 +1267,7 @@ function renderTracks() {
   const miss = tracks.filter((track) => track.status === "missing").length;
   const err = tracks.length - ok - miss;
   $("#plstats").textContent = `✔ ${ok} · ✖ ${miss} · ⚠ ${err}`;
-  const flipped = tracks.filter((track) => track.flipped).length;
-  $("#flipBtn").textContent = flipped ? `⇄ FLAC (${flipped} в WAV)` : "⇄ WAV";
+  renderRbMediaMode(rbMediaMode);
   const table = create("table", { attrs: { "aria-label": "Треки плейлиста" } });
   const thead = create("thead");
   thead.append(create("tr", {}, [
@@ -1170,7 +1285,6 @@ function renderTracks() {
     const formatCell = create("td");
     const badge = formatBadge(track.format);
     if (badge) formatCell.append(badge);
-    if (track.flipped) formatCell.append(create("span", { className: "fmt fmt-wav", text: "→wav" }));
     if (track.mp3_source) formatCell.append(create("span", { className: "fmt fmt-mp3src", text: "mp3", title: "mp3-источник: после конвертации в WAV кью могут сместиться на ~26 мс" }));
     const locationCell = create("td", { className: "track-location" });
     if (track.file_path) {
@@ -1288,31 +1402,6 @@ async function syncAppend() {
   if (!confirm(`Скачать ${missing.length} треков (новые — вниз списка)?`)) return;
   showDownloadResult(await api(downloadUrl("append"), { body: { tracks: missing } }));
 }
-async function rbSync() {
-  const key = current.kind === "sc" ? `sc:${current.id}` : current.id;
-  const body = { playlist_key: key, playlist_title: current.title };
-  try {
-    const dryRun = await api("/api/rb/sync?dry_run=true", { body });
-    showStatus(formatRbSyncResult(dryRun));
-    if (dryRun.error) {
-      showError(new Error(`${dryRun.error.code}: ${dryRun.error.message}`), "rekordbox");
-      return;
-    }
-    if (!rbSyncHasChanges(dryRun)) return;
-    if (!confirm(`Dry-run для «${current.title}» готов. Применить экспериментальные изменения в Rekordbox?
-Rekordbox должен быть ЗАКРЫТ. Бэкап создается только после явного применения.`)) return;
-    const token = prompt(`Для применения введите точно: ${RB_APPLY_CONFIRMATION_TOKEN}`);
-    if (token !== RB_APPLY_CONFIRMATION_TOKEN) {
-      showStatus(`${formatRbSyncResult(dryRun)} Apply cancelled: изменения не применялись, бэкап не создавался.`);
-      return;
-    }
-    const applied = await api(`/api/rb/sync?dry_run=false&confirmation_token=${encodeURIComponent(RB_APPLY_CONFIRMATION_TOKEN)}`, { body });
-    showStatus(formatRbSyncResult(applied));
-    if (applied.error) showError(new Error(`${applied.error.code}: ${applied.error.message}`), "rekordbox");
-  } catch (error) {
-    showError(error, "rekordbox");
-  }
-}
 function rbPlanCounts(result) {
   return result && result.plan && result.plan.counts || {};
 }
@@ -1321,37 +1410,277 @@ function rbCountValue(counts, name) {
 }
 function formatRbSyncCounts(result) {
   const counts = rbPlanCounts(result);
-  return ["add", "remove", "reorder", "metadata", "path", "unresolved"].map((name) => `${name}: ${rbCountValue(counts, name)}`).join(", ");
+  return `добавить: ${rbCountValue(counts, "add")}; убрать: ${rbCountValue(counts, "remove")}; изменить порядок: ${rbCountValue(counts, "reorder")}; метаданные: ${rbCountValue(counts, "metadata")}; пути: ${rbCountValue(counts, "path")}; не разрешено: ${rbCountValue(counts, "unresolved")}`;
 }
 function rbSyncHasChanges(result) {
-  const counts = rbPlanCounts(result);
-  return ["add", "remove", "reorder", "metadata", "path", "unresolved"].some((name) => rbCountValue(counts, name) > 0);
+  return !!result?.plan?.hash && !result.unchanged && !result.error && !(result.unresolved || []).length;
 }
-function formatRbSyncResult(result) {
-  const payload = result || {};
-  const mode = payload.dry_run === false ? "Apply" : "Dry-run";
-  const hash = payload.plan && payload.plan.hash ? `, hash: ${String(payload.plan.hash).slice(0, 12)}` : "";
-  const error = payload.error ? `, error: ${payload.error.code || "unknown"} ${payload.error.message || ""}` : "";
-  if (payload.dry_run === false) {
-    return `Rekordbox ${mode}: applied: ${payload.applied ? "yes" : "no"}, reconciled: ${payload.reconciled ? "yes" : "no"}, backup: ${payload.backup_id || "none"}, ${formatRbSyncCounts(payload)}${hash}${error}`;
+function rbOrderedPathLines(result) {
+  const rows = [...result?.plan?.desired_resolved || []].sort((left, right) => Number(left.position || 0) - Number(right.position || 0));
+  if (!rows.length) return ["Порядок файлов: плейлист пуст."];
+  return ["Порядок и пути файлов:", ...rows.map((row, index) => `${Number(row.position) || index + 1}. ${row.title || row.provider_id || "Трек"} — ${row.path || "путь не определён"}`)];
+}
+function rbSharedEffectLines(result) {
+  const shared = result?.plan?.shared_content || [];
+  if (!shared.length) return ["Общие треки других плейлистов: пути не затрагиваются."];
+  const memberships = shared.reduce((total, item) => total + (item.playlist_ids || []).length, 0);
+  return [`Общие треки: ${shared.length}; переключение путей затронет ${memberships} связей плейлистов Rekordbox.`];
+}
+function formatRbPreview(result, action = "Синхронизация") {
+  if (!result?.plan) return `${action}
+Безопасный план не получен. Изменения не применялись, новый бэкап не создавался.`;
+  const plan = result?.plan || {};
+  const target = plan.target || {};
+  const targetText = !plan.target ? "Цель Rekordbox не удалось определить." : target.id == null ? `Цель Rekordbox: новый плейлист «${target.name || "без названия"}» будет создан.` : `Цель Rekordbox: существующий плейлист «${target.name || "без названия"}».`;
+  const lines = [action, targetText, `Изменения: ${formatRbSyncCounts(result)}.`, ...rbOrderedPathLines(result), ...rbSharedEffectLines(result)];
+  if (result?.media_state?.mode) lines.push(`Текущий режим файлов: ${rbMediaModeLabel(result.media_state.mode)}.`);
+  if (result?.unchanged) lines.push("Rekordbox уже соответствует этому плану. Применение и новый бэкап не требуются.");
+  else lines.push("Это только просмотр: изменения не применялись, новый бэкап не создавался.");
+  return lines.join("\n");
+}
+function rbMediaModeLabel(mode) {
+  return {
+    original: "исходные файлы",
+    wav: "подготовленные WAV",
+    mixed: "смешанный — часть WAV, часть исходников",
+    empty: "пустой плейлист",
+    not_in_rekordbox: "плейлист ещё не создан в Rekordbox",
+    blocked: "состояние нельзя определить безопасно"
+  }[mode] || "не определён";
+}
+function renderRbMediaMode(mode) {
+  rbMediaMode = mode || null;
+  const node = $("#flipBtn");
+  if (!node) return;
+  node.textContent = {
+    original: "⇄ Подготовить WAV",
+    wav: "⇄ Вернуть оригиналы",
+    mixed: "⇄ WAV / оригиналы",
+    empty: "⇄ WAV",
+    not_in_rekordbox: "⇄ WAV после синхронизации",
+    blocked: "⇄ Проверить состояние"
+  }[mode] || "⇄ Проверить WAV";
+  node.title = `Режим Rekordbox: ${rbMediaModeLabel(mode)}`;
+}
+function rbRequestBody(selection, extra = {}) {
+  return { playlist_key: selection.key, playlist_title: selection.title, ...extra };
+}
+function rbMediaStatePath(selection, playlistId = null) {
+  const params = new URLSearchParams({ playlist_key: selection.key, playlist_title: selection.title });
+  if (playlistId) params.set("playlist_id", playlistId);
+  return `/api/rb/media-state?${params}`;
+}
+async function refreshRbMediaState(selection = current, { quiet = false, operation = null, playlistId = null } = {}) {
+  if (!selection) return null;
+  const selectionEpoch = rbSelectionEpoch;
+  const captured = selection.key ? selection : {
+    ...selection,
+    key: canonicalSourceKey(selection.kind, selection.id)
+  };
+  const result = await api(rbMediaStatePath(captured, playlistId));
+  if (operation && !rbOperationIsCurrent(operation)) return null;
+  if (!operation) {
+    const selected = captureRbSelection();
+    if (selectionEpoch !== rbSelectionEpoch || !selected || selected.key !== captured.key || selected.title !== captured.title) return null;
   }
-  return `Rekordbox ${mode}: изменения не применялись, бэкап не создавался, ${formatRbSyncCounts(payload)}${hash}${error}`;
+  renderRbMediaMode(result?.media_state?.mode);
+  if (!quiet && (result?.error || result?.unresolved?.length || result?.media_state?.mode === "blocked")) {
+    showRbResultError(result, "Текущее состояние Rekordbox нельзя определить безопасно.");
+  }
+  return result;
+}
+async function chooseRbTarget(operation, title) {
+  const status = await api("/api/rb/status");
+  if (!rbOperationIsCurrent(operation)) return null;
+  const candidates = (status.playlists || []).filter((item) => item.name === title);
+  if (!candidates.length) {
+    showError(new Error("Плейлист Rekordbox с таким названием не найден. Обновите просмотр."), "rekordbox");
+    return null;
+  }
+  const choices = candidates.map((item, index2) => `${index2 + 1}. ${item.name} — ${item.count ?? "?"} треков`).join("\n");
+  const answer = prompt(`В Rekordbox несколько плейлистов «${title}». Выберите номер:
+${choices}`);
+  if (!rbOperationIsCurrent(operation) || answer === null) return null;
+  const index = Number(answer) - 1;
+  if (!Number.isInteger(index) || !candidates[index]) {
+    showError(new Error("Номер плейлиста не выбран. Изменения не применялись."), "rekordbox");
+    return null;
+  }
+  return String(candidates[index].id);
+}
+async function restorePendingRbOperation(endpoint, body, preview, operation) {
+  const hash = preview?.plan?.hash;
+  if (!hash) {
+    showRbResultError(preview, "Для восстановления не получен безопасный план.");
+    return { stop: true };
+  }
+  showStatus("Обнаружена незавершённая операция Rekordbox. Новые изменения пока не применяются.");
+  if (!confirm("Восстановить состояние до незавершённой операции Rekordbox?\nПосле восстановления DeckPipe заново покажет план, и для новых изменений потребуется отдельное подтверждение.")) {
+    showStatus("Восстановление отменено. Новые изменения не применялись.");
+    return { stop: true };
+  }
+  if (!rbOperationIsCurrent(operation)) return { stop: true };
+  const restored = await api(
+    `${endpoint}?dry_run=false&confirmation_token=${encodeURIComponent(RB_APPLY_CONFIRMATION_TOKEN)}`,
+    { body: { ...body, expected_plan_hash: hash } }
+  );
+  if (!rbOperationIsCurrent(operation)) return { stop: true };
+  if (restored?.error?.code !== "recovery_restored_preview_required") {
+    showRbResultError(restored, "Восстановление не подтверждено. Откройте свежий просмотр состояния.");
+    return { stop: true };
+  }
+  showStatus("Незавершённая операция восстановлена. Загружаем новый план без автоматического применения.");
+  const fresh = await api(`${endpoint}?dry_run=true`, { body });
+  if (!rbOperationIsCurrent(operation)) return { stop: true };
+  return { preview: fresh, prefix: "Незавершённая операция восстановлена.\n" };
+}
+async function loadRbPreview(endpoint, body, operation) {
+  let preview = await api(`${endpoint}?dry_run=true`, { body });
+  if (!rbOperationIsCurrent(operation)) return { stop: true };
+  let prefix = "";
+  if (preview?.error?.code === "recovery_needed") {
+    const recovery = await restorePendingRbOperation(endpoint, body, preview, operation);
+    if (recovery.stop) return recovery;
+    preview = recovery.preview;
+    prefix = recovery.prefix;
+  }
+  if (preview?.error?.code === "ambiguous_playlist_target") {
+    const playlistId = await chooseRbTarget(operation, body.playlist_title);
+    if (!playlistId) return { stop: true };
+    body.playlist_id = playlistId;
+    preview = await api(`${endpoint}?dry_run=true`, { body });
+    if (!rbOperationIsCurrent(operation)) return { stop: true };
+  }
+  return { preview, prefix };
+}
+function showRbAppliedResult(result, action) {
+  if (result?.applied && result?.reconciled) {
+    const backup = result.backup_id ? " Резервная копия создана и проверена." : "";
+    const stateError = result?.media_state?.mode === "blocked" || result?.error?.code === "media_state_unavailable";
+    const postCommitError = !!result?.error && !stateError;
+    showStatus(`${action}: изменения применены и результат проверен.${backup}` + (stateError ? " Пути записаны, но текущее состояние файлов не удалось обновить; повторите проверку состояния." : "") + (postCommitError ? " Основная запись завершена, но дополнительная обработка после неё не завершилась." : ""));
+    if (stateError) showError(new Error(RB_ERROR_MESSAGES.media_state_unavailable), "rekordbox");
+    else if (postCommitError) showError(new Error("Изменения Rekordbox записаны и проверены, но дополнительная обработка не завершилась."), "rekordbox");
+    renderRbMediaMode(result?.media_state?.mode);
+    return true;
+  }
+  if (!result?.applied && result?.reconciled && result?.unchanged && !result?.error) {
+    showStatus(`${action}: состояние уже совпадает с просмотренным планом; запись и новый бэкап не требовались.`);
+    renderRbMediaMode(result?.media_state?.mode);
+    return true;
+  }
+  showStatus(`${action} не подтверждена как завершённая. Не повторяйте действие до нового просмотра состояния.`);
+  showRbResultError(result);
+  return false;
+}
+async function applyRbPreview(endpoint, body, preview, operation, action) {
+  if (!rbOperationIsCurrent(operation)) return false;
+  const viewedHash = preview?.plan?.hash;
+  if (!viewedHash) {
+    showError(new Error("Просмотр не содержит подтверждённого плана. Изменения не применялись."), "rekordbox");
+    return false;
+  }
+  const applied = await api(
+    `${endpoint}?dry_run=false&confirmation_token=${encodeURIComponent(RB_APPLY_CONFIRMATION_TOKEN)}`,
+    { body: { ...body, expected_plan_hash: viewedHash } }
+  );
+  if (!rbOperationIsCurrent(operation)) return false;
+  return showRbAppliedResult(applied, action);
+}
+async function rbSync() {
+  const operation = beginRbOperation();
+  if (!operation) return;
+  const body = rbRequestBody(operation.selection);
+  try {
+    const loaded = await loadRbPreview("/api/rb/sync", body, operation);
+    if (loaded.stop || !rbOperationIsCurrent(operation)) return;
+    const preview = loaded.preview;
+    const previewText = `${loaded.prefix || ""}${formatRbPreview(preview, "Синхронизация плейлиста с Rekordbox")}`;
+    showStatus(previewText);
+    if (preview?.error || preview?.unresolved?.length || !preview?.plan?.hash) {
+      showRbResultError(preview, "Безопасный план синхронизации не получен.");
+      return;
+    }
+    if (!rbSyncHasChanges(preview)) return;
+    if (!confirm(`${previewText}
+
+Применить именно этот план? Rekordbox должен быть закрыт.`)) {
+      showStatus(`${previewText}
+Применение отменено. Изменения не вносились.`);
+      return;
+    }
+    await applyRbPreview("/api/rb/sync", body, preview, operation, "Синхронизация Rekordbox");
+  } catch (error) {
+    if (rbOperationIsCurrent(operation)) showError(error, "rekordbox");
+  } finally {
+    finishRbOperation(operation);
+  }
 }
 async function flipWav() {
-  const flipped = tracks.filter((track) => track.flipped).length;
-  const toWav = flipped === 0;
-  const message = toWav ? `Конвертировать «${current.title}» в WAV для CDJ?
-Все кью, сетка, BPM и порядок сохранятся (пути в master.db переключатся на WAV).
-Rekordbox должен быть ЗАКРЫТ.` : `Вернуть «${current.title}» к исходникам (FLAC/MP3)?
-Пути в master.db переключатся обратно. Rekordbox должен быть ЗАКРЫТ.`;
-  if (!confirm(message)) return;
-  const key = current.kind === "sc" ? `sc:${current.id}` : current.id;
+  const operation = beginRbOperation();
+  if (!operation) return;
+  const selection = operation.selection;
   try {
-    await api("/api/flip", { body: { playlist_key: key, playlist_title: current.title, to_wav: toWav } });
-    showStatus(toWav ? "WAV-конвертация запущена" : "Возврат к исходникам запущен");
-    startPolling();
+    const state = await refreshRbMediaState(selection, { operation });
+    if (!state || !rbOperationIsCurrent(operation)) return;
+    if (state.error || state.unresolved?.length || state.media_state?.mode === "blocked") return;
+    const mode = state.media_state?.mode;
+    let toWav;
+    if (mode === "wav") toWav = false;
+    else if (mode === "mixed") {
+      const answer = prompt("В плейлисте смешаны WAV и исходники. Введите 1, чтобы перевести все треки в WAV, или 2, чтобы вернуть все к исходникам:");
+      if (answer === null) return;
+      if (answer === "1") toWav = true;
+      else if (answer === "2") toWav = false;
+      else {
+        showError(new Error("Режим не выбран. Пути Rekordbox не изменялись."), "rekordbox");
+        return;
+      }
+    } else if (["original", "not_in_rekordbox"].includes(mode)) toWav = true;
+    else {
+      showError(new Error(`Для режима «${rbMediaModeLabel(mode)}» переключение путей недоступно.`), "rekordbox");
+      return;
+    }
+    if (toWav) {
+      if (!confirm(`Подготовить отдельные проверенные WAV-файлы для «${selection.title}»?
+Исходники сохранятся. База Rekordbox на этом шаге не изменяется.`)) {
+        showStatus("Подготовка WAV отменена. Файлы и Rekordbox не изменялись.");
+        return;
+      }
+      const prepared = await api("/api/rb/prepare-wav", { body: rbRequestBody(selection, { bit_depth: 16 }) });
+      if (!rbOperationIsCurrent(operation)) return;
+      showStatus(`Подготовка WAV: создано ${prepared.prepared || 0}, проверено повторно ${prepared.reused || 0}, всего ${prepared.total || 0}.`);
+      if (prepared.state !== "prepared" || prepared.error || prepared.unresolved?.length) {
+        showRbResultError(prepared, "Подготовка WAV не завершена. База Rekordbox не изменялась.");
+        return;
+      }
+      const freshState = await refreshRbMediaState(selection, { operation });
+      if (!freshState || freshState.error || freshState.unresolved?.length || freshState.media_state?.mode === "blocked") return;
+    }
+    const body = rbRequestBody(selection, { to_wav: toWav });
+    const loaded = await loadRbPreview("/api/flip", body, operation);
+    if (loaded.stop || !rbOperationIsCurrent(operation)) return;
+    const preview = loaded.preview;
+    const action = toWav ? "Переключение путей на WAV" : "Возврат путей к исходникам";
+    const previewText = `${loaded.prefix || ""}${formatRbPreview(preview, action)}`;
+    showStatus(previewText);
+    if (preview?.error || preview?.unresolved?.length || !preview?.plan?.hash) {
+      showRbResultError(preview, "Безопасный план переключения путей не получен.");
+      return;
+    }
+    if (!rbSyncHasChanges(preview)) return;
+    if (!confirm(`${previewText}
+
+Применить именно это переключение путей? Rekordbox должен быть закрыт.`)) {
+      showStatus(`${previewText}
+Применение отменено. Пути Rekordbox не изменялись.`);
+      return;
+    }
+    await applyRbPreview("/api/flip", body, preview, operation, action);
   } catch (error) {
-    showError(error, "rekordbox");
+    if (rbOperationIsCurrent(operation)) showError(error, "rekordbox");
+  } finally {
+    finishRbOperation(operation);
   }
 }
 async function bindPath() {
@@ -1442,6 +1771,7 @@ var clickActions = Object.freeze({
   "import-sc-account": () => importScAccount(),
   "select-playlist": (el) => selectPlaylist(el.dataset.id, el.dataset.title),
   "select-sc-source": (el) => selectScSource(el.dataset.id, el.dataset.title),
+  "select-local-playlist": (el) => selectLocalPlaylist(el.dataset.id, el.dataset.title),
   "retry-all": () => retryAll(),
   "retry-one": (el) => retryOne(Number(el.dataset.index)),
   "retry-remote": (el) => retryRemote(el.dataset.id),

@@ -37,6 +37,7 @@
     <nav id="tabs" aria-label="Разделы">
       <button id="tab-deezer" class="active" type="button" data-action="switch-tab" data-tab="deezer">Deezer</button>
       <button id="tab-sc" type="button" data-action="switch-tab" data-tab="sc">SoundCloud</button>
+      <button id="tab-local" type="button" data-action="switch-tab" data-tab="local">Локальные</button>
       <button id="tab-search" type="button" data-action="switch-tab" data-tab="search">Поиск</button>
       <button id="tab-errors" type="button" data-action="switch-tab" data-tab="errors">Ошибки</button>
     </nav>
@@ -62,8 +63,8 @@
       <button type="button" data-action="download-selected" aria-label="Скачать выбранные треки">Скачать выбранные</button>
       <button type="button" data-action="sync-playlist-order" title="Перенумеровать файлы по порядку в стриминге и докачать недостающие" aria-label="Синхронизировать по порядку стриминга">Синк: по порядку</button>
       <button type="button" data-action="sync-append" title="Не трогать текущие номера, новые треки — вниз списка" aria-label="Синхронизировать только новые треки вниз списка">Синк: новые вниз</button>
-      <button class="ghost" type="button" data-action="rb-sync" title="Синхронизировать скачанные треки в Rekordbox (Rekordbox должен быть закрыт)" aria-label="Проверить синхронизацию Rekordbox dry-run">→ RB</button>
-      <button class="ghost" id="flipBtn" type="button" data-action="flip-wav" disabled title="WAV с изменением базы Rekordbox будет доступен после проверки этапа C" aria-label="WAV для Rekordbox — этап C ещё не завершён">⇄ WAV</button>
+      <button class="ghost" id="rbSyncBtn" type="button" data-action="rb-sync" title="Просмотреть синхронизацию скачанных треков с Rekordbox" aria-label="Просмотреть синхронизацию Rekordbox">→ RB</button>
+      <button class="ghost" id="flipBtn" type="button" data-action="flip-wav" title="Проверить режим файлов Rekordbox" aria-label="Подготовить WAV или вернуть исходные файлы в Rekordbox">⇄ Проверить WAV</button>
     </div>
     <div id="searchbar" class="hidden" role="search">
       <label class="sr-only" for="searchInput">Трек, альбом или исполнитель</label>
