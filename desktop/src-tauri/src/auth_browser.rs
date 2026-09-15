@@ -5,9 +5,10 @@ use crate::{
     auth_runtime::AuthRuntime,
 };
 use std::{
+    collections::HashSet,
     net::IpAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
@@ -15,6 +16,7 @@ use tokio::sync::{oneshot, Mutex};
 use webview2_com::{
     ClearBrowsingDataCompletedHandler,
     Microsoft::Web::WebView2::Win32::{ICoreWebView2Profile2, ICoreWebView2_13},
+    WindowCloseRequestedEventHandler,
 };
 use windows::core::Interface;
 
@@ -64,6 +66,159 @@ pub fn navigation_allowed(url: &tauri::Url) -> bool {
 }
 
 pub type NavigationPolicy = Arc<dyn Fn(&tauri::Url) -> bool + Send + Sync>;
+
+#[derive(Default)]
+struct PopupState {
+    closed: bool,
+    labels: HashSet<String>,
+}
+struct PopupGroup {
+    root: String,
+    state: StdMutex<PopupState>,
+}
+impl PopupGroup {
+    fn reserve(&self) -> Option<String> {
+        let mut state = self.state.lock().unwrap();
+        if state.closed || state.labels.len() >= 4 {
+            return None;
+        }
+        let label = format!("{}-popup-{}", self.root, crate::auth_broker::random_id());
+        state.labels.insert(label.clone());
+        Some(label)
+    }
+    fn release(&self, label: &str) {
+        self.state.lock().unwrap().labels.remove(label);
+    }
+    fn active(&self) -> bool {
+        !self.state.lock().unwrap().closed
+    }
+    fn close(&self) -> Vec<String> {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        state.labels.iter().cloned().collect()
+    }
+}
+
+fn popup_response(
+    app: tauri::AppHandle,
+    profile: PathBuf,
+    policy: NavigationPolicy,
+    blocked: Arc<dyn Fn() + Send + Sync>,
+    group: Arc<PopupGroup>,
+    url: tauri::Url,
+    features: tauri::webview::NewWindowFeatures,
+) -> tauri::webview::NewWindowResponse<tauri::Wry> {
+    use tauri::webview::NewWindowResponse;
+    // OAuth pages commonly open a blank child and assign its HTTPS URL later.
+    // Every subsequent navigation still uses the same production URL policy.
+    if url.as_str() != "about:blank" && !policy(&url) {
+        blocked();
+        return NewWindowResponse::Deny;
+    }
+    let Some(parent) = app.get_webview_window(&group.root) else {
+        return NewWindowResponse::Deny;
+    };
+    let Some(label) = group.reserve() else {
+        blocked();
+        return NewWindowResponse::Deny;
+    };
+    let navigate_policy = policy.clone();
+    let navigate_group = group.clone();
+    let child_app = app.clone();
+    let child_profile = profile.clone();
+    let child_blocked = blocked.clone();
+    let child_group = group.clone();
+    // Wry 0.55 defers this callback past WebView2's NewWindowRequested event.
+    // window_features supplies the opener's exact environment; returning Create
+    // lets WebView2 retain window.opener/postMessage and perform the navigation.
+    let builder = WebviewWindowBuilder::new(
+        &app,
+        &label,
+        WebviewUrl::External("about:blank".parse().unwrap()),
+    )
+    .window_features(features)
+    .title("DeckPipe — дополнительное окно входа")
+    .inner_size(640.0, 760.0)
+    .min_inner_size(480.0, 480.0)
+    .data_directory(profile)
+    .incognito(false)
+    .devtools(false)
+    .on_navigation(move |url| {
+        navigate_group.active() && (url.as_str() == "about:blank" || navigate_policy(url))
+    })
+    .on_new_window(move |url, features| {
+        popup_response(
+            child_app.clone(),
+            child_profile.clone(),
+            policy.clone(),
+            child_blocked.clone(),
+            child_group.clone(),
+            url,
+            features,
+        )
+    });
+    let window = builder.owner(&parent).and_then(|builder| builder.build());
+    match window {
+        Ok(window) => {
+            let close_group = group.clone();
+            let close_label = label.clone();
+            window.on_window_event(move |event| {
+                if matches!(event, tauri::WindowEvent::Destroyed) {
+                    close_group.release(&close_label);
+                }
+            });
+            // Wry handles window.close() by destroying its child HWND. Tauri's
+            // outer window and registry must be destroyed as well, otherwise a
+            // blank window and occupied popup slot survive each OAuth handoff.
+            let close_window = window.clone();
+            let close_failed = blocked.clone();
+            if window
+                .with_webview(move |webview| {
+                    let requested = close_window.clone();
+                    let result = (|| -> windows::core::Result<()> {
+                        unsafe {
+                            let core = webview.controller().CoreWebView2()?;
+                            core.add_WindowCloseRequested(
+                                &WindowCloseRequestedEventHandler::create(Box::new(move |_, _| {
+                                    let window = requested.clone();
+                                    tauri::async_runtime::spawn_blocking(move || {
+                                        let _ = window.destroy();
+                                    });
+                                    Ok(())
+                                })),
+                                &mut 0,
+                            )
+                        }
+                    })();
+                    if result.is_err() {
+                        close_failed();
+                        tauri::async_runtime::spawn_blocking(move || {
+                            let _ = close_window.destroy();
+                        });
+                    }
+                })
+                .is_err()
+            {
+                let _ = window.destroy();
+                group.release(&label);
+                blocked();
+                return NewWindowResponse::Deny;
+            }
+            if !group.active() || app.get_webview_window(&group.root).is_none() {
+                let _ = window.destroy();
+                group.release(&label);
+                return NewWindowResponse::Deny;
+            }
+            NewWindowResponse::Create { window }
+        }
+        Err(_) => {
+            group.release(&label);
+            blocked();
+            NewWindowResponse::Deny
+        }
+    }
+}
+
 /// Called from async commands/tasks, never synchronously from a UI event.
 /// All auth and maintenance/probe windows use these exact profile settings.
 pub async fn persistent_window(
@@ -77,7 +232,15 @@ pub async fn persistent_window(
 ) -> Result<WebviewWindow, &'static str> {
     tokio::task::spawn_blocking(move || {
         std::fs::create_dir_all(&profile).map_err(|_| "AUTH_PROFILE_UNAVAILABLE")?;
-        WebviewWindowBuilder::new(&app, label, WebviewUrl::External(url))
+        let group = Arc::new(PopupGroup {
+            root: label.clone(),
+            state: StdMutex::default(),
+        });
+        let popup_app = app.clone();
+        let popup_profile = profile.clone();
+        let popup_policy = policy.clone();
+        let popup_group = group.clone();
+        let window = WebviewWindowBuilder::new(&app, label, WebviewUrl::External(url))
             .title("DeckPipe — вход в сервис")
             .inner_size(1000.0, 760.0)
             .min_inner_size(640.0, 480.0)
@@ -86,14 +249,38 @@ pub async fn persistent_window(
             .visible(visible)
             .devtools(false)
             .on_navigation(move |url| policy(url))
-            .on_new_window(move |_, _| {
-                // Do not create a window synchronously in WebView2's UI event.
-                // Explicit safe rejection is reported to the main UI.
-                popup_blocked();
-                tauri::webview::NewWindowResponse::Deny
+            .on_new_window(move |url, features| {
+                popup_response(
+                    popup_app.clone(),
+                    popup_profile.clone(),
+                    popup_policy.clone(),
+                    popup_blocked.clone(),
+                    popup_group.clone(),
+                    url,
+                    features,
+                )
             })
             .build()
-            .map_err(|_| "AUTH_BROWSER_UNAVAILABLE")
+            .map_err(|_| "AUTH_BROWSER_UNAVAILABLE")?;
+        window.on_window_event(move |event| {
+            if matches!(
+                event,
+                tauri::WindowEvent::Destroyed | tauri::WindowEvent::CloseRequested { .. }
+            ) {
+                let labels = group.close();
+                let app = app.clone();
+                // Also covers cancellation/expiry/commit and a child still being
+                // constructed when the parent closes. Other attempts are untouched.
+                tauri::async_runtime::spawn_blocking(move || {
+                    for label in labels {
+                        if let Some(child) = app.get_webview_window(&label) {
+                            let _ = child.destroy();
+                        }
+                    }
+                });
+            }
+        });
+        Ok(window)
     })
     .await
     .map_err(|_| "AUTH_BROWSER_UNAVAILABLE")?
@@ -157,11 +344,14 @@ impl AuthBrowser {
         })
     }
     async fn destroy_attempt_windows(app: &tauri::AppHandle) -> Result<(), &'static str> {
-        let windows: Vec<_> = app
+        let mut windows: Vec<_> = app
             .webview_windows()
             .into_values()
             .filter(|w| w.label().starts_with("auth-"))
             .collect();
+        // Close children before their Win32 owner; destroying the owner first
+        // already destroys them and would make a second destroy report failure.
+        windows.sort_by_key(|w| !w.label().contains("-popup-"));
         tokio::task::spawn_blocking(move || {
             for window in windows {
                 window.destroy().map_err(|_| "AUTH_BROWSER_CLEAR_FAILED")?;

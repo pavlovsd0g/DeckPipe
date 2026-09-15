@@ -695,7 +695,7 @@ async function tauriLogin(service) {
 function waitingAuthNotice(state) {
   if (state.status === "validating") return "Проверяем вход…";
   const notices = {
-    AUTH_POPUP_BLOCKED: "Вход во всплывающем окне недоступен. Продолжите вход на странице сервиса в окне DeckPipe.",
+    AUTH_POPUP_BLOCKED: "Дополнительное окно входа не открылось. Закройте лишние окна входа и попробуйте ещё раз.",
     AUTH_PROVIDER_REJECTED: "Сервис не принял вход. Войдите снова в этом же окне.",
     AUTH_BACKEND_UNAVAILABLE: "Проверка входа временно недоступна. Повторите попытку.",
     AUTH_INVALID_RESPONSE: "Сервис вернул неполный ответ. Повторите попытку."

@@ -98,7 +98,7 @@ globalThis.setTimeout=()=>{scheduled++;return 1;};
 globalThis.__invokeImpl=async()=>({requestId:'popup-1',provider:'deezer',status:'waiting_browser',errorCode:'AUTH_POPUP_BLOCKED'});
 await tauriLogin('deezer');
 const message=$('#loginResult').textContent;
-if(!message.includes('во всплывающем окне недоступен')) throw new Error('popup policy notice missing');
+if(!message.includes('Дополнительное окно входа не открылось')) throw new Error('popup policy notice missing');
 if(message.includes('не удалось')) throw new Error('popup policy was rendered as terminal failure');
 if(scheduled!==1||activeAuthRequest!=='popup-1') throw new Error('popup policy stopped a pending attempt');
 ''')
