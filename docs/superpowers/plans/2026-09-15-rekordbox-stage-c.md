@@ -28,7 +28,7 @@
 
 **Produces:** `sync_playlist(pl_name, ordered_files, create_missing=True, *, dry_run=True, adapter_factory=None, confirmation_token=None, expected_plan_hash=None, playlist_id=None, operation_kind="sync", on_reconciled=None) -> dict`; pure `plan_playlist_sync`; `get_rb_playlists` includes unique IDs. Add explicit adapter parameters for synthetic tests, never an HTTP arbitrary-database input. Report any internal extension before consumers start.
 
-- [ ] Write RED behavior tests that expose destructive comment/member rewriting, repeated apply writes, stale preview, WAL/backup loss and recovery after process death. Use real DB fixture for mutation semantics and keep focused doubles for failure injection.
+- [x] Write RED behavior tests that expose destructive comment/member rewriting, repeated apply writes, stale preview, WAL/backup loss and recovery after process death. Use real DB fixture for mutation semantics and keep focused doubles for failure injection.
 
 ```python
 preview = sync_playlist("Likes", desired, adapter_factory=fixture.factory)
@@ -45,15 +45,15 @@ again = sync_playlist("Likes", desired, dry_run=False,
 assert again["unchanged"] and fixture.inventory() == before
 ```
 
-- [ ] Implement exact target/path identity, preserve existing metadata/comments and retained memberships, reject duplicate targets/paths, use explicit single transaction and supported registry primitives. Remove/reorder only the target playlist's memberships; path-only mode cannot change membership.
-- [ ] Implement fingerprint-bound preview/apply and no-op/replay. Check root files and DB state under the lock immediately before mutation. Confirmation/hash missing returns before write-adapter construction; changed state returns `stale_preview` without backup/mutation.
-- [ ] Implement verified consistent backup, durable operation phases, atomic external-file publication, integrity/readback and recover-or-refuse after a killed process. Test rollback failures separately; preserve damaged evidence for diagnosis.
-- [ ] Test real newly generated SQLCipher DB + XML/ANLZ fixtures, protected cues/grid/ContentID, WAL, competing lock, interruption and reopening. Direct-session methods must preserve pinned registry semantics; update old tests that specifically asserted the superseded destructive behavior, retain their safety scenarios.
-- [ ] Run targeted Python unittest files in the isolated lab; self-review and report RED/GREEN, actual interfaces, remaining limits. Controller commits/reviews before Task 2.
+- [x] Implement exact target/path identity, preserve existing metadata/comments and retained memberships, reject duplicate targets/paths, use explicit single transaction and supported registry primitives. Remove/reorder only the target playlist's memberships; path-only mode cannot change membership.
+- [x] Implement fingerprint-bound preview/apply and no-op/replay. Check root files and DB state under the lock immediately before mutation. Confirmation/hash missing returns before write-adapter construction; changed state returns `stale_preview` without backup/mutation.
+- [x] Implement verified consistent backup, durable operation phases, atomic external-file publication, integrity/readback and recover-or-refuse after a killed process. Test rollback failures separately; preserve damaged evidence for diagnosis.
+- [x] Test real newly generated SQLCipher DB + XML/ANLZ fixtures, protected cues/grid/ContentID, WAL, competing lock, interruption and reopening. Direct-session methods must preserve pinned registry semantics; update old tests that specifically asserted the superseded destructive behavior, retain their safety scenarios.
+- [x] Run targeted Python unittest files in the isolated lab; self-review and report RED/GREEN, actual interfaces, remaining limits. Controller commits/reviews before Task 2.
 
 ### Task 2: Authoritative catalog input and verified reversible WAV paths
 
-**Ownership:** `app/main.py` Rekordbox endpoints and source resolution only; new `app/rekordbox_service.py`, `app/rekordbox_media.py`; minimal catalog/converter helpers only when required; new `qa/tests/test_rekordbox_catalog.py`, `qa/tests/test_rekordbox_media.py`, API cases formerly in test_rekordbox_sync.py with coordination. Do not edit reviewed core/adapter without reporting a concrete interface gap first.
+**Ownership:** `app/main.py` Rekordbox endpoints and source resolution, plus narrowly required local membership persistence/read projection; new `app/rekordbox_service.py`, `app/rekordbox_media.py`; minimal library/catalog/converter helpers only when required; new `qa/tests/test_rekordbox_catalog.py`, `qa/tests/test_rekordbox_media.py`, API cases formerly in test_rekordbox_sync.py with coordination. Do not edit reviewed core/adapter without reporting a concrete interface gap first.
 
 **Consumes:** Task 1 sync contract; server-side Deezer fetch_tracks, SoundCloud source fetching and local sources; catalog_service.playlist_tracks/configured roots; staged converter/publication.
 
@@ -72,6 +72,7 @@ assert result["error"]["code"] == "stale_preview"
 ```
 
 - [ ] Replace sidecar-only sourcing with authoritative service order and catalog paths; keep all unreadable/unavailable items explicit. Preserve normal sync as an idempotent operation without arbitrary path input.
+- [ ] Close the existing local-source producer gap: explicit local additions must retain requested membership/order even when all files are reused and no download job runs. Provide a validated local tracks projection through the catalog without calling Deezer for a local key. Keep unresolved requested members explicit and preserve existing local metadata.
 - [ ] Write real-audio RED tests for WAV preparation/reuse/revert and timeline mismatch: truncated/shifted variant or changed original cannot rebind; preserved cues/grid keep their timestamps. Use source/target decoded PCM equivalence and native rates/channels/frame counts, not stream-reported duration alone.
 - [ ] Implement durable original/variant mapping, staged no-clobber publication, explicit preparation action, fresh verification at application, source preservation and post-reconcile state/recovery. Ordinary preview writes no media or database. Expose shared-content effects in preview.
 - [ ] Run targeted API/audio suites; demonstrate real converter and ANLZ preservation; report exact contracts and no live-provider claims. Controller commits/reviews before Task 3.
@@ -95,6 +96,7 @@ if (calls.some(call => call.isApply && call.hash !== displayedHash)) throw Error
 
 - [ ] Implement preview display with target/counts/actual paths, explicit confirmation and stale-result guards. Retain all source/account/library behaviors. Use optional target selection for duplicate playlist names; unresolved results cannot be applied.
 - [ ] Implement WAV prepare -> database preview -> explicit apply, revert, persisted mode and shared-content notice; show success only after reconciled backend result.
+- [ ] Expose existing local playlists through the normal selection UI using the reviewed local source projection, so their C controls are reachable. Use the existing layout and canonical local keys; retain provider tabs and search behavior.
 - [ ] Run affected FakeDOM/UI contracts, regenerate frontend, report paths/results. Controller commits before full archive checks.
 
 ### Task 4: Integrated evidence, new Windows candidate and report
@@ -107,3 +109,4 @@ if (calls.some(call => call.isApply && call.hash !== displayedHash)) throw Error
 - [ ] Run one final whole-change review, one coherent fix wave if needed, and scoped re-review. Tie evidence to final source revision.
 - [ ] Build fresh unsigned engineering Windows candidate, validate MSI payload/artifact provenance (Tauri bundle marker exception must be exact), exercise extracted backend on isolated synthetic fixtures. Preserve public-release signing gate.
 - [ ] Update visible release plan and Stage C report with code, actual test/build outcomes, remaining real Rekordbox/live-provider/installer acceptance. No merge/push/install/pin promotion. Retain worktree/evidence for further release work.
+
