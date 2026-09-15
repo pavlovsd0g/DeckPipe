@@ -85,7 +85,7 @@ assert result["error"]["code"] == "stale_preview"
 
 **Produces:** normal Windows UI for target/order/path preview, applying exactly the displayed hash, unresolved and stale-state handling, no-op, recovery errors, WAV preparation and reversible path switch. All Russian user messages describe actions/results rather than internal JSON/hash/experimental flags.
 
-- [ ] Write failing behavior tests for no apply on cancellation/unresolved/error, exact hash forwarding, changed selected playlist while awaiting preview, duplicate apply prevention and readable result messages.
+- [x] Write failing behavior tests for no apply on cancellation/unresolved/error, exact hash forwarding, changed selected playlist while awaiting preview, duplicate apply prevention and readable result messages.
 
 ```javascript
 const preview = await rbSync();
@@ -94,10 +94,10 @@ const preview = await rbSync();
 if (calls.some(call => call.isApply && call.hash !== displayedHash)) throw Error('wrong preview applied');
 ```
 
-- [ ] Implement preview display with target/counts/actual paths, explicit confirmation and stale-result guards. Retain all source/account/library behaviors. Use optional target selection for duplicate playlist names; unresolved results cannot be applied.
-- [ ] Implement WAV prepare -> database preview -> explicit apply, revert, persisted mode and shared-content notice; show success only after reconciled backend result.
-- [ ] Expose existing local playlists through the normal selection UI using the reviewed local source projection, so their C controls are reachable. Use the existing layout and canonical local keys; retain provider tabs and search behavior.
-- [ ] Run affected FakeDOM/UI contracts, regenerate frontend, report paths/results. Controller commits before full archive checks.
+- [x] Implement preview display with target/counts/actual paths, explicit confirmation and stale-result guards. Retain all source/account/library behaviors. Use optional target selection for duplicate playlist names; unresolved results cannot be applied.
+- [x] Implement WAV prepare -> database preview -> explicit apply, revert, persisted mode and shared-content notice; show success only after reconciled backend result.
+- [x] Expose existing local playlists through the normal selection UI using the reviewed local source projection, so their C controls are reachable. Use the existing layout and canonical local keys; retain provider tabs and search behavior.
+- [x] Run affected FakeDOM/UI contracts, regenerate frontend, report paths/results. Controller commits before full archive checks.
 
 ### Task 4: Integrated evidence, new Windows candidate and report
 
