@@ -9,7 +9,17 @@
 В отдельном профиле приложения, без пользовательской музыки и авторизации:
 
 ```powershell
-$env:DECKPIPE_DATA_DIR = 'D:\DeckPipe-RC-Lab\qa-evidence\developer-profile'
+$deckpipeTestProfile = Join-Path 'D:\DeckPipe-RC-Lab\qa-evidence' ('developer-' + [guid]::NewGuid().ToString('N'))
+foreach ($deckpipeArea in @('Roaming', 'Local', 'User', 'Data')) {
+  New-Item -ItemType Directory -Path (Join-Path $deckpipeTestProfile $deckpipeArea) | Out-Null
+}
+$env:APPDATA = Join-Path $deckpipeTestProfile 'Roaming'
+$env:LOCALAPPDATA = Join-Path $deckpipeTestProfile 'Local'
+$env:USERPROFILE = Join-Path $deckpipeTestProfile 'User'
+$env:DECKPIPE_DATA_DIR = Join-Path $deckpipeTestProfile 'Data'
+$env:TEMP = Join-Path 'D:\DeckPipe-RC-Lab\t' ([guid]::NewGuid().ToString('N').Substring(0, 8))
+$env:TMP = $env:TEMP
+New-Item -ItemType Directory -Path $env:TEMP | Out-Null
 $env:DECKPIPE_API_TOKEN = 'synthetic-test-only'
 $env:DECKPIPE_BOUND_PORT = '7100'
 $env:PYTHONDONTWRITEBYTECODE = '1'
@@ -33,7 +43,7 @@ cargo test --offline --locked --manifest-path desktop/src-tauri/Cargo.toml
 
 Backend EXE остаётся единственным внешним sidecar; новому checkout сначала нужно подготовить его через release pipeline. Окно входа и его профили создаёт само приложение Tauri.
 
-Для проверки **собранного EXE** изоляция отличается: frozen backend намеренно игнорирует `DECKPIPE_DATA_DIR`. Перед его запуском задайте дочернему процессу отдельные `APPDATA` и `LOCALAPPDATA` внутри новой папки лаборатории; профиль будет создан в `APPDATA/DeckPipe`. Не переносите туда рабочую конфигурацию или авторизацию. Тест исходников с `DECKPIPE_DATA_DIR` не доказывает изоляцию собранного приложения.
+Для проверки **собранного EXE** frozen backend намеренно игнорирует `DECKPIPE_DATA_DIR`. Перед его запуском задайте дочернему процессу отдельные `APPDATA`, `LOCALAPPDATA`, `USERPROFILE` и временную папку, как выше; профиль будет создан в `APPDATA/DeckPipe`. Такая же изоляция нужна тестам исходников с Rekordbox, чтобы библиотеки не искали конфигурацию в рабочем профиле Windows. Тестовые базы создаются заново с явными синтетическими путями и ключами. Не переносите туда рабочую конфигурацию, музыку или авторизацию. Один `DECKPIPE_DATA_DIR` не доказывает изоляцию собранного приложения.
 
 ## Воспроизводимая сборка кандидата
 
