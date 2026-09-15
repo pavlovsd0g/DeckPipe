@@ -531,6 +531,20 @@ collectActions(elements.get('#playlists')).forEach(action => emitted.add(action)
 libraryConfigured = true;
 await loadSearchTargets();
 collectActions(elements.get('#playlists')).forEach(action => emitted.add(action));
+await loadLocalPlaylists();
+collectActions(elements.get('#playlists')).forEach(action => emitted.add(action));
+current = {kind: 'local', id: 'local:one', title: 'Local'};
+const rbOperation = beginRbOperation();
+const rbDialog = chooseRbTargetDialog(rbOperation, 'Local', [
+  {id: 'rb-1', name: 'Local', count: 1},
+  {id: 'rb-2', name: 'Local', count: 2},
+]);
+for (const selector of ['#btnAuthStart', '#btnAuthRetry']) {
+  collectActions(elements.get(selector)).forEach(action => emitted.add(action));
+}
+cancelRbDialog();
+await rbDialog;
+finishRbOperation(rbOperation);
 console.log(JSON.stringify({
   emitted: [...emitted].sort(),
   click: Object.keys(clickActions).sort(),

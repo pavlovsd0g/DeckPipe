@@ -15,17 +15,31 @@ from qa.tests.test_library_catalog import wav_file, track
 
 class Client:
     def __init__(self, app):
+        from app.security import LoopbackSecurityMiddleware
         self.app = app
+        settings = [middleware.kwargs['settings'] for middleware in app.user_middleware
+                    if middleware.cls is LoopbackSecurityMiddleware]
+        if len(settings) != 1:
+            raise AssertionError('Client requires exactly one production loopback security middleware')
+        # The target app captured immutable settings at import/launch. Other
+        # suites can launch another listener and change os.environ afterwards;
+        # those new process values do not reconfigure this existing ASGI app.
+        self.settings = settings[0]
 
-    def request(self, method, url, json=None):
+    def request(self, method, url, json=None, *, headers=None):
         import json as codec
         split = urlsplit(url)
+        host = self.settings.bound_host
+        authority = f'[{host}]' if ':' in host else host
+        request_headers = {'host': f'{authority}:{self.settings.bound_port}',
+                           'authorization': 'Bearer ' + self.settings.api_token,
+                           'content-type': 'application/json'}
+        request_headers.update(headers or {})
         async def with_query(scope, receive, send):
             scope['query_string'] = split.query.encode()
+            scope['server'] = (host, self.settings.bound_port)
             await self.app(scope, receive, send)
-        status, _, body = asyncio.run(asgi_request(with_query, method, split.path,
-            {'host': '127.0.0.1:' + os.environ['DECKPIPE_BOUND_PORT'],
-             'authorization': 'Bearer ' + os.environ['DECKPIPE_API_TOKEN'], 'content-type': 'application/json'},
+        status, _, body = asyncio.run(asgi_request(with_query, method, split.path, request_headers,
             codec.dumps(json).encode() if json is not None else b''))
         return SimpleNamespace(status_code=status, text=body.decode(), json=lambda: codec.loads(body))
 
@@ -34,6 +48,37 @@ class Client:
 
     def get(self, url):
         return self.request('GET', url)
+
+
+class ClientLaunchBindingTests(unittest.TestCase):
+    def test_client_targets_immutable_app_launch_after_other_suite_changes_environment(self):
+        from fastapi import FastAPI
+        from app.security import LoopbackSecurityMiddleware, SecuritySettings
+        app = FastAPI()
+        settings = SecuritySettings.for_launch('127.0.0.1', 7241, 'synthetic-client-launch')
+        app.add_middleware(LoopbackSecurityMiddleware, settings=settings)
+        calls = []
+        @app.get('/api/probe')
+        def probe():
+            calls.append('authorized')
+            return {'ok': True}
+        client = Client(app)
+        with patch.dict(os.environ, {'DECKPIPE_BOUND_PORT': '7242', 'DECKPIPE_API_TOKEN': 'synthetic-later-launch'}):
+            response = client.get('/api/probe')
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(calls, ['authorized'])
+        self.assertEqual(response.json(), {'ok': True})
+
+        # The helper submits real credentials; it does not strip or bypass the
+        # middleware. Explicitly bad credentials and origins still stop routing.
+        for headers, expected_status in [({'authorization': 'Bearer synthetic-wrong'}, 401),
+                                         ({'host': '127.0.0.1:7242'}, 403),
+                                         ({'origin': 'https://untrusted.invalid'}, 403)]:
+            with self.subTest(headers=headers):
+                refused = client.request('GET', '/api/probe', headers=headers)
+                self.assertEqual(refused.status_code, expected_status, refused.text)
+                self.assertNotIn(settings.api_token, refused.text)
+                self.assertEqual(calls, ['authorized'])
 
 
 class CatalogApiTests(unittest.TestCase):
