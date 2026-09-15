@@ -231,9 +231,9 @@ confirmation_token=rb.APPLY_CONFIRMATION_TOKEN,expected_plan_hash=preview['plan'
         journal = Journal(self.fixture.path)
         self.assertEqual(journal.data['phase'], 'database_committed')
         self.assertEqual(self.preview()['error']['code'], 'recovery_needed')
-        result = rb.sync_playlist('Likes', self.fixture.desired(), adapter_factory=self.fixture.factory,
-            dry_run=False, confirmation_token=rb.APPLY_CONFIRMATION_TOKEN,
-            expected_plan_hash=journal.data['plan_hash'])
+        result = rb.recover_operation(adapter_factory=self.fixture.factory,
+            dry_run=False, confirmation_token=rb.RECOVERY_CONFIRMATION_TOKEN,
+            expected_plan_hash=rb.recover_operation(adapter_factory=self.fixture.factory)['plan']['hash'])
         self.assertEqual(result['error']['code'], 'recovery_restored_preview_required', result)
         self.assertEqual(self.fixture.inventory(), before)
         self.assertTrue((self.fixture.root / 'deckpipe-rekordbox-mutation.lock').exists())
@@ -255,9 +255,9 @@ confirmation_token=rb.APPLY_CONFIRMATION_TOKEN,expected_plan_hash=preview['plan'
                     adapter.db.commit()
                 adapter.close()
                 before = fixture.inventory()
-                result = rb.sync_playlist('Likes', fixture.desired(), adapter_factory=fixture.factory,
-                    dry_run=False, confirmation_token=rb.APPLY_CONFIRMATION_TOKEN,
-                    expected_plan_hash=preview['plan']['hash'])
+                result = rb.recover_operation(adapter_factory=fixture.factory, dry_run=False,
+                    confirmation_token=rb.RECOVERY_CONFIRMATION_TOKEN,
+                    expected_plan_hash=rb.recover_operation(adapter_factory=fixture.factory)['plan']['hash'])
                 expected = 'recovery_backup_damaged' if damaged else 'recovery_database_changed'
                 self.assertEqual(result['error']['code'], expected, result)
                 self.assertEqual(fixture.inventory(), before)
@@ -394,9 +394,9 @@ confirmation_token=rb.APPLY_CONFIRMATION_TOKEN,expected_plan_hash=preview['plan'
                     capture_output=True, timeout=30)
                 self.assertEqual(child.returncode, 73, child.stderr.decode(errors='replace'))
                 journal = Journal(fixture.path)
-                result = rb.sync_playlist('Likes', fixture.desired(), adapter_factory=fixture.factory,
-                    dry_run=False, confirmation_token=rb.APPLY_CONFIRMATION_TOKEN,
-                    expected_plan_hash=journal.data['plan_hash'])
+                result = rb.recover_operation(adapter_factory=fixture.factory,
+                    dry_run=False, confirmation_token=rb.RECOVERY_CONFIRMATION_TOKEN,
+                    expected_plan_hash=rb.recover_operation(adapter_factory=fixture.factory)['plan']['hash'])
                 self.assertEqual(result['error']['code'], 'recovery_restored_preview_required', result)
                 self.assertEqual(fixture.inventory(), before)
 
@@ -455,9 +455,9 @@ confirmation_token=rb.APPLY_CONFIRMATION_TOKEN,expected_plan_hash=preview['plan'
         self.assertEqual(child.returncode, 73, child.stderr.decode(errors='replace'))
         self.assertNotEqual(analysis.read_bytes(), original_bytes)
         journal = Journal(self.fixture.path)
-        result = rb.sync_playlist('Likes', self.fixture.desired(), adapter_factory=self.fixture.factory,
-            dry_run=False, confirmation_token=rb.APPLY_CONFIRMATION_TOKEN,
-            expected_plan_hash=journal.data['plan_hash'])
+        result = rb.recover_operation(adapter_factory=self.fixture.factory,
+            dry_run=False, confirmation_token=rb.RECOVERY_CONFIRMATION_TOKEN,
+            expected_plan_hash=rb.recover_operation(adapter_factory=self.fixture.factory)['plan']['hash'])
         self.assertEqual(result['error']['code'], 'recovery_restored_preview_required', result)
         self.assertEqual(self.fixture.inventory(), before)
         self.assertEqual(analysis.read_bytes(), original_bytes)

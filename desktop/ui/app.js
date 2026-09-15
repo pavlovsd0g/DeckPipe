@@ -120,6 +120,10 @@ var RB_ERROR_MESSAGES = Object.freeze({
   media_state_unavailable: "Изменения записаны, но текущее состояние файлов не удалось перечитать.",
   media_bit_depth_conflict: "Для этих файлов уже подготовлен WAV другой разрядности. Проверьте подготовленные файлы.",
   playlist_not_found: "Выбранный плейлист Rekordbox больше не найден. Обновите просмотр.",
+  rekordbox_process_check_failed: "Не удалось проверить, закрыт ли Rekordbox. Запись заблокирована; повторите проверку состояния.",
+  recovery_stale_preview: "Незавершённая операция или её файлы изменились. Откройте восстановление заново и проверьте новое состояние.",
+  recovery_context_unavailable: "Данные восстановления недоступны. Подключите диск Rekordbox и повторите проверку.",
+  recovery_not_needed: "Незавершённых операций Rekordbox нет. Откройте свежий просмотр синхронизации.",
   preview_required: "Сначала откройте свежий просмотр изменений.",
   recovery_needed: "Осталась незавершённая операция Rekordbox. Её нужно отдельно восстановить перед новым просмотром.",
   recovery_restored_preview_required: "Незавершённая операция восстановлена. Перед новыми изменениями нужен свежий просмотр.",
@@ -282,6 +286,8 @@ function setRbOperationBusy(busy) {
   const wavButton = $("#flipBtn");
   if (syncButton) syncButton.disabled = busy;
   if (wavButton) wavButton.disabled = busy;
+  const recoveryButton = $("#rbRecoveryBtn");
+  if (recoveryButton) recoveryButton.disabled = busy;
 }
 function invalidateRbOperation({ selectionChanged = true } = {}) {
   cancelRbDialog();
@@ -290,14 +296,15 @@ function invalidateRbOperation({ selectionChanged = true } = {}) {
   rbMediaMode = null;
   setRbOperationBusy(false);
 }
-function beginRbOperation() {
-  if (rbOperationBusy || !current) return null;
-  const selection = captureRbSelection();
+function beginRbOperation({ global = false } = {}) {
+  if (rbOperationBusy || !global && !current) return null;
+  const selection = global ? null : captureRbSelection();
   const generation = ++rbOperationGeneration;
   setRbOperationBusy(true);
   return { generation, selection };
 }
 function rbOperationIsCurrent(operation) {
+  if (operation && operation.selection === null) return operation.generation === rbOperationGeneration;
   const selected = captureRbSelection();
   return !!operation && operation.generation === rbOperationGeneration && !!selected && selected.epoch === operation.selection.epoch && selected.key === operation.selection.key && selected.title === operation.selection.title;
 }
@@ -1540,6 +1547,7 @@ function formatRbPreview(result, action = "Синхронизация") {
   const targetText = !plan.target ? "Цель Rekordbox не удалось определить." : target.id == null ? `Цель Rekordbox: новый плейлист «${target.name || "без названия"}» будет создан.` : `Цель Rekordbox: существующий плейлист «${target.name || "без названия"}», ID ${target.id}.`;
   const lines = [action, targetText, `Изменения: ${formatRbSyncCounts(result)}.`, ...rbOrderedPathLines(result), ...rbSharedEffectLines(result)];
   if (result?.media_state?.mode) lines.push(`Текущий режим файлов: ${rbMediaModeLabel(result.media_state.mode)}.`);
+  if (result?.media_state?.membership === "partial") lines.push(`Состав плейлиста неполный: отсутствует ${result.media_state.missing} треков. Сначала синхронизируйте состав и порядок.`);
   if (result?.unchanged) lines.push("Rekordbox уже соответствует этому плану. Применение и новый бэкап не требуются.");
   else lines.push("Это только просмотр: изменения не применялись, новый бэкап не создавался.");
   return lines.join("\n");
@@ -1551,7 +1559,8 @@ function rbMediaModeLabel(mode) {
     mixed: "смешанный — часть WAV, часть исходников",
     empty: "пустой плейлист",
     not_in_rekordbox: "плейлист ещё не создан в Rekordbox",
-    blocked: "состояние нельзя определить безопасно"
+    blocked: "состояние нельзя определить безопасно",
+    membership_sync_required: "сначала синхронизируйте состав плейлиста"
   }[mode] || "не определён";
 }
 function renderRbMediaMode(mode) {
@@ -1564,7 +1573,8 @@ function renderRbMediaMode(mode) {
     mixed: "⇄ WAV / оригиналы",
     empty: "⇄ WAV",
     not_in_rekordbox: "⇄ WAV после синхронизации",
-    blocked: "⇄ Проверить состояние"
+    blocked: "⇄ Проверить состояние",
+    membership_sync_required: "⇄ WAV после синхронизации"
   }[mode] || "⇄ Проверить WAV";
   node.title = `Режим Rekordbox: ${rbMediaModeLabel(mode)}`;
 }
@@ -1580,6 +1590,11 @@ function rememberedRbTarget(selection) {
 }
 function rememberRbTarget(selection, playlistId) {
   if (playlistId != null) rbTargetIdsBySource.set(rbTargetMemoryKey(selection), String(playlistId));
+}
+function forgetMissingRbTarget(selection, result) {
+  if (selection && result?.error?.code === "playlist_not_found") {
+    rbTargetIdsBySource.delete(rbTargetMemoryKey(selection));
+  }
 }
 function rbMediaStatePath(selection, playlistId = null) {
   const params = new URLSearchParams({ playlist_key: selection.key, playlist_title: selection.title });
@@ -1599,7 +1614,8 @@ async function refreshRbMediaState(selection = current, { quiet = false, operati
     const selected = captureRbSelection();
     if (selectionEpoch !== rbSelectionEpoch || !selected || selected.key !== captured.key || selected.title !== captured.title) return null;
   }
-  renderRbMediaMode(result?.media_state?.mode);
+  forgetMissingRbTarget(captured, result);
+  renderRbMediaMode(result?.media_state?.membership && result.media_state.membership !== "complete" ? "membership_sync_required" : result?.media_state?.mode);
   if (!quiet && (result?.error || result?.unresolved?.length || result?.media_state?.mode === "blocked")) {
     showRbResultError(result, "Текущее состояние Rekordbox нельзя определить безопасно.");
   }
@@ -1618,8 +1634,10 @@ async function chooseRbTarget(operation, title) {
   return candidates.some((item) => String(item.id) === String(selected)) ? String(selected) : null;
 }
 async function restorePendingRbOperation(endpoint, body, preview, operation) {
+  preview = await api("/api/rb/recovery");
+  if (!rbOperationIsCurrent(operation)) return { stop: true };
   const hash = preview?.plan?.hash;
-  if (!hash) {
+  if (!hash || preview.error) {
     showRbResultError(preview, "Для восстановления не получен безопасный план.");
     return { stop: true };
   }
@@ -1627,7 +1645,9 @@ async function restorePendingRbOperation(endpoint, body, preview, operation) {
   const confirmed = await confirmRbAction(
     operation,
     "Восстановление Rekordbox",
-    "Восстановить состояние до незавершённой операции Rekordbox?\nПосле восстановления DeckPipe заново покажет план, и для новых изменений потребуется отдельное подтверждение.",
+    `Восстановить состояние до незавершённой операции Rekordbox?
+Операция: ${preview.plan.operation_id}. Будут восстановлены база и связанные файлы.
+После восстановления для новых изменений потребуется свежий просмотр и отдельное подтверждение.`,
     "Восстановить"
   );
   if (!rbOperationIsCurrent(operation)) return { stop: true };
@@ -1637,8 +1657,8 @@ async function restorePendingRbOperation(endpoint, body, preview, operation) {
   }
   if (!rbOperationIsCurrent(operation)) return { stop: true };
   const restored = await api(
-    `${endpoint}?dry_run=false&confirmation_token=${encodeURIComponent(RB_APPLY_CONFIRMATION_TOKEN)}`,
-    { body: { ...body, expected_plan_hash: hash } }
+    "/api/rb/recovery?confirmation_token=RESTORE_REKORDBOX_OPERATION",
+    { body: { expected_plan_hash: hash } }
   );
   if (!rbOperationIsCurrent(operation)) return { stop: true };
   if (restored?.error?.code !== "recovery_restored_preview_required") {
@@ -1646,9 +1666,34 @@ async function restorePendingRbOperation(endpoint, body, preview, operation) {
     return { stop: true };
   }
   showStatus("Незавершённая операция восстановлена. Загружаем новый план без автоматического применения.");
+  if (!endpoint) {
+    showStatus("Незавершённая операция восстановлена. Для синхронизации выберите источник и откройте новый просмотр.");
+    return { stop: true };
+  }
   const fresh = await api(`${endpoint}?dry_run=true`, { body });
   if (!rbOperationIsCurrent(operation)) return { stop: true };
   return { preview: fresh, prefix: "Незавершённая операция восстановлена.\n" };
+}
+async function rbRecovery() {
+  const operation = beginRbOperation({ global: true });
+  if (!operation) return;
+  try {
+    const status = await api("/api/rb/status");
+    if (!rbOperationIsCurrent(operation)) return;
+    if (status.error) {
+      showRbResultError(status);
+      return;
+    }
+    if (!status.recovery?.needed) {
+      showStatus("Rekordbox: незавершённых операций нет.");
+      return;
+    }
+    await restorePendingRbOperation(null, null, null, operation);
+  } catch (error) {
+    if (rbOperationIsCurrent(operation)) showError(error, "rekordbox");
+  } finally {
+    finishRbOperation(operation);
+  }
 }
 async function loadRbPreview(endpoint, body, operation) {
   let preview = await api(`${endpoint}?dry_run=true`, { body });
@@ -1668,6 +1713,7 @@ async function loadRbPreview(endpoint, body, operation) {
     if (!rbOperationIsCurrent(operation)) return { stop: true };
   }
   if (preview?.plan?.target?.id != null) rememberRbTarget(operation.selection, preview.plan.target.id);
+  forgetMissingRbTarget(operation.selection, preview);
   return { preview, prefix };
 }
 function showRbAppliedResult(result, action) {
@@ -1702,6 +1748,7 @@ async function applyRbPreview(endpoint, body, preview, operation, action) {
     { body: { ...body, expected_plan_hash: viewedHash } }
   );
   if (!rbOperationIsCurrent(operation)) return false;
+  forgetMissingRbTarget(operation.selection, applied);
   return showRbAppliedResult(applied, action);
 }
 async function rbSync() {
@@ -1749,6 +1796,10 @@ async function flipWav() {
     let playlistId = rememberedRbTarget(selection);
     let state = await refreshRbMediaState(selection, { operation, playlistId, quiet: true });
     if (!state || !rbOperationIsCurrent(operation)) return;
+    if (state?.error?.code === "recovery_needed") {
+      await restorePendingRbOperation(null, null, null, operation);
+      return;
+    }
     if (state?.error?.code === "ambiguous_playlist_target") {
       playlistId = await chooseRbTarget(operation, selection.title);
       if (!playlistId || !rbOperationIsCurrent(operation)) return;
@@ -1756,6 +1807,10 @@ async function flipWav() {
       clearError();
       state = await refreshRbMediaState(selection, { operation, playlistId, quiet: true });
       if (!state || !rbOperationIsCurrent(operation)) return;
+    }
+    if (state.media_state?.membership && state.media_state.membership !== "complete") {
+      showStatus("Сначала синхронизируйте состав и порядок плейлиста через → RB. Затем откройте переключение WAV заново.");
+      return;
     }
     if (state.error || state.unresolved?.length || state.media_state?.mode === "blocked") {
       showRbResultError(state, "Текущее состояние Rekordbox нельзя определить безопасно.");
@@ -1773,7 +1828,7 @@ async function flipWav() {
         showError(new Error("Режим не выбран. Пути Rekordbox не изменялись."), "rekordbox");
         return;
       }
-    } else if (["original", "not_in_rekordbox"].includes(mode)) toWav = true;
+    } else if (mode === "original") toWav = true;
     else {
       showError(new Error(`Для режима «${rbMediaModeLabel(mode)}» переключение путей недоступно.`), "rekordbox");
       return;
@@ -1911,6 +1966,7 @@ var clickActions = Object.freeze({
   "sync-playlist-order": () => syncPlaylistOrder(),
   "sync-append": () => syncAppend(),
   "rb-sync": () => rbSync(),
+  "rb-recovery": () => rbRecovery(),
   "flip-wav": () => flipWav(),
   "run-search": () => runSearch(),
   "set-search-filter": (el) => setSearchFilter(el.dataset.filter),

@@ -604,19 +604,25 @@ class LocalPlaylistIn(BaseModel):
 
 @app.get("/api/local/playlists")
 def api_local_playlists():
+    from .rekordbox_service import local_tracks, _local_sidecar, SourceError
     _require_music_root()
     out = []
     for s in _local_sources():
         key = f"local:{s['id']}"
         pl_dir = library.playlist_dir(key, s["title"])
-        sc = library.load_sidecar(pl_dir)
+        try:
+            sc = _local_sidecar(pl_dir)
+            count, membership_error = len(local_tracks(pl_dir)), None
+        except SourceError as exc:
+            sc, count, membership_error = {'tracks': {}}, None, {'code': exc.code}
         ok = err = 0
         for e in sc.get("tracks", {}).values():
             if e.get("status", "").startswith("verify_failed"):
                 err += 1
             elif library.is_ready_entry(pl_dir, e):
                 ok += 1
-        out.append({**s, "key": key, "ok": ok, "errors": err, "path": str(pl_dir)})
+        out.append({**s, 'count': count, 'membership_error': membership_error,
+                    "key": key, "ok": ok, "errors": err, "path": str(pl_dir)})
     return out
 
 
@@ -1022,14 +1028,34 @@ from . import rekordbox as rb
 
 @app.get("/api/rb/status")
 def api_rb_status():
-    out = {"db_exists": rb.db_exists(), "running": rb.rb_running(), "playlists": [],
+    out = {"db_exists": rb.db_exists(), "running": None, "playlists": [],
            "recovery": rb.get_recovery_status()}
+    try:
+        out['running'] = rb.rb_running()
+    except rb.AdapterError as exc:
+        out['error'] = {'code': str(exc)}
+        return out
     if out["db_exists"] and not out["running"]:
         try:
             out["playlists"] = rb.get_rb_playlists()
         except Exception:
             out["error"] = "Rekordbox status unavailable"
     return out
+
+
+class RbRecoveryIn(BaseModel):
+    expected_plan_hash: str | None = None
+
+
+@app.get('/api/rb/recovery')
+def api_rb_recovery_preview():
+    return rb.recover_operation()
+
+
+@app.post('/api/rb/recovery')
+def api_rb_recovery_restore(body: RbRecoveryIn, confirmation_token: str | None = None):
+    return rb.recover_operation(dry_run=False, expected_plan_hash=body.expected_plan_hash,
+                                confirmation_token=confirmation_token)
 
 
 class RbSyncIn(BaseModel):

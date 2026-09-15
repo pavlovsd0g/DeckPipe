@@ -269,7 +269,21 @@ class Journal:
         except OwnershipError:
             raise RecoveryError('recovery_external_busy') from None
 
-    def restore(self, adapter):
+    def recovery_context(self, adapter, owned_hashes=None):
+        # Hash the complete durable record and observed authoritative state.
+        # Media/source-provider availability is irrelevant to row restoration.
+        files = {self.data['backup']}
+        for item in self.data['external']:
+            files.update((item['path'], item['backup']))
+            files.update(move['path'] for move in item.get('moves', []))
+        context = {'operation_id': self.data['id'], 'phase': self.data['phase'],
+                   'journal': self.data, 'database': adapter.fingerprint(),
+                   'files': {path: owned_hashes[path] if owned_hashes and path in owned_hashes else file_hash(path)
+                             for path in sorted(files)}}
+        return {'operation_id': self.data['id'], 'phase': self.data['phase'],
+                'external_files': len(self.data['external']), 'hash': digest(context)}
+
+    def restore(self, adapter, *, expected_recovery_hash=None):
         """Restore under SQLite writer ownership and mandatory external handles."""
         data = self.data
         if str(adapter.db_path.resolve()) != data['database_path']:
@@ -298,6 +312,12 @@ class Journal:
                 state = adapter.fingerprint()
                 if state not in (data['database_before'], data['database_after']):
                     raise RecoveryError('recovery_database_changed')
+                if expected_recovery_hash is not None:
+                    # Re-read identity as well: an earlier preview cannot approve
+                    # a replacement journal or a changed backup/file/DB state.
+                    owned_hashes = {path: owner.digest() if owner else file_hash(path) for path, owner in owners.items()}
+                    if Journal(self.db_path).data != data or self.recovery_context(adapter, owned_hashes)['hash'] != expected_recovery_hash:
+                        raise RecoveryError('recovery_stale_preview')
                 adapter.validate_recovery_schema()
                 self.save(phase='restoring')
                 if state != data['database_before']:

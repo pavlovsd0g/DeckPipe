@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 
 APPLY_CONFIRMATION_TOKEN = "APPLY_REKORDBOX_CHANGES"
+RECOVERY_CONFIRMATION_TOKEN = "RESTORE_REKORDBOX_OPERATION"
 SUPPORTED_PYREKORDBOX_VERSION = "0.4.4"
 CANONICAL_FIELDS = ("provider_id", "title", "artist", "album", "duration", "position", "path", "source_path", "content_id", "existing_path", "verified_path_sha256", "verified_source_sha256")
 
@@ -22,8 +23,24 @@ def db_exists() -> bool:
 
 
 def rb_running() -> bool:
-    r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq rekordbox.exe"], capture_output=True, text=True)
-    return "rekordbox.exe" in r.stdout.lower()
+    # Enumerate CSV rows, avoiding localized "no matching tasks" prose entirely.
+    # Only the ASCII executable/PID fields matter; memory/session names may use
+    # the Windows OEM code page even when Python runs in UTF-8 mode.
+    try:
+        result = subprocess.run(['tasklist', '/FO', 'CSV', '/NH'], capture_output=True, timeout=10)
+        if result.returncode != 0 or not isinstance(result.stdout, bytes) or not result.stdout.strip():
+            raise ValueError()
+        names = []
+        for line in result.stdout.splitlines():
+            if not line.strip():
+                continue
+            fields = line.strip().split(b'","')
+            if len(fields) != 5 or not fields[0].startswith(b'"') or not fields[-1].endswith(b'"') or not fields[1].isdigit():
+                raise ValueError()
+            names.append(fields[0][1:].lower())
+        return b'rekordbox.exe' in names
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise AdapterError('rekordbox_process_check_failed') from None
 
 
 def open_db():
@@ -286,12 +303,10 @@ def sync_playlist(pl_name, ordered_files, create_missing=True, *, dry_run=True,
                 return _failure('concurrent_apply', plan=plan)
             adapter = factory()
             journal = Journal(adapter.db_path)
+            if journal.pending:
+                return _failure('recovery_needed', plan=plan, backup=journal.data)
             if adapter.is_rekordbox_running():
                 return _failure('rekordbox_running', plan=plan)
-            if journal.pending:
-                journal.restore(adapter)
-                adapter = None
-                return _failure('recovery_restored_preview_required', plan=plan, backup=journal.data)
             adapter.read_only()
             adapter.integrity_check()
             plan = _bound_plan(adapter, pl_name, ordered_files, playlist_id, operation_kind)
@@ -374,6 +389,50 @@ def sync_playlist(pl_name, ordered_files, create_missing=True, *, dry_run=True,
             adapter.close()
 
 
+
+
+def recover_operation(*, dry_run=True, adapter_factory=None, expected_plan_hash=None, confirmation_token=None):
+    """Separate source-independent, journal-bound recovery confirmation."""
+    plan, adapter, journal = {}, None, None
+    if not dry_run and confirmation_token != RECOVERY_CONFIRMATION_TOKEN:
+        return _failure('recovery_not_confirmed', plan=plan)
+    if not dry_run and not expected_plan_hash:
+        return _failure('recovery_preview_required', plan=plan)
+    factory = adapter_factory or _PyrekordboxAdapter
+    try:
+        adapter = factory()
+        journal = Journal(adapter.db_path)
+        if dry_run:
+            adapter.read_only()
+            if not journal.pending:
+                return {**_failure('recovery_not_needed', plan=plan, dry_run=True), 'recovery': False}
+            plan = journal.recovery_context(adapter)
+            return {**_failure('recovery_needed', plan=plan, dry_run=True, backup=journal.data), 'error': None}
+        lock_path = adapter.mutation_lock_path()
+        adapter.close()
+        adapter = None
+        with mutation_lock(lock_path) as acquired:
+            if not acquired:
+                return _failure('concurrent_apply', plan=plan)
+            adapter = factory()
+            journal = Journal(adapter.db_path)
+            if not journal.pending:
+                return _failure('recovery_stale_preview', plan=plan)
+            # Cheap comparison before restoration admission; repeated under the
+            # held SQLite transaction and external-file ownership in restore().
+            plan = journal.recovery_context(adapter)
+            if plan['hash'] != expected_plan_hash:
+                return _failure('recovery_stale_preview', plan=plan, backup=journal.data)
+            journal.restore(adapter, expected_recovery_hash=expected_plan_hash)
+            adapter = None
+            return _failure('recovery_restored_preview_required', plan=plan, backup=journal.data)
+    except (AdapterError, RecoveryError) as exc:
+        return _failure(str(exc), plan=plan, dry_run=dry_run, backup=journal.data if journal else None)
+    except Exception:
+        return _failure('recovery_context_unavailable', plan=plan, dry_run=dry_run)
+    finally:
+        if adapter is not None:
+            adapter.close()
 
 
 def get_recovery_status(*, database_path=None) -> dict:

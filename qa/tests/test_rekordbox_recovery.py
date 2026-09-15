@@ -312,9 +312,9 @@ confirmation_token=rb.APPLY_CONFIRMATION_TOKEN,expected_plan_hash=preview['plan'
                 self.assertEqual(child.returncode, 74, child.stderr.decode(errors='replace'))
                 journal = Journal(fixture.path)
                 self.assertTrue(journal.pending)
-                result = rb.sync_playlist('Likes', fixture.desired(), adapter_factory=fixture.factory,
-                    dry_run=False, confirmation_token=rb.APPLY_CONFIRMATION_TOKEN,
-                    expected_plan_hash=journal.data['plan_hash'])
+                result = rb.recover_operation(adapter_factory=fixture.factory,
+                    dry_run=False, confirmation_token=rb.RECOVERY_CONFIRMATION_TOKEN,
+                    expected_plan_hash=rb.recover_operation(adapter_factory=fixture.factory)['plan']['hash'])
                 self.assertEqual(result['error']['code'], 'recovery_restored_preview_required', result)
                 self.assertEqual(fixture.inventory(), before)
                 self.assertEqual(analysis.read_bytes(), original)

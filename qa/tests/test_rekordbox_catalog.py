@@ -142,9 +142,75 @@ class CatalogApiTests(unittest.TestCase):
             projected = self.client.get('/api/playlists/local:fixture/tracks').json()['tracks']
             self.assertEqual(['2', '1'], [t['id'] for t in projected])
             self.assertEqual(['deezer', 'sc'], [t['provider'] for t in projected])
+            # Registry count was zero; reload derives the durable membership.
+            listing = self.client.get('/api/local/playlists').json()[0]
+            self.assertEqual(listing['count'], 2)
+            self.assertIsNone(listing['membership_error'])
             with patch.object(self.main.rb, 'sync_playlist', side_effect=self.fake_core):
                 desired = self.client.post('/api/rb/sync', json={'playlist_key': 'local:fixture', 'playlist_title': 'Local'}).json()['plan']['desired_resolved']
             self.assertEqual(['deezer:2', 'sc:1'], [t['provider_id'] for t in desired])
+
+    def test_local_count_unknown_for_missing_corrupt_and_known_for_legacy_membership(self):
+        from app import library
+        directory = self.music / 'Local'
+        for payload in (None, b'{broken'):
+            if payload is not None:
+                library.sidecar_path(directory).write_bytes(payload)
+            result = self.client.get('/api/local/playlists')
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertIsNone(result.json()[0]['count'])
+            self.assertEqual(result.json()[0]['membership_error']['code'], 'local_membership_unavailable')
+        library.save_sidecar(directory, {'tracks': {'1': {**self.tracks[0], 'position':1}}})
+        self.assertEqual(self.client.get('/api/local/playlists').json()[0]['count'], 1)
+
+    def test_frontend_ordered_subset_and_retry_preserve_durable_whole_membership(self):
+        from app import library, jobs
+        from app.rekordbox_service import persist_local_membership
+        from qa.tests.test_frontend_contract import run_frontend_app_probe
+        from qa.tests.rekordbox_fixture import Fixture
+        members = [*self.tracks, track('4', 'Missing')]
+        directory = self.music / 'Local'
+        persist_local_membership(directory, members)
+        # A failed saved member must survive a different missing-only job.
+        library.update_track_status(directory, '3', {**self.tracks[2], 'position':3, 'status':'verify_failed_metadata', 'custom':'keep'})
+        before = library.load_sidecar(directory)
+        browser = run_frontend_app_probe('''
+libraryConfigured = libraryReady = true;
+current = {kind:'local', id:'local:fixture', title:'Local'};
+tracks = ''' + json.dumps([{**t, 'status':status} for t, status in zip(members, ['ok','missing','error','missing'])]) + ''';
+globalThis.confirm = () => true;
+const calls=[];
+globalThis.fetch=async(url, request)=>{calls.push({url,body:JSON.parse(request.body)}); return {ok:true,json:async()=>({renamed:0,already_present:1,needs_attention:0,job_id:'synthetic-job'})};};
+await syncPlaylistOrder();
+console.log(JSON.stringify(calls));
+''')
+        self.assertEqual(browser.returncode, 0, browser.stdout)
+        requests = json.loads(browser.stdout)
+        self.assertEqual([t['id'] for t in requests[1]['body']['tracks']], ['2','4'])
+        jobs.initialize(self.base / 'jobs', start_worker=False)
+        for request in requests:
+            response = self.client.post(request['url'], request['body'])
+            self.assertEqual(response.status_code, 200, response.text)
+        job_id = response.json()['job_id']
+        self.assertEqual(response.json()['already_present'], 1)
+        jobs.initialize(self.base / 'jobs', start_worker=False)
+        self.assertEqual([t['id'] for t in jobs.get_job(job_id)['tracks']], ['4'])
+        saved = library.load_sidecar(directory)
+        self.assertEqual(saved['local_membership'], before['local_membership'])
+        self.assertEqual(saved['tracks']['3']['custom'], 'keep')
+        # Retry transport ordering must also preserve full source membership.
+        retry = self.client.post('/api/playlists/local:fixture/download?title=Local&mode=playlist_order',
+            {'tracks':[members[3]]})
+        self.assertEqual(retry.status_code, 200, retry.text)
+        self.assertEqual(library.load_sidecar(directory)['local_membership'], before['local_membership'])
+        wav_file(self.music / 'four' / 'Artist - Missing.wav')
+        library.update_track_status(directory, '3', {'status':'ok'})
+        fixture = Fixture()
+        with patch.object(self.main.rb, '_PyrekordboxAdapter', fixture.factory):
+            result = self.client.post('/api/rb/sync', {'playlist_key':'local:fixture', 'playlist_title':'Local'}).json()
+        self.assertIsNone(result['error'], result)
+        self.assertEqual([t['provider_id'] for t in result['plan']['desired_resolved']], ['deezer:1','deezer:2','deezer:3','deezer:4'])
+        self.assertEqual(self.client.get('/api/local/playlists').json()[0]['count'], 4)
 
     def test_missing_local_soundcloud_retains_url_through_queue_and_download_consumer(self):
         from app import jobs, library

@@ -89,7 +89,7 @@ def persist_local_membership(directory, requested, *, mode='append'):
             raise SourceError('local_membership_unavailable')
         else:
             data, previous = {'tracks': {}}, []
-        if mode == 'append':
+        if mode in ('append', 'playlist_order'):
             # Refresh transport URLs on an explicit re-add, without changing
             # retained order/title/file/status metadata (including legacy rows).
             urls = {(t['provider'], t['id']): t['url'] for t in requested if 'url' in t}
@@ -97,8 +97,10 @@ def persist_local_membership(directory, requested, *, mode='append'):
                         for t in previous]
             existing = {(t['provider'], t['id']) for t in previous}
             members = previous + [t for t in requested if (t['provider'], t['id']) not in existing]
-        else:
+        elif mode == 'replace_membership':
             members = requested
+        else:
+            raise SourceError('local_membership_mode_invalid')
         # File/status metadata is not replaced by a cross-folder projection.
         data['local_membership'] = members
         library.save_sidecar(directory, data)
@@ -189,22 +191,33 @@ def media_state_from_plan(desired, plan, store):
             allowed[path_key(entry['variant'])] = 'wav'
         matches = [row for row in current if path_key(row['path']) in allowed]
         mode = allowed[path_key(matches[0]['path'])] if len(matches) == 1 else ('not_in_rekordbox' if not matches else 'blocked')
-        modes.add(mode)
+        if mode != 'not_in_rekordbox':
+            modes.add(mode)
         rows.append(dict(provider_id=item['provider_id'], original_path=original,
                          wav_path=entry['variant'] if entry else None, prepared=bool(entry), mode=mode,
                          current_path=matches[0]['path'] if len(matches) == 1 else None,
                          content_id=matches[0].get('content_id') if len(matches) == 1 else None))
     known = {path_key(row['current_path']) for row in rows if row['current_path']}
     unmatched = [row for row in current if path_key(row['path']) not in known]
-    mode = next(iter(modes)) if len(modes) == 1 else ('empty' if not modes and not current else 'mixed')
+    target_exists = (plan or {}).get('target', {}).get('id') is not None
+    missing = sum(row['mode'] == 'not_in_rekordbox' for row in rows)
+    membership = 'absent_target' if not target_exists else ('partial' if missing else 'complete')
+    if membership == 'complete' and (plan or {}).get('reorder'):
+        membership = 'order_mismatch'
+    mode = next(iter(modes)) if len(modes) == 1 else ('empty' if not modes else 'mixed')
     if unmatched or 'blocked' in modes:
         mode = 'blocked'
+        membership = 'mismatch'
     return dict(mode=mode, tracks=rows, unmatched_memberships=unmatched,
+                membership=membership, target_exists=target_exists, missing=missing,
                 prepared=sum(row['prepared'] for row in rows), total=len(rows),
                 shared_content=(plan or {}).get('shared_content', []))
 
 
 def inspect_state(key, title, playlist_id=None):
+    pending = pending_recovery()
+    if pending:
+        return {**pending, 'media_state': {'mode': 'blocked'}}
     try:
         desired, store = resolve(key, title), MediaStore()
         media_desired = _media_desired(desired, store)
@@ -221,6 +234,9 @@ def sync(key, title, *, dry_run=True, expected_plan_hash=None, confirmation_toke
     if not dry_run and (confirmation_token != rb.APPLY_CONFIRMATION_TOKEN or not expected_plan_hash):
         return rb.sync_playlist(title, [], dry_run=False, expected_plan_hash=expected_plan_hash,
                                 confirmation_token=confirmation_token, playlist_id=playlist_id)
+    pending = pending_recovery(dry_run=dry_run)
+    if pending:
+        return pending
     try:
         desired, store = resolve(key, title), MediaStore()
         media_desired = _media_desired(desired, store, to_wav=bool(to_wav), require_prepared=to_wav is True)
@@ -228,9 +244,6 @@ def sync(key, title, *, dry_run=True, expected_plan_hash=None, confirmation_toke
             # Ordinary sync retains each existing content's actual mode.
             observed = rb.sync_playlist(title, media_desired, dry_run=True, playlist_id=playlist_id)
             if observed.get('error'):
-                if not dry_run and observed['error']['code'] == 'recovery_needed':
-                    return rb.sync_playlist(title, media_desired, dry_run=False, playlist_id=playlist_id,
-                                            confirmation_token=confirmation_token, expected_plan_hash=expected_plan_hash)
                 return {**observed, 'dry_run': dry_run}
             # existing_path is resolved against the whole collection ContentID,
             # including items not yet in this target. Target memberships alone
@@ -253,6 +266,13 @@ def sync(key, title, *, dry_run=True, expected_plan_hash=None, confirmation_toke
         return result
     except (SourceError, MediaError, MusicRootRequired, catalog_service.LibraryUnavailable) as exc:
         return blocked(exc, dry_run)
+
+
+def pending_recovery(*, dry_run=True):
+    status = rb.get_recovery_status()
+    if status['needed']:
+        return rb._failure((status.get('error') or {}).get('code', 'recovery_needed'), plan={}, dry_run=dry_run)
+    return None
 
 
 def _result_media_state(result, desired, store, title, media_desired, playlist_id, dry_run):

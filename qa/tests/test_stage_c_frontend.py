@@ -7,6 +7,72 @@ from qa.tests.test_frontend_contract import run_frontend_app_probe
 class StageCFrontendBehaviorTests(unittest.TestCase):
     maxDiff = None
 
+    def test_global_recovery_is_actionable_without_source_or_library(self):
+        payload = self.probe(r'''
+current = null; libraryConfigured = libraryReady = false;
+const calls=[];
+globalThis.fetch=async(url,request)=>{
+  const path=new URL(url).pathname;
+  calls.push({url,body:request.body ? JSON.parse(request.body) : null});
+  if(path==='/api/rb/status') return {ok:true,json:async()=>({running:false,recovery:{needed:true}})};
+  if(path!=='/api/rb/recovery') throw new Error('unexpected source dependency: '+path);
+  return {ok:true,json:async()=>request.body
+    ? {error:{code:'recovery_restored_preview_required'}}
+    : {error:null,recovery:true,plan:{hash:'r'.repeat(64),operation_id:'operation-A',phase:'database_committed'}}};
+};
+const operation=rbRecovery();
+await driveRbDialog({confirm:true});
+await operation;
+console.log(JSON.stringify({calls,status:$('#statusRegion').textContent,busy:rbOperationBusy,current}));
+''')
+        self.assertIsNone(payload['current'])
+        self.assertFalse(payload['busy'])
+        self.assertEqual(len(payload['calls']), 3)
+        self.assertEqual(payload['calls'][2]['body'], {'expected_plan_hash':'r'*64})
+        self.assertIn('RESTORE_REKORDBOX_OPERATION', payload['calls'][2]['url'])
+        self.assertIn('восстановлена', payload['status'])
+
+    def test_deleted_target_is_forgotten_only_for_affected_source_before_fresh_preview(self):
+        payload = self.probe(r'''
+current={kind:'local',id:'local:a',title:'A'};
+const sourceA=captureRbSelection();
+const sourceB={key:'local:b',title:'B'};
+rememberRbTarget(sourceA,'deleted'); rememberRbTarget(sourceB,'keep');
+const calls=[];
+globalThis.fetch=async(url,request)=>{
+  calls.push(JSON.parse(request.body));
+  return {ok:true,json:async()=>calls.length===1
+    ? {error:{code:'playlist_not_found'},plan:null}
+    : {error:null,unchanged:true,plan:{hash:'new',target:{id:'fresh',name:'A'},counts:{}}}};
+};
+await rbSync();
+const afterFailure=rememberedRbTarget(sourceA);
+await rbSync();
+console.log(JSON.stringify({calls,afterFailure,other:rememberedRbTarget(sourceB),fresh:rememberedRbTarget(sourceA)}));
+''')
+        self.assertEqual(payload['calls'][0]['playlist_id'], 'deleted')
+        self.assertNotIn('playlist_id', payload['calls'][1])
+        self.assertIsNone(payload['afterFailure'])
+        self.assertEqual((payload['other'],payload['fresh']), ('keep','fresh'))
+
+    def test_partial_empty_absent_and_disjoint_membership_never_prepare_wav(self):
+        payload = self.probe(r'''
+const results=[];
+for(const [mode,membership] of [['original','partial'],['wav','partial'],['empty','partial'],['empty','absent_target'],['blocked','mismatch'],['original','order_mismatch']]) {
+  current={kind:'local',id:'local:set',title:'Set'};
+  const calls=[];
+  globalThis.prompt=()=>{throw new Error('false mixed-format prompt');};
+  globalThis.fetch=async(url)=>{calls.push(url);return {ok:true,json:async()=>({error:null,unresolved:[],media_state:{mode,membership}})};};
+  await flipWav();
+  results.push({calls,status:$('#statusRegion').textContent,dialog:!!pendingRbDialog});
+}
+console.log(JSON.stringify(results));
+''')
+        for result in payload:
+            self.assertEqual(len(result['calls']), 1)
+            self.assertFalse(result['dialog'])
+            self.assertIn('Сначала синхронизируйте', result['status'])
+
     def probe(self, script):
         result = run_frontend_app_probe(script)
         self.assertEqual(result.returncode, 0, result.stdout)
@@ -294,6 +360,7 @@ for (const scenario of ['cancel','restore','vanished','changed-cancel','changed-
   const responses=[
     {dry_run:true,applied:false,reconciled:false,unchanged:false,recovery:true,unresolved:[],
       error:{code:'recovery_needed',message:'pending'},plan:{hash:'t'.repeat(64),counts:{add:1}}},
+    {dry_run:true,recovery:true,error:null,plan:{hash:'t'.repeat(64),operation_id:'operation-A',phase:'database_committed'}},
   ];
   if (['restore','changed-cancel','changed-apply'].includes(scenario)) responses.push(
     {dry_run:false,applied:false,reconciled:false,unchanged:false,recovery:true,unresolved:[],backup_id:'journal-1',
@@ -310,7 +377,7 @@ for (const scenario of ['cancel','restore','vanished','changed-cancel','changed-
       error:{code:'stale_preview',message:'stale'},plan:{hash:'v'.repeat(64)}}
   );
   globalThis.fetch=async(url,request)=>{
-    calls.push({url,body:JSON.parse(request.body)});
+    calls.push({url,body:request.body ? JSON.parse(request.body) : null});
     return {ok:true,json:async()=>responses.shift()};
   };
   const confirms=[];
@@ -333,25 +400,25 @@ console.log(JSON.stringify(runs));
 """
         )
         cancelled, restored, vanished, changed_cancel, changed_apply = payload
-        self.assertEqual(len(cancelled["calls"]), 1)
+        self.assertEqual(len(cancelled["calls"]), 2)
         self.assertTrue(cancelled["confirms"], cancelled)
         self.assertIn("восстанов", cancelled["confirms"][0]["message"].lower())
-        self.assertEqual(len(restored["calls"]), 3)
-        self.assertEqual(restored["calls"][1]["body"]["expected_plan_hash"], "t" * 64)
-        self.assertRegex(restored["calls"][2]["url"], r"dry_run=true$")
+        self.assertEqual(len(restored["calls"]), 4)
+        self.assertEqual(restored["calls"][2]["body"]["expected_plan_hash"], "t" * 64)
+        self.assertRegex(restored["calls"][3]["url"], r"dry_run=true$")
         self.assertIn("восстанов", restored["status"].lower())
-        self.assertEqual(len(vanished["calls"]), 2)
+        self.assertEqual(len(vanished["calls"]), 3)
         self.assertNotIn("восстановлена", vanished["status"].lower())
         self.assertTrue(vanished["error"])
-        self.assertEqual(len(changed_cancel["calls"]), 3)
+        self.assertEqual(len(changed_cancel["calls"]), 4)
         self.assertEqual(len(changed_cancel["confirms"]), 2)
         self.assertIn("Восстановление", changed_cancel["confirms"][0]["title"])
         self.assertIn("синхронизации", changed_cancel["confirms"][1]["title"].lower())
         self.assertIn("отменено", changed_cancel["status"].lower())
-        self.assertEqual(len(changed_apply["calls"]), 4)
+        self.assertEqual(len(changed_apply["calls"]), 5)
         self.assertEqual(len(changed_apply["confirms"]), 2)
-        self.assertEqual(changed_apply["calls"][1]["body"]["expected_plan_hash"], "t" * 64)
-        self.assertEqual(changed_apply["calls"][3]["body"]["expected_plan_hash"], "u" * 64)
+        self.assertEqual(changed_apply["calls"][2]["body"]["expected_plan_hash"], "t" * 64)
+        self.assertEqual(changed_apply["calls"][4]["body"]["expected_plan_hash"], "u" * 64)
         self.assertIn("применены", changed_apply["status"].lower())
 
     def test_preview_names_target_and_shows_ordered_paths_counts_and_shared_effect(self):
