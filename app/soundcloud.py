@@ -325,8 +325,11 @@ def _resolve_api(url: str, token: str | None) -> dict:
                 errors.append(provider_collection_incomplete("soundcloud").detail)
                 continue
             tracks.append(_track_from_api(item))
+        if 'track_count' in obj and (type(obj['track_count']) is not int or obj['track_count'] != len(tracks)):
+            errors.append(provider_collection_incomplete('soundcloud').detail)
         return {"id": str(obj["id"]), "title": obj.get("title") or "playlist",
-                "tracks": tracks, "errors": errors}
+                "tracks": tracks, "errors": errors,
+                **({'track_count': obj['track_count']} if 'track_count' in obj else {})}
     if kind == "user":
         tracks, errors = [], []
         first_url = f"{SC_API}/users/{obj['id']}/tracks"
@@ -363,7 +366,10 @@ def _resolve_likes(url: str) -> dict:
     if not info:
         raise RuntimeError("yt-dlp не смог прочитать лайки")
     tracks, errors = [], []
-    for e in (info.get("entries") or []):
+    entries = info.get('entries')
+    if entries is None or isinstance(entries, (str, dict)) or not hasattr(entries, '__iter__'):
+        raise provider_collection_incomplete('soundcloud')
+    for e in entries:
         if not isinstance(e, dict) or e.get("id") is None:
             errors.append(provider_collection_incomplete("soundcloud").detail)
             continue
@@ -375,6 +381,8 @@ def _resolve_likes(url: str) -> dict:
             "duration": int(e.get("duration") or 0),
             "url": e.get("url") or e.get("webpage_url") or "",
         })
+    if 'playlist_count' in info and (type(info['playlist_count']) is not int or info['playlist_count'] != len(tracks)):
+        errors.append(provider_collection_incomplete('soundcloud').detail)
     # добивка метаданных батчами по 50 id (устойчиво к рейт-лимиту: батч не удался — пропускаем)
     token = sc_oauth_token()
     for i in range(0, len(tracks), 50):
@@ -396,7 +404,8 @@ def _resolve_likes(url: str) -> dict:
             errors.append(detail_from_exception("soundcloud", exc))
         time.sleep(0.4)  # пейсинг против рейт-лимита
     return {"id": "likes", "title": info.get("title") or "❤ Лайки",
-            "tracks": tracks, "errors": errors}
+            "tracks": tracks, "errors": errors,
+            **({'playlist_count': info['playlist_count']} if 'playlist_count' in info else {})}
 
 
 def download_track(track: dict, out_dir: Path):

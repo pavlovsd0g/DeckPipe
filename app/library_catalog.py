@@ -50,7 +50,7 @@ def _identity(track: dict) -> tuple[str, str]:
     if provider not in {'deezer', 'sc'}:
         raise ValueError('Неизвестный источник трека.')
     raw = str(track.get('id') or '')
-    if raw.startswith(provider + ':'):
+    while raw.startswith(provider + ':'):
         raw = raw[len(provider) + 1:]
     if not raw or len(raw) > 512:
         raise ValueError('Не указан идентификатор трека.')
@@ -161,6 +161,11 @@ class MusicCatalog:
 
     def scan(self, roots: list[Path], progress=None) -> dict:
         """Atomically publish a scan; unavailable/partial roots retain old rows."""
+        from .rekordbox_media import MediaError, MediaStore
+        try:
+            owned_variants = MediaStore().owned_variants()
+        except MediaError:
+            owned_variants = set()  # No unverified file is hidden from A/B.
         candidates = sorted({Path(p).resolve() for p in roots}, key=lambda p: len(p.parts))
         selected: list[Path] = []
         for path in candidates:
@@ -204,6 +209,8 @@ class MusicCatalog:
                             if not child.is_file(follow_symlinks=False) or path.suffix.lower() not in AUDIO_EXTENSIONS or is_partial_path(path):
                                 continue
                             resolved = path.resolve()
+                            if _path_key(resolved) in owned_variants:
+                                continue
                             if root not in resolved.parents:
                                 continue
                             self._index_file(db, resolved, root_key, stat, stamp)

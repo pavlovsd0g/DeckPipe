@@ -277,14 +277,21 @@ class ErrorListingCoverageTests(unittest.TestCase):
             self.assertEqual(0, listed[0]["ok"])
             with (
                 patch.object(library, "playlist_dir", return_value=playlist),
+                patch.object(main, '_local_sources', return_value=[{'id': 'fixture', 'title': 'Ready API'}]),
+                patch.object(main.catalog_service, 'load_config', return_value={'music_root': str(playlist)}),
                 patch.object(main.rb, "sync_playlist", side_effect=AssertionError("partial reached RB")),
+                patch.object(main.jobs, 'enqueue_flip', side_effect=AssertionError('flip enqueue reached live worker')),
             ):
-                with self.assertRaises(Exception):
-                    main.api_rb_sync(main.RbSyncIn(playlist_key="local:fixture", playlist_title="Ready API"))
-
-            with patch.object(main.jobs, "enqueue_flip", side_effect=AssertionError("flip enqueue reached live worker")):
-                with self.assertRaises(Exception):
-                    main.api_flip(main.FlipIn(playlist_key="local:fixture", playlist_title="Ready API", to_wav=True))
+                result = main.api_rb_sync(main.RbSyncIn(playlist_key="local:fixture", playlist_title="Ready API"))
+                self.assertFalse(result['applied'])
+                self.assertTrue(result['error'])
+                self.assertTrue(result['unresolved'])
+                self.assertEqual(result['unresolved'][0]['code'], 'catalog_missing')
+                result = main.api_flip(main.FlipIn(playlist_key="local:fixture", playlist_title="Ready API", to_wav=True))
+                self.assertFalse(result['applied'])
+                self.assertTrue(result['error'])
+                self.assertTrue(result['unresolved'])
+                self.assertEqual(result['unresolved'][0]['code'], 'catalog_missing')
 
 
 if __name__ == "__main__":

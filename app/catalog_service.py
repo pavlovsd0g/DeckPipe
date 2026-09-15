@@ -101,7 +101,7 @@ def validate_destination(pl_dir: Path, *, require_online: bool = False, config=N
     return target
 
 
-def playlist_tracks(pl_dir: Path, requested: list[dict], *, refresh: bool = True) -> list[dict]:
+def playlist_tracks(pl_dir: Path, requested: list[dict], *, refresh: bool = True, require_complete: bool = False) -> list[dict]:
     config = load_config()
     roots = configured_music_roots(config)
     catalog = catalog_for_config(config)
@@ -109,8 +109,10 @@ def playlist_tracks(pl_dir: Path, requested: list[dict], *, refresh: bool = True
     # Local status is read without adopting filenames into trusted identities.
     # The catalog validates duration and ambiguity across every connected folder.
     local = library.scan_playlist(pl_dir, requested, adopt_unmatched=False)
-    if refresh or not catalog.status()['configured']:
-        catalog.scan(roots)
+    if refresh or require_complete or not catalog.status()['configured']:
+        summary = catalog.scan(roots)
+        if require_complete and (summary['offline_roots'] or summary['partial_roots']):
+            raise LibraryUnavailable()
     result = []
     for item in local:
         match = catalog.match(item)

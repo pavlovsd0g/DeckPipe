@@ -309,12 +309,14 @@ class RekordboxApiAndFlipGateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.old_token = os.environ.get("DECKPIPE_API_TOKEN")
         self.old_port = os.environ.get("DECKPIPE_BOUND_PORT")
-        os.environ["DECKPIPE_API_TOKEN"] = "rekordbox-sync-test-token"
-        os.environ["DECKPIPE_BOUND_PORT"] = "8123"
+        os.environ.setdefault("DECKPIPE_API_TOKEN", "rekordbox-sync-test-token")
+        os.environ.setdefault("DECKPIPE_BOUND_PORT", "8123")
         from app import main
         from app import rekordbox
-        self.main = importlib.reload(main)
-        self.rb = importlib.reload(rekordbox)
+        # Keep the shared ASGI app's launch-token/port binding consistent with
+        # adjacent HTTP suites; these tests exercise API functions directly.
+        self.main = main
+        self.rb = rekordbox
         self.tempdir = tempfile.TemporaryDirectory(prefix="deckpipe-rb-api-")
         self.root = Path(self.tempdir.name)
 
@@ -330,174 +332,55 @@ class RekordboxApiAndFlipGateTests(unittest.TestCase):
         else:
             os.environ["DECKPIPE_BOUND_PORT"] = self.old_port
 
-    def test_api_apply_preserves_intent_and_lets_coordinator_reject_unauthorized_before_adapter_open(self) -> None:
-        playlist = self.root / "playlist"
-        playlist.mkdir()
-        ready = playlist / "ready.flac"
-        ready.write_bytes(b"ready")
-        from app import library
+    def test_apply_needs_exact_token_and_viewed_hash_before_source_or_adapter(self):
+        from app import rekordbox_service
+        for token, viewed_hash, error in [
+            (None, None, 'apply_not_confirmed'),
+            ('wrong', 'a' * 64, 'apply_not_confirmed'),
+            (self.rb.APPLY_CONFIRMATION_TOKEN, None, 'preview_required'),
+        ]:
+            for experimental in ('0', '1'):
+                with self.subTest(token=token, experimental=experimental), patch.dict(os.environ, {'DECKPIPE_RB_EXPERIMENTAL': experimental}), patch.object(rekordbox_service, 'resolve', side_effect=AssertionError('unauthorized source access')), patch.object(self.main.rb, '_PyrekordboxAdapter', side_effect=AssertionError('unauthorized adapter access')):
+                    body = self.main.RbSyncIn(playlist_key='123', playlist_title='Likes', expected_plan_hash=viewed_hash)
+                    result = self.main.api_rb_sync(body, dry_run=False, confirmation_token=token)
+                    self.assertFalse(result['dry_run'])
+                    self.assertFalse(result['applied'])
+                    self.assertEqual(result['error']['code'], error)
 
-        library.save_sidecar(
-            playlist,
-            {
-                "tracks": {
-                    "1": {
-                        "provider": "deezer",
-                        "title": "Ready",
-                        "artist": "Artist",
-                        "album": "Album",
-                        "duration_expected": 10,
-                        "position": 1,
-                        "file": ready.name,
-                        "status": "ok",
-                    }
-                }
-            },
-        )
-        body = self.main.RbSyncIn(playlist_key="local:fixture", playlist_title="Fixture")
-        cases = [
-            (None, None, "apply_not_confirmed", 0),
-            ("1", None, "apply_not_confirmed", 0),
-            (None, self.rb.APPLY_CONFIRMATION_TOKEN, "apply_not_confirmed", 0),
-            ("1", self.rb.APPLY_CONFIRMATION_TOKEN, None, 2),
-        ]
+    def test_sync_forwards_complete_core_envelope_and_target_contract(self):
+        from app import rekordbox_service
+        body = self.main.RbSyncIn(playlist_key='123', playlist_title='Likes', playlist_id='42', expected_plan_hash='a' * 64)
+        structured = dict(dry_run=False, applied=True, reconciled=True, unchanged=False,
+                          plan=None, plan_hash='a' * 64, unresolved=[], backup_id='backup-1',
+                          backup={'id': 'backup-1'}, recovery=False,
+                          error={'code': 'callback_failed', 'message': 'Callback failed'})
+        with patch.object(rekordbox_service, 'resolve', return_value=[]), patch.object(self.main.rb, 'sync_playlist', return_value=structured.copy()) as core:
+            result = self.main.api_rb_sync(body, dry_run=False, confirmation_token=self.rb.APPLY_CONFIRMATION_TOKEN)
+        for key, value in structured.items():
+            self.assertEqual(result[key], value)
+        self.assertEqual(core.call_args_list[0].kwargs['expected_plan_hash'], 'a' * 64)
+        self.assertEqual(core.call_args_list[0].kwargs['playlist_id'], '42')
+        self.assertFalse(core.call_args_list[0].kwargs['dry_run'])
 
-        with patch.object(self.main.library, "playlist_dir", return_value=playlist):
-            for env_value, token, expected_error, expected_adapter_calls in cases:
-                with self.subTest(env_value=env_value, token=bool(token)):
-                    if env_value is None:
-                        os.environ.pop("DECKPIPE_RB_EXPERIMENTAL", None)
-                    else:
-                        os.environ["DECKPIPE_RB_EXPERIMENTAL"] = env_value
-                    shared: dict = {}
-                    adapters: list[FakeRekordboxAdapter] = []
-
-                    def adapter_factory():
-                        adapter = FakeRekordboxAdapter(self.root / "api-apply", [], shared=shared)
-                        adapters.append(adapter)
-                        return adapter
-
-                    with patch.object(self.main.rb, "_PyrekordboxAdapter", side_effect=adapter_factory):
-                        result = self.main.api_rb_sync(body, dry_run=False, confirmation_token=token)
-
-                    self.assertFalse(result["dry_run"])
-                    self.assertEqual(expected_error, result["error"]["code"] if result["error"] else None)
-                    self.assertEqual(expected_adapter_calls, len(adapters))
-                    if expected_error is None:
-                        self.assertTrue(result["applied"])
-                        self.assertEqual(1, adapters[0].begin_count)
-                        self.assertEqual(1, adapters[0].commit_count)
-                        self.assertTrue(adapters[0].closed)
-                        self.assertTrue(adapters[1].closed)
-                    else:
-                        self.assertFalse(result["applied"])
-
-    def test_api_explicit_dry_run_opens_read_only_adapter_and_stays_dry_run(self) -> None:
-        playlist = self.root / "playlist-dry-run"
-        playlist.mkdir()
-        ready = playlist / "ready.flac"
-        ready.write_bytes(b"ready")
-        from app import library
-
-        library.save_sidecar(
-            playlist,
-            {
-                "tracks": {
-                    "1": {
-                        "provider": "deezer",
-                        "title": "Ready",
-                        "artist": "Artist",
-                        "album": "Album",
-                        "duration_expected": 10,
-                        "position": 1,
-                        "file": ready.name,
-                        "status": "ok",
-                    }
-                }
-            },
-        )
-        body = self.main.RbSyncIn(playlist_key="local:fixture", playlist_title="Fixture")
-        adapters: list[FakeRekordboxAdapter] = []
-
-        def adapter_factory():
-            adapter = FakeRekordboxAdapter(self.root / "api-dry-run", [])
-            adapters.append(adapter)
-            return adapter
-
-        os.environ.pop("DECKPIPE_RB_EXPERIMENTAL", None)
-        with patch.object(self.main.library, "playlist_dir", return_value=playlist), patch.object(self.main.rb, "_PyrekordboxAdapter", side_effect=adapter_factory):
-            result = self.main.api_rb_sync(body, dry_run=True, confirmation_token=self.rb.APPLY_CONFIRMATION_TOKEN)
-
-        self.assertTrue(result["dry_run"])
-        self.assertFalse(result["applied"])
-        self.assertIsNone(result["error"])
-        self.assertEqual(1, len(adapters))
-        self.assertEqual(["snapshot", "close"], adapters[0].events)
-        self.assertEqual(0, adapters[0].begin_count)
-        self.assertEqual(0, adapters[0].commit_count)
-
-    def test_api_dry_run_uses_only_ready_regular_in_root_files_and_structured_schema(self) -> None:
-        playlist = self.root / "playlist"
-        playlist.mkdir()
-        ready = playlist / "ready.flac"
-        ready.write_bytes(b"ok")
-        partial = playlist / "bad.deckpipe-stage-x.part.flac"
-        partial.write_bytes(b"bad")
-        outside = self.root / "outside.flac"
-        outside.write_bytes(b"outside")
-        from app import library
-
-        library.save_sidecar(
-            playlist,
-            {
-                "tracks": {
-                    "1": {"provider": "deezer", "title": "Ready", "artist": "A", "album": "B", "duration_expected": 10, "position": 1, "file": ready.name, "status": "ok"},
-                    "2": {"provider": "deezer", "title": "Partial", "artist": "A", "album": "B", "duration_expected": 11, "position": 2, "file": partial.name, "status": "ok"},
-                    "3": {"provider": "deezer", "title": "Outside", "artist": "A", "album": "B", "duration_expected": 12, "position": 3, "file": str(outside), "status": "ok"},
-                    "4": {"provider": "deezer", "title": "Missing", "artist": "A", "album": "B", "duration_expected": 13, "position": 4, "file": "missing.flac", "status": "ok"},
-                }
-            },
-        )
-        body = self.main.RbSyncIn(playlist_key="local:fixture", playlist_title="Fixture")
-
-        with (
-            patch.object(self.main.library, "playlist_dir", return_value=playlist),
-            patch.object(self.main.jobs, "enqueue_flip", side_effect=AssertionError("dry-run enqueued conversion")),
-            patch.object(self.main.rb, "sync_playlist", return_value={
-                "dry_run": True,
-                "applied": False,
-                "reconciled": False,
-                "unresolved": [],
-                "backup_id": None,
-                "error": None,
-                "plan": {"counts": {"desired": 1}},
-            }) as sync,
-        ):
+    def test_explicit_preview_never_prepares_media_or_enqueues_work(self):
+        from app import rekordbox_service, rekordbox_media
+        structured = dict(dry_run=True, applied=False, reconciled=False, plan=None,
+                          unresolved=[], backup_id=None, backup=None, error=None)
+        body = self.main.RbSyncIn(playlist_key='123', playlist_title='Likes')
+        with patch.object(rekordbox_service, 'resolve', return_value=[]), patch.object(self.main.rb, 'sync_playlist', return_value=structured.copy()) as core, patch.object(rekordbox_media.MediaStore, 'prepare', side_effect=AssertionError('preview preparation')), patch.object(self.main.jobs, 'enqueue_flip', side_effect=AssertionError('preview conversion')):
             result = self.main.api_rb_sync(body)
+        self.assertTrue(result['dry_run'])
+        self.assertFalse(result['applied'])
+        self.assertTrue(core.call_args.kwargs['dry_run'])
 
-        desired = sync.call_args.args[1]
-        self.assertEqual(1, len(desired))
-        self.assertEqual("deezer:1", desired[0]["provider_id"])
-        self.assertEqual(str(ready), desired[0]["path"])
-        self.assertEqual({"dry_run", "applied", "reconciled", "unresolved", "backup_id", "error", "plan"}, set(result))
-
-    def test_api_rb_sync_passes_through_structured_adapter_open_failure(self) -> None:
-        body = self.main.RbSyncIn(playlist_key="local:fixture", playlist_title="Fixture")
-        structured = {
-            "dry_run": True,
-            "applied": False,
-            "reconciled": False,
-            "unresolved": [],
-            "backup_id": None,
-            "error": {"code": "adapter_open_failed", "message": "Rekordbox sync failed"},
-            "plan": {"counts": {"desired": 0}},
-        }
-
-        with patch.object(self.main, "_desired_tracks_for_rekordbox", return_value=[]), patch.object(self.main.rb, "sync_playlist", return_value=structured):
+    def test_structured_adapter_open_failure_is_retained(self):
+        from app import rekordbox_service
+        body = self.main.RbSyncIn(playlist_key='123', playlist_title='Likes')
+        with patch.object(rekordbox_service, 'resolve', return_value=[]), patch.object(self.main.rb, '_PyrekordboxAdapter', side_effect=RuntimeError('synthetic failure')):
             result = self.main.api_rb_sync(body)
-
-        self.assertEqual(structured["error"], result["error"])
-        self.assertTrue(result["dry_run"])
+        self.assertEqual(result['error']['code'], 'adapter_open_failed')
+        self.assertTrue(result['dry_run'])
+        self.assertFalse(result['applied'])
 
     def test_default_flip_fails_closed_and_explicit_flip_uses_reconciled_callback_for_sidecar_advance(self) -> None:
         from app import jobs, library

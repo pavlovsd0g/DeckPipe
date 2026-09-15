@@ -73,6 +73,17 @@ def _enqueue_missing(key: str, title: str, tracks: list, mode: str) -> dict:
     if mode not in {"append", "playlist_order"}:
         raise HTTPException(400, "Неизвестный режим синхронизации.")
     try:
+        if key.startswith('local:'):
+            from .rekordbox_service import persist_local_membership, SourceError
+            source = next((s for s in _local_sources() if str(s['id']) == key[6:]), None)
+            if not source:
+                raise HTTPException(404, {'code': 'source_unknown'})
+            title = source['title']
+            try:
+                directory = catalog_service.validate_destination(library.playlist_dir(key, title), require_online=True)
+                tracks = persist_local_membership(directory, tracks, mode=mode)
+            except SourceError as exc:
+                raise HTTPException(409, {'code': exc.code}) from None
         prepared = catalog_service.prepare_download(library.playlist_dir(key, title), tracks)
     except MusicRootRequired:
         raise
@@ -185,9 +196,9 @@ def _deezer_gql_client():
     return DeezerGQLClient(arl=get_deezer_arl())
 
 
-def fetch_tracks(playlist_id: str):
+def fetch_tracks(playlist_id: str, *, force_refresh: bool = False):
     ts, data = _cache["tracks"].get(playlist_id, (0, None))
-    if data is not None and time.time() - ts < TRACKS_TTL:
+    if not force_refresh and data is not None and time.time() - ts < TRACKS_TTL:
         return data
     # публичный API (быстро, но только для public-плейлистов)
     try:
@@ -201,6 +212,7 @@ def fetch_tracks(playlist_id: str):
 
 def _fetch_tracks_public(playlist_id: str) -> list:
     tracks = []
+    advertised_total = None
     url = f"https://api.deezer.com/playlist/{playlist_id}/tracks"
     params = {"limit": 100, "index": 0}
     seen_urls = set()
@@ -216,6 +228,10 @@ def _fetch_tracks_public(playlist_id: str) -> list:
             raise provider_exception("deezer", exc) from None
         if not isinstance(d, dict) or not isinstance(d.get("data"), list):
             raise provider_collection_incomplete("deezer")
+        if 'total' in d:
+            if type(d['total']) is not int or d['total'] < 0 or (advertised_total is not None and advertised_total != d['total']):
+                raise provider_collection_incomplete('deezer')
+            advertised_total = d['total']
         for t in d["data"]:
             if not isinstance(t, dict) or "id" not in t:
                 raise provider_collection_incomplete("deezer")
@@ -233,6 +249,8 @@ def _fetch_tracks_public(playlist_id: str) -> list:
         url, params = next_url, None
     else:
         raise provider_collection_incomplete("deezer")
+    if advertised_total is not None and len(tracks) != advertised_total:
+        raise provider_collection_incomplete('deezer')
     return tracks
 
 
@@ -367,6 +385,13 @@ async def api_playlists():
 @app.get("/api/playlists/{playlist_id}/tracks")
 def api_tracks(playlist_id: str, title: str = ""):
     _require_music_root()
+    if playlist_id.startswith('local:'):
+        from .rekordbox_service import source_tracks, SourceError
+        try:
+            pl_dir, tracks = source_tracks(playlist_id, title)
+            return {'path': str(pl_dir), 'tracks': catalog_service.playlist_tracks(pl_dir, tracks)}
+        except SourceError as exc:
+            raise HTTPException(409, {'code': exc.code}) from None
     try:
         deezer_tracks = fetch_tracks(playlist_id)
     except Exception as exc:
@@ -606,6 +631,8 @@ def api_local_create(body: LocalPlaylistIn):
     sources = _local_sources()
     sources.append(src)
     _local_save(sources)
+    from .rekordbox_service import persist_local_membership
+    persist_local_membership(library.playlist_dir(f"local:{src['id']}", title), [])
     return {"ok": True, "key": f"local:{src['id']}", **src}
 
 
@@ -995,7 +1022,8 @@ from . import rekordbox as rb
 
 @app.get("/api/rb/status")
 def api_rb_status():
-    out = {"db_exists": rb.db_exists(), "running": rb.rb_running(), "playlists": []}
+    out = {"db_exists": rb.db_exists(), "running": rb.rb_running(), "playlists": [],
+           "recovery": rb.get_recovery_status()}
     if out["db_exists"] and not out["running"]:
         try:
             out["playlists"] = rb.get_rb_playlists()
@@ -1007,61 +1035,52 @@ def api_rb_status():
 class RbSyncIn(BaseModel):
     playlist_key: str
     playlist_title: str
+    expected_plan_hash: str | None = None
+    playlist_id: str | None = None
 
 
 def _desired_tracks_for_rekordbox(playlist_key: str, playlist_title: str) -> list[dict]:
-    pl_dir = library.playlist_dir(playlist_key, playlist_title or playlist_key)
-    sidecar = library.load_sidecar(pl_dir)
-    desired = []
-    for tid, entry in sidecar.get("tracks", {}).items():
-        if not library.is_ready_entry(pl_dir, entry):
-            continue
-        provider = entry.get("provider", "deezer")
-        path = Path(pl_dir) / entry["file"]
-        desired.append({
-            "provider_id": f"{provider}:{tid}",
-            "title": entry.get("title", ""),
-            "artist": entry.get("artist", ""),
-            "album": entry.get("album", ""),
-            "duration": int(entry.get("duration_expected") or entry.get("duration") or 0),
-            "position": int(entry.get("position") or 0),
-            "path": str(path),
-        })
-    return sorted(desired, key=lambda item: (item["position"], item["provider_id"]))
+    from .rekordbox_service import resolve
+    return resolve(playlist_key, playlist_title)
 
 
 @app.post("/api/rb/sync")
 def api_rb_sync(body: RbSyncIn, dry_run: bool = True, confirmation_token: str | None = None):
-    """Синк локального плейлиста (ок-треки по порядку) в Rekordbox."""
-    desired = _desired_tracks_for_rekordbox(body.playlist_key, body.playlist_title)
-    result = rb.sync_playlist(
-        body.playlist_title,
-        desired,
-        dry_run=dry_run,
-        confirmation_token=confirmation_token,
-    )
-    return {
-        "dry_run": bool(result.get("dry_run")),
-        "applied": bool(result.get("applied")),
-        "reconciled": bool(result.get("reconciled")),
-        "unresolved": result.get("unresolved", []),
-        "backup_id": result.get("backup_id"),
-        "error": result.get("error"),
-        "plan": result.get("plan"),
-    }
+    from .rekordbox_service import sync
+    return sync(body.playlist_key, body.playlist_title, dry_run=dry_run,
+                confirmation_token=confirmation_token, expected_plan_hash=body.expected_plan_hash,
+                playlist_id=body.playlist_id)
 
 
-class FlipIn(BaseModel):
-    playlist_key: str
-    playlist_title: str
+class FlipIn(RbSyncIn):
     to_wav: bool
     workers: int = 0
 
 
 @app.post("/api/flip")
-def api_flip(body: FlipIn):
-    """WAV-flip: конвертация + перенос путей в master.db (все кью/сетка сохраняются)."""
-    raise HTTPException(409, "Rekordbox mutation is disabled until Task 5")
+def api_flip(body: FlipIn, dry_run: bool = True, confirmation_token: str | None = None):
+    from .rekordbox_service import sync
+    return sync(body.playlist_key, body.playlist_title, dry_run=dry_run,
+                confirmation_token=confirmation_token, expected_plan_hash=body.expected_plan_hash,
+                playlist_id=body.playlist_id, to_wav=body.to_wav)
+
+
+class PrepareWavIn(BaseModel):
+    playlist_key: str
+    playlist_title: str
+    bit_depth: int = 16
+
+
+@app.post('/api/rb/prepare-wav')
+def api_rb_prepare_wav(body: PrepareWavIn):
+    from .rekordbox_service import prepare_wav
+    return prepare_wav(body.playlist_key, body.playlist_title, body.bit_depth)
+
+
+@app.get('/api/rb/media-state')
+def api_rb_media_state(playlist_key: str, playlist_title: str, playlist_id: str | None = None):
+    from .rekordbox_service import inspect_state
+    return inspect_state(playlist_key, playlist_title, playlist_id)
 
 
 @app.get("/api/errors")
