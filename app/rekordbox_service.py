@@ -43,8 +43,13 @@ def canonical_tracks(tracks, default_provider='deezer'):
                 raise ValueError()
         except (TypeError, ValueError):
             raise SourceError('source_incomplete') from None
-        result.append(dict(id=raw, provider=provider, title=str(item.get('title') or ''),
-                           artist=str(item.get('artist') or ''), album=str(item.get('album') or ''), duration=duration))
+        clean = dict(id=raw, provider=provider, title=str(item.get('title') or ''),
+                     artist=str(item.get('artist') or ''), album=str(item.get('album') or ''), duration=duration)
+        if 'url' in item:
+            if not isinstance(item['url'], str):
+                raise SourceError('source_incomplete')
+            clean['url'] = item['url']
+        result.append(clean)
     return result
 
 
@@ -74,6 +79,7 @@ def local_tracks(directory):
 
 
 def persist_local_membership(directory, requested, *, mode='append'):
+    operational = requested
     requested = canonical_tracks(requested)
     with file_lock(library.sidecar_path(directory)):
         if library.sidecar_path(directory).exists():
@@ -84,6 +90,11 @@ def persist_local_membership(directory, requested, *, mode='append'):
         else:
             data, previous = {'tracks': {}}, []
         if mode == 'append':
+            # Refresh transport URLs on an explicit re-add, without changing
+            # retained order/title/file/status metadata (including legacy rows).
+            urls = {(t['provider'], t['id']): t['url'] for t in requested if 'url' in t}
+            previous = [{**t, 'url': urls[(t['provider'], t['id'])]} if (t['provider'], t['id']) in urls else t
+                        for t in previous]
             existing = {(t['provider'], t['id']) for t in previous}
             members = previous + [t for t in requested if (t['provider'], t['id']) not in existing]
         else:
@@ -91,7 +102,10 @@ def persist_local_membership(directory, requested, *, mode='append'):
         # File/status metadata is not replaced by a cross-folder projection.
         data['local_membership'] = members
         library.save_sidecar(directory, data)
-    return requested
+    # Membership is a durable projection, not the downloader's transport payload.
+    # Keep operational fields such as URL/position/total while canonical IDs and
+    # metadata take precedence consistently in both producer and queue consumer.
+    return [{**raw, **clean} for raw, clean in zip(operational, requested)]
 
 
 def source_tracks(key, title):
@@ -218,9 +232,14 @@ def sync(key, title, *, dry_run=True, expected_plan_hash=None, confirmation_toke
                     return rb.sync_playlist(title, media_desired, dry_run=False, playlist_id=playlist_id,
                                             confirmation_token=confirmation_token, expected_plan_hash=expected_plan_hash)
                 return {**observed, 'dry_run': dry_run}
-            current = {path_key(row['path']) for row in observed['plan'].get('current_memberships', [])}
+            # existing_path is resolved against the whole collection ContentID,
+            # including items not yet in this target. Target memberships alone
+            # cannot tell whether adding a shared track would relocate it globally.
+            existing_paths = {row['provider_id']: row.get('existing_path')
+                              for row in observed['plan'].get('desired_resolved', []) if row.get('content_id')}
             media_desired = [(_media_desired([item], store, to_wav=True)[0]
-                              if store.entry(item['path']) and path_key(store.entry(item['path'])['variant']) in current else candidate)
+                              if store.entry(item['path']) and existing_paths.get(item['provider_id'])
+                              and path_key(store.entry(item['path'])['variant']) == path_key(existing_paths[item['provider_id']]) else candidate)
                              for item, candidate in zip(desired, media_desired)]
         result = rb.sync_playlist(title, media_desired, dry_run=dry_run, expected_plan_hash=expected_plan_hash,
                                  confirmation_token=confirmation_token, playlist_id=playlist_id,

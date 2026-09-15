@@ -101,6 +101,37 @@ class CatalogApiTests(unittest.TestCase):
                 desired = self.client.post('/api/rb/sync', json={'playlist_key': 'local:fixture', 'playlist_title': 'Local'}).json()['plan']['desired_resolved']
             self.assertEqual(['deezer:2', 'sc:1'], [t['provider_id'] for t in desired])
 
+    def test_missing_local_soundcloud_retains_url_through_queue_and_download_consumer(self):
+        from app import jobs, library
+        from unittest.mock import MagicMock
+        jobs.initialize(self.base / 'jobs', start_worker=False)
+        requested = {'id': 'sc:sc:404', 'provider': 'sc', 'title': 'Absent SC', 'artist': 'Artist',
+                     'duration': 1, 'url': 'https://soundcloud.com/synthetic-fixture/absent', 'position': 7, 'total': 9}
+        with patch.object(self.main, 'fetch_tracks', side_effect=AssertionError('local must not call Deezer')):
+            response = self.client.post('/api/search/download', json={'target_key': 'local:fixture', 'target_title': 'Local', 'tracks': [requested]})
+        self.assertEqual(response.status_code, 200, response.text)
+        job = jobs.get_job(response.json()['job_id'])
+        queued = job['tracks'][0]
+        self.assertEqual((queued['provider'], queued['id']), ('sc', '404'))
+        self.assertEqual(queued['url'], requested['url'])
+        self.assertEqual((queued['position'], queued['total']), (7, 9))
+        # Read back the durable queue before exercising its real SC consumer.
+        jobs.initialize(self.base / 'jobs', start_worker=False)
+        queued = jobs.get_job(job['id'])['tracks'][0]
+        ydl = MagicMock()
+        ydl.__enter__.return_value.extract_info.side_effect = RuntimeError('synthetic network boundary stop')
+        sc = self.main.soundcloud
+        with patch.object(sc, 'sc_oauth_token', return_value=None), patch.object(sc, '_youtube_dl_opts_with_oauth', side_effect=lambda options, token: options), \
+             patch.object(sc, '_bind_cookiejar'), patch.object(sc.yt_dlp, 'YoutubeDL', return_value=ydl), \
+             patch.object(jobs, 'AUTO_RETRIES', 0), patch.object(jobs, 'get_session', side_effect=AssertionError('Deezer access')):
+            jobs._process_track(job, self.music / 'Local', queued, {'ds': None}, {'base': 0, 'n': 0, 'digits': 2})
+        ydl.__enter__.return_value.extract_info.assert_called_once_with(requested['url'], download=True)
+        saved = library.load_sidecar(self.music / 'Local')['local_membership'][0]
+        self.assertEqual((saved['provider'], saved['id'], saved['url']), ('sc', '404', requested['url']))
+        projected = self.client.get('/api/playlists/local:fixture/tracks').json()['tracks'][0]
+        self.assertEqual((projected['provider'], projected['id'], projected['url']), ('sc', '404', requested['url']))
+        self.assertEqual(projected['status'], 'error')
+
     def test_gaps_partial_sources_unknown_and_offline_block_without_core(self):
         cases = [([*self.tracks, track('4', 'Missing')], '123'), (self.tracks, 'unknown:source')]
         with patch.object(self.main.rb, 'sync_playlist', side_effect=AssertionError('unresolved source must block')):

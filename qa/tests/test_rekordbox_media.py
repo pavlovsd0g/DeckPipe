@@ -361,6 +361,94 @@ with patch.object(main, 'load_config', return_value=cfg), patch.object(library, 
         self.assertEqual(reverted['error']['code'], 'callback_failed', reverted)
         self.assertEqual(reverted['media_state']['mode'], 'original', reverted)
 
+    def test_normal_sync_into_other_and_new_targets_retains_global_wav_content_and_replays(self):
+        from app.rekordbox_media import MediaStore
+        self.client.post('/api/rb/prepare-wav', json=self.body)
+        flipped = self.apply(self.preview())
+        self.assertTrue(flipped['reconciled'], flipped)
+        before, analysis = self.fixture.protected(), self.anlz.read_bytes()
+        variants = {str(i): MediaStore().entry(path)['variant'] for i, path in enumerate(self.paths, 1)}
+        for target in ({'playlist_title': 'Other', 'playlist_id': self.fixture.other_id}, {'playlist_title': 'New Target'}):
+            with self.subTest(target=target):
+                body = {**self.body, **target}
+                if 'playlist_id' not in target:
+                    body.pop('playlist_id')
+                preview = self.client.post('/api/rb/sync', json=body).json()
+                self.assertIsNone(preview['error'], preview)
+                self.assertEqual(preview['plan']['counts']['path'], 0, preview)
+                self.assertEqual(preview['plan']['shared_content'], [])
+                for item in preview['plan']['desired_resolved']:
+                    self.assertEqual(item['path'], variants[item['content_id']])
+                result = self.client.post('/api/rb/sync?dry_run=false&confirmation_token=APPLY_REKORDBOX_CHANGES',
+                                          json={**body, 'expected_plan_hash': preview['plan']['hash']}).json()
+                self.assertTrue(result['reconciled'], result)
+                self.assertEqual(result['media_state']['mode'], 'wav', result)
+                actual = self.fixture.protected()
+                self.assertEqual(actual['content'], before['content'])
+                self.assertEqual(actual['cues'], before['cues'])
+                self.assertEqual(actual['other'], before['other'])
+                self.assertEqual(self.anlz.read_bytes(), analysis)
+                adapter = self.fixture.factory()
+                try:
+                    for name in ('Likes', target['playlist_title']):
+                        membership = adapter.snapshot_playlist(name)
+                        self.assertEqual([row['content_id'] for row in membership], ['1', '2'])
+                        self.assertEqual([row['path'] for row in membership], [variants['1'], variants['2']])
+                finally:
+                    adapter.close()
+                fingerprint = self.fixture.inventory()
+                replay = self.client.post('/api/rb/sync?dry_run=false&confirmation_token=APPLY_REKORDBOX_CHANGES',
+                                          json={**body, 'expected_plan_hash': preview['plan']['hash']}).json()
+                self.assertTrue(replay['unchanged'], replay)
+                self.assertFalse(replay['applied'], replay)
+                self.assertIsNone(replay['backup_id'])
+                self.assertEqual(fingerprint, self.fixture.inventory())
+
+    def test_normal_sync_keeps_new_content_original_even_when_variant_is_prepared(self):
+        from app.converter import FFMPEG
+        from app.rekordbox_media import MediaStore
+        self.client.post('/api/rb/prepare-wav', json=self.body)
+        self.assertTrue(self.apply(self.preview())['reconciled'])
+        before, analysis = self.fixture.protected(), self.anlz.read_bytes()
+        wav = audio_file(self.root / 'new-source.wav', shift=333)
+        original = self.music / 'new-folder' / 'Artist - New Original.flac'
+        original.parent.mkdir()
+        subprocess.run([FFMPEG, '-v', 'error', '-i', str(wav), str(original)], check=True)
+        new_track = dict(id='new-original', provider='deezer', title='New Original', artist='Artist', duration=1)
+        with patch.object(self.main.jobs, 'enqueue', side_effect=AssertionError('reuse must not download')):
+            result = self.client.post('/api/search/download', json={'target_key': 'local:fixture', 'target_title': 'Local', 'tracks': [new_track]}).json()
+        self.assertIsNone(result['job_id'])
+        prepared = self.client.post('/api/rb/prepare-wav', json=self.body).json()
+        self.assertEqual((prepared['prepared'], prepared['reused']), (1, 2), prepared)
+        self.assertIsNotNone(MediaStore().entry(original))
+        body = dict(playlist_key='local:fixture', playlist_title='New With Original')
+        preview = self.client.post('/api/rb/sync', json=body).json()
+        self.assertIsNone(preview['error'], preview)
+        self.assertEqual(preview['plan']['counts']['path'], 0)
+        desired = next(t for t in preview['plan']['desired_resolved'] if t['provider_id'] == 'deezer:new-original')
+        self.assertFalse(desired.get('content_id'))
+        self.assertEqual(desired['path'], str(original))
+        applied = self.client.post('/api/rb/sync?dry_run=false&confirmation_token=APPLY_REKORDBOX_CHANGES',
+                                   json={**body, 'expected_plan_hash': preview['plan']['hash']}).json()
+        self.assertTrue(applied['reconciled'], applied)
+        self.assertEqual(applied['media_state']['mode'], 'mixed')
+        actual = self.fixture.protected()
+        retained = {row['ID']: row for row in actual['content']}
+        for row in before['content']:
+            self.assertEqual(retained[row['ID']], row)
+        added = [row for row in actual['content'] if row['ID'] not in {r['ID'] for r in before['content']}]
+        self.assertEqual(len(added), 1)
+        self.assertEqual((added[0]['FolderPath'], added[0]['FileType']), (str(original), 5))
+        self.assertEqual(actual['cues'], before['cues'])
+        self.assertEqual(actual['other'], before['other'])
+        self.assertEqual(self.anlz.read_bytes(), analysis)
+        fingerprint = self.fixture.inventory()
+        replay = self.client.post('/api/rb/sync?dry_run=false&confirmation_token=APPLY_REKORDBOX_CHANGES',
+                                  json={**body, 'expected_plan_hash': preview['plan']['hash']}).json()
+        self.assertTrue(replay['unchanged'], replay)
+        self.assertFalse(replay['applied'], replay)
+        self.assertEqual(fingerprint, self.fixture.inventory())
+
 
 if __name__ == '__main__':
     unittest.main()
