@@ -131,6 +131,13 @@ function collectActions(node, out = []) {
   for (const child of node.children || []) collectActions(child, out);
   return out;
 }
+async function driveRbDialog({confirm = true, targetId = null} = {}) {
+  for (let index = 0; index < 40 && !(typeof pendingRbDialog !== 'undefined' && pendingRbDialog); index++) await Promise.resolve();
+  if (!(typeof pendingRbDialog !== 'undefined' && pendingRbDialog)) return false;
+  if (targetId !== null) elements.get('#rbTargetSelect').value = String(targetId);
+  if (confirm) confirmRbDialog(); else cancelRbDialog();
+  return true;
+}
 """
     with tempfile.TemporaryDirectory() as td:
         probe = Path(td) / "frontend-app-probe.mjs"
@@ -369,11 +376,13 @@ globalThis.fetch = async (url, request) => {
   fetchCalls.push({url, body: JSON.parse(request.body)});
   return {ok: true, json: async () => responses.shift()};
 };
-        globalThis.confirm = () => true;
-        const prompts = [];
-        globalThis.prompt = message => { prompts.push(message); throw new Error('technical token prompt must not be shown'); };
+globalThis.confirm = () => { throw new Error('native confirm must not be shown'); };
+const prompts = [];
+globalThis.prompt = message => { prompts.push(message); throw new Error('technical token prompt must not be shown'); };
 current = {kind: 'sc', id: 'source-7', title: 'SC Set'};
-await rbSync();
+const operation = rbSync();
+await driveRbDialog();
+await operation;
 console.log(JSON.stringify({fetchCalls, prompts, status: elements.get('#statusRegion').textContent}));
 """
         )

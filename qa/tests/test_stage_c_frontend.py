@@ -42,9 +42,11 @@ for (const scenario of scenarios) {
     calls.push({url, body: JSON.parse(request.body)});
     return {ok:true, json:async()=>scenario.preview};
   };
-  globalThis.confirm = () => scenario.confirm;
+  globalThis.confirm = () => { throw new Error('native confirm must not be used'); };
   current = {kind:'local', id:'local:fixture', title:'Set'};
-  await rbSync();
+  const operation = rbSync();
+  await driveRbDialog({confirm: scenario.confirm});
+  await operation;
   outcomes.push({name:scenario.name, calls, error:elements.get('#errorRegion').textContent});
 }
 console.log(JSON.stringify(outcomes));
@@ -73,10 +75,14 @@ globalThis.fetch = async (url, request) => {
   calls.push({url, body:JSON.parse(request.body)});
   return {ok:true, json:async()=>responses.shift()};
 };
-globalThis.confirm = message => { confirms.push(message); return true; };
+globalThis.confirm = () => { throw new Error('native confirm must not be used'); };
 globalThis.prompt = () => { throw new Error('technical token prompt must not be shown'); };
 current = {kind:'local', id:'local:empty', title:'Новый пустой'};
-await rbSync();
+const operation = rbSync();
+for(let i=0;i<40 && !pendingRbDialog;i++) await Promise.resolve();
+confirms.push(elements.get('#loginSteps').textContent);
+confirmRbDialog();
+await operation;
 console.log(JSON.stringify({calls, confirms, status:elements.get('#statusRegion').textContent}));
 """
         )
@@ -136,23 +142,30 @@ const responses = [
   {db_exists:true,running:false,playlists:[{id:'11',name:'Дубль',count:2},{id:'22',name:'Дубль',count:5}]},
   {dry_run:true,applied:false,reconciled:false,unchanged:true,unresolved:[],error:null,
     plan:{hash:'p'.repeat(64),target:{id:'22',name:'Дубль'},counts:{},desired_resolved:[],shared_content:[]}},
+  {error:null,unresolved:[],media_state:{mode:'wav'}},
+  {dry_run:true,applied:false,reconciled:false,unchanged:true,unresolved:[],error:null,
+    plan:{hash:'k'.repeat(64),target:{id:'22',name:'Дубль'},counts:{},desired_resolved:[],shared_content:[]},media_state:{mode:'wav'}},
 ];
 const calls=[];
 globalThis.fetch=async(url,request)=>{
   calls.push({url,body:request.body ? JSON.parse(request.body) : null});
   return {ok:true,json:async()=>responses.shift()};
 };
-globalThis.prompt=message=>message.includes('2.') ? '2' : null;
-globalThis.confirm=()=>{throw new Error('unchanged target must not ask to apply');};
+globalThis.confirm=()=>{throw new Error('native confirm must not be used');};
 current={kind:'local',id:'local:dup',title:'Дубль'};
-await rbSync();
+const operation=rbSync();
+await driveRbDialog({targetId:'22'});
+await operation;
+await flipWav();
 console.log(JSON.stringify({calls,status:elements.get('#statusRegion').textContent}));
 """
         )
-        self.assertEqual(len(payload["calls"]), 3)
+        self.assertEqual(len(payload["calls"]), 5)
         self.assertRegex(payload["calls"][1]["url"], r"/api/rb/status$")
         self.assertEqual(payload["calls"][2]["body"]["playlist_id"], "22")
         self.assertRegex(payload["calls"][2]["url"], r"dry_run=true$")
+        self.assertIn("playlist_id=22", payload["calls"][3]["url"])
+        self.assertEqual(payload["calls"][4]["body"]["playlist_id"], "22")
 
     def test_wav_uses_persisted_media_state_and_preparation_failure_blocks_flip(self):
         payload = self.probe(
@@ -173,9 +186,11 @@ for (const scenario of ['prepare-fails','persisted-wav']) {
     calls.push({url,body:request.body ? JSON.parse(request.body) : null});
     return {ok:true,json:async()=>responses.shift()};
   };
-  globalThis.confirm=()=>scenario === 'prepare-fails';
+  globalThis.confirm=()=>{throw new Error('native confirm must not be used');};
   current={kind:'local',id:'local:set',title:'Set'};
-  await flipWav();
+  const operation=flipWav();
+  await driveRbDialog({confirm:scenario === 'prepare-fails'});
+  await operation;
   runs.push({scenario,calls,error:elements.get('#errorRegion').textContent});
 }
 console.log(JSON.stringify(runs));
@@ -216,9 +231,12 @@ for (const direction of ['wav','original']) {
     calls.push({url,body:request.body ? JSON.parse(request.body) : null});
     return {ok:true,json:async()=>responses.shift()};
   };
-  globalThis.confirm=()=>true;
+  globalThis.confirm=()=>{throw new Error('native confirm must not be used');};
   current={kind:'local',id:'local:set',title:'Set'};
-  await flipWav();
+  const operation=flipWav();
+  await driveRbDialog();
+  if(direction === 'wav') await driveRbDialog();
+  await operation;
   runs.push({direction,calls,status:elements.get('#statusRegion').textContent});
 }
 console.log(JSON.stringify(runs));
@@ -249,9 +267,11 @@ for (const applied of [
   const responses=[{dry_run:true,applied:false,reconciled:false,unchanged:false,unresolved:[],error:null,
     plan:{hash:'s'.repeat(64),target:{id:'rb-1',name:'Set'},counts:{add:1},desired_resolved:[],shared_content:[]}},applied];
   globalThis.fetch=async()=>({ok:true,json:async()=>responses.shift()});
-  globalThis.confirm=()=>true;
+  globalThis.confirm=()=>{throw new Error('native confirm must not be used');};
   current={kind:'local',id:'local:set',title:'Set'};
-  await rbSync();
+  const operation=rbSync();
+  await driveRbDialog();
+  await operation;
   outcomes.push({status:elements.get('#statusRegion').textContent,error:elements.get('#errorRegion').textContent});
 }
 console.log(JSON.stringify(outcomes));
@@ -269,17 +289,21 @@ console.log(JSON.stringify(outcomes));
         payload = self.probe(
             r"""
 const runs=[];
-for (const scenario of ['cancel','restore','vanished']) {
+for (const scenario of ['cancel','restore','vanished','changed-cancel','changed-apply']) {
   const calls=[];
   const responses=[
     {dry_run:true,applied:false,reconciled:false,unchanged:false,recovery:true,unresolved:[],
       error:{code:'recovery_needed',message:'pending'},plan:{hash:'t'.repeat(64),counts:{add:1}}},
   ];
-  if (scenario === 'restore') responses.push(
+  if (['restore','changed-cancel','changed-apply'].includes(scenario)) responses.push(
     {dry_run:false,applied:false,reconciled:false,unchanged:false,recovery:true,unresolved:[],backup_id:'journal-1',
       error:{code:'recovery_restored_preview_required',message:'restored'},plan:{hash:'t'.repeat(64)}},
-    {dry_run:true,applied:false,reconciled:false,unchanged:true,recovery:false,unresolved:[],error:null,
-      plan:{hash:'u'.repeat(64),target:{id:'rb-1',name:'Set'},counts:{},desired_resolved:[],shared_content:[]}}
+    {dry_run:true,applied:false,reconciled:false,unchanged:scenario === 'restore',recovery:false,unresolved:[],error:null,
+      plan:{hash:'u'.repeat(64),target:{id:'rb-1',name:'Set'},counts:{add:scenario === 'restore' ? 0 : 1},desired_resolved:[],shared_content:[]}}
+  );
+  if (scenario === 'changed-apply') responses.push(
+    {dry_run:false,applied:true,reconciled:true,unchanged:false,recovery:false,unresolved:[],error:null,backup_id:'new-backup',
+      plan:{hash:'u'.repeat(64)},media_state:{mode:'original'}}
   );
   if (scenario === 'vanished') responses.push(
     {dry_run:false,applied:false,reconciled:false,unchanged:false,recovery:false,unresolved:[],
@@ -290,18 +314,28 @@ for (const scenario of ['cancel','restore','vanished']) {
     return {ok:true,json:async()=>responses.shift()};
   };
   const confirms=[];
-  globalThis.confirm=message=>{confirms.push(message);return scenario !== 'cancel';};
+  globalThis.confirm=()=>{throw new Error('native confirm must not be used');};
+  async function settle(value){
+    for(let i=0;i<40 && !pendingRbDialog;i++) await Promise.resolve();
+    if(!pendingRbDialog) return false;
+    confirms.push({title:elements.get('#loginTitle').textContent,message:elements.get('#loginSteps').textContent});
+    if(value) confirmRbDialog(); else cancelRbDialog();
+    return true;
+  }
   current={kind:'local',id:'local:set',title:'Set'};
-  await rbSync();
+  const operation=rbSync();
+  await settle(scenario !== 'cancel');
+  if(scenario.startsWith('changed-')) await settle(scenario === 'changed-apply');
+  await operation;
   runs.push({scenario,calls,confirms,status:elements.get('#statusRegion').textContent,error:elements.get('#errorRegion').textContent});
 }
 console.log(JSON.stringify(runs));
 """
         )
-        cancelled, restored, vanished = payload
+        cancelled, restored, vanished, changed_cancel, changed_apply = payload
         self.assertEqual(len(cancelled["calls"]), 1)
         self.assertTrue(cancelled["confirms"], cancelled)
-        self.assertIn("восстанов", cancelled["confirms"][0].lower())
+        self.assertIn("восстанов", cancelled["confirms"][0]["message"].lower())
         self.assertEqual(len(restored["calls"]), 3)
         self.assertEqual(restored["calls"][1]["body"]["expected_plan_hash"], "t" * 64)
         self.assertRegex(restored["calls"][2]["url"], r"dry_run=true$")
@@ -309,6 +343,16 @@ console.log(JSON.stringify(runs));
         self.assertEqual(len(vanished["calls"]), 2)
         self.assertNotIn("восстановлена", vanished["status"].lower())
         self.assertTrue(vanished["error"])
+        self.assertEqual(len(changed_cancel["calls"]), 3)
+        self.assertEqual(len(changed_cancel["confirms"]), 2)
+        self.assertIn("Восстановление", changed_cancel["confirms"][0]["title"])
+        self.assertIn("синхронизации", changed_cancel["confirms"][1]["title"].lower())
+        self.assertIn("отменено", changed_cancel["status"].lower())
+        self.assertEqual(len(changed_apply["calls"]), 4)
+        self.assertEqual(len(changed_apply["confirms"]), 2)
+        self.assertEqual(changed_apply["calls"][1]["body"]["expected_plan_hash"], "t" * 64)
+        self.assertEqual(changed_apply["calls"][3]["body"]["expected_plan_hash"], "u" * 64)
+        self.assertIn("применены", changed_apply["status"].lower())
 
     def test_preview_names_target_and_shows_ordered_paths_counts_and_shared_effect(self):
         payload = self.probe(
@@ -324,6 +368,7 @@ console.log(JSON.stringify({preview}));
 """
         )["preview"]
         self.assertIn("существующий плейлист «Сет»", payload)
+        self.assertIn("ID rb-7", payload)
         self.assertIn("добавить: 1", payload)
         self.assertIn("1. One — D:/Library/One.flac", payload)
         self.assertIn("2. Two — D:/Library/Two.wav", payload)
@@ -362,6 +407,269 @@ console.log(JSON.stringify({calls,actions,current,status:elements.get('#statusRe
         self.assertIn("/api/local/playlists", joined)
         self.assertIn("/api/playlists/local:fixture/tracks", joined)
         self.assertNotRegex(joined, r"/api/(?:deezer|sc|config|auth)")
+
+    def test_duplicate_name_wav_chooses_exact_target_before_state_and_flip_preview(self):
+        payload = self.probe(
+            r"""
+const responses=[
+  {error:{code:'ambiguous_playlist_target'},unresolved:[],media_state:{mode:'blocked'}},
+  {db_exists:true,running:false,playlists:[{id:'11',name:'Дубль',count:2},{id:'22',name:'Дубль',count:2}]},
+  {error:null,unresolved:[],media_state:{mode:'wav'}},
+  {dry_run:true,applied:false,reconciled:false,unchanged:true,unresolved:[],error:null,
+    plan:{hash:'z'.repeat(64),target:{id:'22',name:'Дубль'},counts:{},desired_resolved:[],shared_content:[]},media_state:{mode:'wav'}},
+];
+const calls=[];
+globalThis.fetch=async(url,request)=>{
+  calls.push({url,body:request.body ? JSON.parse(request.body) : null});
+  return {ok:true,json:async()=>responses.shift()};
+};
+globalThis.confirm=()=>{throw new Error('native confirm must not be used');};
+current={kind:'local',id:'local:dup',title:'Дубль'};
+const pending=flipWav();
+for(let i=0;i<20 && !(typeof pendingRbDialog !== 'undefined' && pendingRbDialog);i++) await Promise.resolve();
+const dialogAvailable=typeof confirmRbDialog === 'function' && !!pendingRbDialog;
+let choiceText='';
+if(dialogAvailable){
+  choiceText=elements.get('#rbTargetSelect').textContent;
+  elements.get('#rbTargetSelect').value='22';
+  confirmRbDialog();
+}
+await pending;
+console.log(JSON.stringify({dialogAvailable,choiceText,calls,status:elements.get('#statusRegion').textContent,error:elements.get('#errorRegion').textContent}));
+"""
+        )
+        self.assertTrue(payload["dialogAvailable"], payload)
+        self.assertIn("ID 11", payload["choiceText"])
+        self.assertIn("ID 22", payload["choiceText"])
+        self.assertEqual(len(payload["calls"]), 4, payload)
+        self.assertRegex(payload["calls"][1]["url"], r"/api/rb/status$")
+        self.assertIn("playlist_id=22", payload["calls"][2]["url"])
+        self.assertEqual(payload["calls"][3]["body"]["playlist_id"], "22")
+        self.assertIn("ID 22", payload["status"])
+
+    def test_duplicate_name_original_target_keeps_id_through_prepare_and_flip_preview(self):
+        payload = self.probe(
+            r"""
+const responses=[
+  {error:{code:'ambiguous_playlist_target'},unresolved:[],media_state:{mode:'blocked'}},
+  {db_exists:true,running:false,playlists:[{id:'11',name:'Дубль',count:2},{id:'22',name:'Дубль',count:2}]},
+  {error:null,unresolved:[],media_state:{mode:'original'}},
+  {prepared:2,reused:0,total:2,state:'prepared',tracks:[],unresolved:[],error:null},
+  {error:null,unresolved:[],media_state:{mode:'original',prepared:2,total:2}},
+  {dry_run:true,applied:false,reconciled:false,unchanged:true,unresolved:[],error:null,
+    plan:{hash:'j'.repeat(64),target:{id:'22',name:'Дубль'},counts:{},desired_resolved:[],shared_content:[]},media_state:{mode:'original'}},
+];
+const calls=[];
+globalThis.fetch=async(url,request)=>{
+  calls.push({url,body:request.body ? JSON.parse(request.body) : null});
+  return {ok:true,json:async()=>responses.shift()};
+};
+globalThis.confirm=()=>{throw new Error('native confirm must not be used');};
+current={kind:'local',id:'local:dup',title:'Дубль'};
+const pending=flipWav();
+await driveRbDialog({targetId:'22'});
+await driveRbDialog();
+await pending;
+console.log(JSON.stringify({calls,status:elements.get('#statusRegion').textContent}));
+"""
+        )
+        self.assertEqual(len(payload["calls"]), 6, payload)
+        self.assertIn("playlist_id=22", payload["calls"][2]["url"])
+        self.assertRegex(payload["calls"][3]["url"], r"/api/rb/prepare-wav$")
+        self.assertIn("playlist_id=22", payload["calls"][4]["url"])
+        self.assertEqual(payload["calls"][5]["body"]["playlist_id"], "22")
+        self.assertTrue(payload["calls"][5]["body"]["to_wav"])
+        self.assertIn("ID 22", payload["status"])
+
+    def test_delayed_preview_cannot_replace_new_auth_dialog_or_status(self):
+        payload = self.probe(
+            r"""
+let releasePreview;
+const previewPromise=new Promise(resolve=>{releasePreview=resolve;});
+let calls=0;
+globalThis.fetch=async()=>{
+  calls++;
+  return {ok:true,json:async()=>previewPromise};
+};
+globalThis.__invokeImpl=async(name,body)=>{
+  if(name==='backend_connection') return {baseUrl:'http://127.0.0.1:24680',token:'test'};
+  if(name==='auth_status'&&body.requestId===null) return {accounts:{deezer:{connected:true,account:{name:'DJ'}}}};
+  return {};
+};
+let nativeConfirms=0;
+globalThis.confirm=()=>{nativeConfirms++;return false;};
+current={kind:'local',id:'local:set',title:'Set'};
+const pending=rbSync();
+await Promise.resolve();
+await openLogin('deezer');
+showStatus('AUTH-MARKER');
+releasePreview({dry_run:true,applied:false,reconciled:false,unchanged:false,unresolved:[],error:null,
+  plan:{hash:'q'.repeat(64),target:{id:'rb-1',name:'Set'},counts:{add:1},desired_resolved:[],shared_content:[]}});
+await pending;
+console.log(JSON.stringify({calls,nativeConfirms,status:elements.get('#statusRegion').textContent,
+  title:elements.get('#loginTitle').textContent,visible:!elements.get('#modalOverlay').classList.contains('hidden')}));
+"""
+        )
+        self.assertEqual(payload["nativeConfirms"], 0, payload)
+        self.assertEqual(payload["calls"], 1)
+        self.assertEqual(payload["status"], "AUTH-MARKER")
+        self.assertEqual(payload["title"], "Вход в Deezer")
+        self.assertTrue(payload["visible"])
+
+    def test_closing_rekordbox_dialog_cancels_and_unlocks_without_apply(self):
+        payload = self.probe(
+            r"""
+const calls=[];
+globalThis.fetch=async(url,request)=>{
+  calls.push(url);
+  return {ok:true,json:async()=>({dry_run:true,applied:false,reconciled:false,unchanged:false,unresolved:[],error:null,
+    plan:{hash:'d'.repeat(64),target:{id:'rb-1',name:'Set'},counts:{add:1},desired_resolved:[],shared_content:[]}})};
+};
+globalThis.confirm=()=>{throw new Error('native confirm must not be used');};
+current={kind:'local',id:'local:set',title:'Set'};
+const pending=rbSync();
+for(let i=0;i<20 && !(typeof pendingRbDialog !== 'undefined' && pendingRbDialog);i++) await Promise.resolve();
+const dialogAvailable=typeof pendingRbDialog !== 'undefined' && !!pendingRbDialog;
+if(dialogAvailable) closeLogin();
+await pending;
+console.log(JSON.stringify({dialogAvailable,calls,busy:rbOperationBusy,visible:!elements.get('#modalOverlay').classList.contains('hidden'),
+  status:elements.get('#statusRegion').textContent}));
+"""
+        )
+        self.assertTrue(payload["dialogAvailable"], payload)
+        self.assertEqual(len(payload["calls"]), 1)
+        self.assertFalse(payload["busy"])
+        self.assertFalse(payload["visible"])
+        self.assertIn("отменено", payload["status"].lower())
+
+    def test_playlist_change_settles_and_closes_stale_rekordbox_dialog(self):
+        payload = self.probe(
+            r"""
+const calls=[];
+globalThis.fetch=async url=>{
+  calls.push(url);
+  return {ok:true,json:async()=>({dry_run:true,applied:false,reconciled:false,unchanged:false,unresolved:[],error:null,
+    plan:{hash:'c'.repeat(64),target:{id:'rb-1',name:'First'},counts:{add:1},desired_resolved:[],shared_content:[]}})};
+};
+globalThis.confirm=()=>{throw new Error('native confirm must not be used');};
+loadPlaylists=async()=>{};
+loadTracks=async()=>{};
+current={kind:'deezer',id:'first',title:'First'};
+const operation=rbSync();
+for(let i=0;i<40 && !pendingRbDialog;i++) await Promise.resolve();
+await selectPlaylist('second','Second');
+const afterSelection={visible:!elements.get('#modalOverlay').classList.contains('hidden'),pending:!!pendingRbDialog,busy:rbOperationBusy};
+if(pendingRbDialog) cancelRbDialog();
+await operation;
+console.log(JSON.stringify({calls,afterSelection,current}));
+"""
+        )
+        self.assertEqual(len(payload["calls"]), 1)
+        self.assertEqual(payload["current"]["id"], "second")
+        self.assertFalse(payload["afterSelection"]["visible"], payload)
+        self.assertFalse(payload["afterSelection"]["pending"], payload)
+        self.assertFalse(payload["afterSelection"]["busy"], payload)
+
+    def test_auth_replacement_settles_open_rekordbox_dialog_without_status_takeover(self):
+        payload = self.probe(
+            r"""
+let calls=0;
+globalThis.fetch=async()=>{
+  calls++;
+  return {ok:true,json:async()=>({dry_run:true,applied:false,reconciled:false,unchanged:false,unresolved:[],error:null,
+    plan:{hash:'e'.repeat(64),target:{id:'rb-1',name:'Set'},counts:{add:1},desired_resolved:[],shared_content:[]}})};
+};
+globalThis.__invokeImpl=async(name,body)=>{
+  if(name==='backend_connection') return {baseUrl:'http://127.0.0.1:24680',token:'test'};
+  if(name==='auth_status'&&body.requestId===null) return {accounts:{deezer:{connected:true,account:{name:'DJ'}}}};
+  return {};
+};
+globalThis.confirm=()=>{throw new Error('native confirm must not be used');};
+current={kind:'local',id:'local:set',title:'Set'};
+const pending=rbSync();
+for(let i=0;i<40 && !pendingRbDialog;i++) await Promise.resolve();
+const rbWasVisible=activeDialogKind==='rb'&&!elements.get('#modalOverlay').classList.contains('hidden');
+await openLogin('deezer');
+showStatus('AUTH-REPLACED');
+await pending;
+console.log(JSON.stringify({calls,rbWasVisible,busy:rbOperationBusy,status:elements.get('#statusRegion').textContent,
+  title:elements.get('#loginTitle').textContent,kind:activeDialogKind,visible:!elements.get('#modalOverlay').classList.contains('hidden')}));
+"""
+        )
+        self.assertTrue(payload["rbWasVisible"], payload)
+        self.assertEqual(payload["calls"], 1)
+        self.assertFalse(payload["busy"])
+        self.assertEqual(payload["status"], "AUTH-REPLACED")
+        self.assertEqual(payload["title"], "Вход в Deezer")
+        self.assertEqual(payload["kind"], "auth")
+        self.assertTrue(payload["visible"])
+
+    def test_stale_track_failure_cannot_replace_new_selection_table(self):
+        payload = self.probe(
+            r"""
+let rejectFirst;
+const firstPromise=new Promise((resolve,reject)=>{rejectFirst=reject;});
+globalThis.fetch=async url=>{
+  const path=new URL(url).pathname;
+  if(path==='/api/playlists/first/tracks') return {ok:true,json:async()=>firstPromise};
+  if(path==='/api/playlists/second/tracks') return {ok:true,json:async()=>({path:'D:/Second',tracks:[
+    {id:'2',provider:'deezer',title:'Second Track',artist:'B',album:'',duration:120,status:'ok',file_path:'D:/Second.flac'}]})};
+  if(path==='/api/rb/media-state') return {ok:true,json:async()=>({error:{code:'adapter_open_failed'},media_state:{mode:'blocked'}})};
+  throw new Error('unexpected '+path);
+};
+const first={kind:'deezer',id:'first',title:'First'};
+libraryConfigured=true;
+current=first;
+const stale=loadTracks(first);
+await Promise.resolve();
+invalidateRbOperation();
+const second={kind:'deezer',id:'second',title:'Second'};
+current=second;
+await loadTracks(second);
+rejectFirst(new Error('Old first request failed'));
+await stale;
+console.log(JSON.stringify({current,title:elements.get('#pltitle').textContent,tracksText:elements.get('#tracks').textContent,
+  error:elements.get('#errorRegion').textContent}));
+"""
+        )
+        self.assertEqual(payload["current"]["id"], "second")
+        self.assertEqual(payload["title"], "Second")
+        self.assertIn("Second Track", payload["tracksText"])
+        self.assertNotIn("Old first request failed", payload["tracksText"])
+        self.assertNotIn("Old first request failed", payload["error"])
+
+    def test_opening_auth_does_not_discard_current_playlist_track_load(self):
+        payload = self.probe(
+            r"""
+let releaseTracks;
+const pendingTracks=new Promise(resolve=>{releaseTracks=resolve;});
+globalThis.fetch=async url=>{
+  const path=new URL(url).pathname;
+  if(path==='/api/playlists/current/tracks') return {ok:true,json:async()=>pendingTracks};
+  if(path==='/api/rb/media-state') return {ok:true,json:async()=>({error:{code:'adapter_open_failed'},media_state:{mode:'blocked'}})};
+  throw new Error('unexpected '+path);
+};
+globalThis.__invokeImpl=async(name,body)=>{
+  if(name==='backend_connection') return {baseUrl:'http://127.0.0.1:24680',token:'test'};
+  if(name==='auth_status'&&body.requestId===null) return {accounts:{deezer:{connected:true,account:{name:'DJ'}}}};
+  return {};
+};
+libraryConfigured=true;
+current={kind:'deezer',id:'current',title:'Current'};
+const loading=loadTracks(current);
+await Promise.resolve();
+await openLogin('deezer');
+releaseTracks({path:'D:/Current',tracks:[
+  {id:'7',provider:'deezer',title:'Current Track',artist:'DJ',album:'',duration:180,status:'ok',file_path:'D:/Current.flac'}]});
+await loading;
+console.log(JSON.stringify({title:elements.get('#pltitle').textContent,tracksText:elements.get('#tracks').textContent,
+  dialogTitle:elements.get('#loginTitle').textContent,visible:!elements.get('#modalOverlay').classList.contains('hidden')}));
+"""
+        )
+        self.assertEqual(payload["title"], "Current")
+        self.assertIn("Current Track", payload["tracksText"])
+        self.assertEqual(payload["dialogTitle"], "Вход в Deezer")
+        self.assertTrue(payload["visible"])
 
 
 if __name__ == "__main__":

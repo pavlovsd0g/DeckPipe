@@ -22,6 +22,9 @@ let rbSelectionEpoch = 0;
 let rbOperationGeneration = 0;
 let rbOperationBusy = false;
 let rbMediaMode = null;
+let activeDialogKind = null;
+let pendingRbDialog = null;
+const rbTargetIdsBySource = new Map();
 
 const $ = s => document.querySelector(s);
 const RB_APPLY_CONFIRMATION_TOKEN = 'APPLY_REKORDBOX_CHANGES';
@@ -226,8 +229,9 @@ function setRbOperationBusy(busy) {
   if (wavButton) wavButton.disabled = busy;
 }
 
-function invalidateRbOperation() {
-  rbSelectionEpoch += 1;
+function invalidateRbOperation({selectionChanged = true} = {}) {
+  cancelRbDialog();
+  if (selectionChanged) rbSelectionEpoch += 1;
   rbOperationGeneration += 1;
   rbMediaMode = null;
   setRbOperationBusy(false);
@@ -409,8 +413,94 @@ function openDialog(initialFocus) {
   target.focus();
 }
 
+function settleRbDialog(value, {hide = true} = {}) {
+  const pending = pendingRbDialog;
+  if (!pending) return false;
+  pendingRbDialog = null;
+  if (hide && activeDialogKind === 'rb') {
+    activeDialogKind = null;
+    setHidden($('#modalOverlay'), true);
+    releaseDialogFocus();
+  }
+  pending.resolve(value);
+  return true;
+}
+
+function confirmRbDialog() {
+  if (!pendingRbDialog) return;
+  const value = pendingRbDialog.value();
+  settleRbDialog(value);
+}
+
+function cancelRbDialog({hide = true} = {}) {
+  settleRbDialog(null, {hide});
+}
+
+function configureRbDialog({title, children, confirmLabel, cancelLabel, value}) {
+  if (activeDialogKind === 'auth' && !$('#modalOverlay').classList.contains('hidden')) return Promise.resolve(null);
+  cancelRbDialog();
+  activeDialogKind = 'rb';
+  $('#loginTitle').textContent = title;
+  $('#modal').setAttribute('aria-labelledby', 'loginTitle');
+  $('#modalOverlay').setAttribute('data-dialog-kind', 'rb');
+  const closeButton = $('[data-action="close-login"]');
+  if (closeButton) closeButton.setAttribute('aria-label', 'Закрыть подтверждение Rekordbox');
+  replaceChildren($('#loginSteps'), children);
+  const accept = $('#btnAuthStart');
+  accept.textContent = confirmLabel;
+  accept.dataset.action = 'confirm-rb-dialog';
+  setHidden(accept, false);
+  const cancel = $('#btnAuthRetry');
+  cancel.textContent = cancelLabel;
+  cancel.dataset.action = 'cancel-rb-dialog';
+  setHidden(cancel, false);
+  setHidden($('#btnChangeAccount'), true);
+  setHidden($('#btnLogout'), true);
+  setHidden($('#scImport'), true);
+  $('#loginResult').textContent = '';
+  setResultState(null);
+  const promise = new Promise(resolve => { pendingRbDialog = {resolve, value}; });
+  openDialog(accept);
+  return promise;
+}
+
+function confirmRbAction(operation, title, message, confirmLabel) {
+  if (!rbOperationIsCurrent(operation)) return Promise.resolve(null);
+  return configureRbDialog({
+    title,
+    children: [create('p', {className: 'rb-dialog-copy', text: message})],
+    confirmLabel,
+    cancelLabel: 'Отмена',
+    value: () => true,
+  });
+}
+
+function chooseRbTargetDialog(operation, title, candidates) {
+  if (!rbOperationIsCurrent(operation)) return Promise.resolve(null);
+  const select = create('select', {id: 'rbTargetSelect', className: 'rb-target-select',
+    attrs: {'aria-label': `Целевой плейлист Rekordbox для ${title}`}},
+  candidates.map(item => create('option', {value: String(item.id),
+    text: `${item.name} — ${item.count ?? '?'} треков — ID ${item.id}${item.folder ? ` — ${item.folder}` : ''}`})));
+  select.value = String(candidates[0].id);
+  return configureRbDialog({
+    title: 'Выберите плейлист Rekordbox',
+    children: [
+      create('p', {text: `В Rekordbox несколько плейлистов «${title}». Выберите точную цель:`}),
+      select,
+    ],
+    confirmLabel: 'Использовать выбранный',
+    cancelLabel: 'Отмена',
+    value: () => select.value,
+  });
+}
+
 function closeLogin({cancel = true} = {}) {
+  if (activeDialogKind === 'rb') {
+    cancelRbDialog();
+    return;
+  }
   if (cancel) cancelAuthAttempt().catch(error => showError(error, 'security'));
+  activeDialogKind = null;
   setHidden($('#modalOverlay'), true);
   releaseDialogFocus();
 }
@@ -446,6 +536,7 @@ async function loadConfig(expectedAuthEpoch = null) {
 }
 
 async function openLogin(service) {
+  invalidateRbOperation({selectionChanged: false});
   const epoch = authAttemptEpoch + 1;
   const previousRequest = activeAuthRequest;
   authAttemptEpoch = epoch;
@@ -484,14 +575,24 @@ async function openLogin(service) {
 }
 
 function renderLoginDialog(service) {
+  cancelRbDialog();
+  activeDialogKind = 'auth';
   loginService = service;
   $('#loginTitle').textContent = `Вход в ${provLabel(service)}`;
+  $('#modalOverlay').setAttribute('data-dialog-kind', 'auth');
+  const closeButton = $('[data-action="close-login"]');
+  if (closeButton) closeButton.setAttribute('aria-label', 'Закрыть вход');
   $('#loginResult').textContent = '';
   setResultState(null);
   setHidden($('#scImport'), true);
   setHidden($('#btnLogout'), !nativeAccounts[service]?.connected);
   setHidden($('#btnChangeAccount'), !nativeAccounts[service]?.connected);
   setHidden($('#btnAuthRetry'), true);
+  $('#btnAuthRetry').dataset.action = 'retry-login';
+  $('#btnAuthRetry').textContent = 'Повторить попытку';
+  $('#btnAuthStart').dataset.action = 'do-login';
+  $('#btnAuthStart').textContent = 'Открыть окно входа';
+  setHidden($('#btnAuthStart'), false);
   replaceChildren($('#loginSteps'), [
     create('p', {text: 'DeckPipe откроет отдельное окно входа. Войдите на странице сервиса в этом окне.'}),
     create('p', {className: 'dim', text: 'DeckPipe помнит только собственную сессию входа; первая авторизация не использует вход из обычного браузера. Пароль вводится только на сайте сервиса.'}),
@@ -1307,6 +1408,7 @@ async function loadTracks(playlist) {
       if (selectionEpoch === rbSelectionEpoch && current === playlist) renderRbMediaMode('blocked');
     }
   } catch (error) {
+    if (selectionEpoch !== rbSelectionEpoch || current !== playlist) return;
     showError(error, 'state');
     setEmpty(`Не удалось загрузить: ${describeError(error, 'state')}`, 'Повторить', 'rescan');
   }
@@ -1479,7 +1581,7 @@ function formatRbPreview(result, action = 'Синхронизация') {
     ? 'Цель Rekordbox не удалось определить.'
     : target.id == null
     ? `Цель Rekordbox: новый плейлист «${target.name || 'без названия'}» будет создан.`
-    : `Цель Rekordbox: существующий плейлист «${target.name || 'без названия'}».`;
+    : `Цель Rekordbox: существующий плейлист «${target.name || 'без названия'}», ID ${target.id}.`;
   const lines = [action, targetText, `Изменения: ${formatRbSyncCounts(result)}.`, ...rbOrderedPathLines(result), ...rbSharedEffectLines(result)];
   if (result?.media_state?.mode) lines.push(`Текущий режим файлов: ${rbMediaModeLabel(result.media_state.mode)}.`);
   if (result?.unchanged) lines.push('Rekordbox уже соответствует этому плану. Применение и новый бэкап не требуются.');
@@ -1517,6 +1619,18 @@ function rbRequestBody(selection, extra = {}) {
   return {playlist_key: selection.key, playlist_title: selection.title, ...extra};
 }
 
+function rbTargetMemoryKey(selection) {
+  return `${selection.key}\n${selection.title}`;
+}
+
+function rememberedRbTarget(selection) {
+  return rbTargetIdsBySource.get(rbTargetMemoryKey(selection)) || null;
+}
+
+function rememberRbTarget(selection, playlistId) {
+  if (playlistId != null) rbTargetIdsBySource.set(rbTargetMemoryKey(selection), String(playlistId));
+}
+
 function rbMediaStatePath(selection, playlistId = null) {
   const params = new URLSearchParams({playlist_key: selection.key, playlist_title: selection.title});
   if (playlistId) params.set('playlist_id', playlistId);
@@ -1551,15 +1665,9 @@ async function chooseRbTarget(operation, title) {
     showError(new Error('Плейлист Rekordbox с таким названием не найден. Обновите просмотр.'), 'rekordbox');
     return null;
   }
-  const choices = candidates.map((item, index) => `${index + 1}. ${item.name} — ${item.count ?? '?'} треков`).join('\n');
-  const answer = prompt(`В Rekordbox несколько плейлистов «${title}». Выберите номер:\n${choices}`);
-  if (!rbOperationIsCurrent(operation) || answer === null) return null;
-  const index = Number(answer) - 1;
-  if (!Number.isInteger(index) || !candidates[index]) {
-    showError(new Error('Номер плейлиста не выбран. Изменения не применялись.'), 'rekordbox');
-    return null;
-  }
-  return String(candidates[index].id);
+  const selected = await chooseRbTargetDialog(operation, title, candidates);
+  if (!rbOperationIsCurrent(operation) || selected === null) return null;
+  return candidates.some(item => String(item.id) === String(selected)) ? String(selected) : null;
 }
 
 async function restorePendingRbOperation(endpoint, body, preview, operation) {
@@ -1569,7 +1677,11 @@ async function restorePendingRbOperation(endpoint, body, preview, operation) {
     return {stop: true};
   }
   showStatus('Обнаружена незавершённая операция Rekordbox. Новые изменения пока не применяются.');
-  if (!confirm('Восстановить состояние до незавершённой операции Rekordbox?\nПосле восстановления DeckPipe заново покажет план, и для новых изменений потребуется отдельное подтверждение.')) {
+  const confirmed = await confirmRbAction(operation, 'Восстановление Rekordbox',
+    'Восстановить состояние до незавершённой операции Rekordbox?\nПосле восстановления DeckPipe заново покажет план, и для новых изменений потребуется отдельное подтверждение.',
+    'Восстановить');
+  if (!rbOperationIsCurrent(operation)) return {stop: true};
+  if (!confirmed) {
     showStatus('Восстановление отменено. Новые изменения не применялись.');
     return {stop: true};
   }
@@ -1604,6 +1716,7 @@ async function loadRbPreview(endpoint, body, operation) {
     preview = await api(`${endpoint}?dry_run=true`, {body});
     if (!rbOperationIsCurrent(operation)) return {stop: true};
   }
+  if (preview?.plan?.target?.id != null) rememberRbTarget(operation.selection, preview.plan.target.id);
   return {preview, prefix};
 }
 
@@ -1646,7 +1759,8 @@ async function applyRbPreview(endpoint, body, preview, operation, action) {
 async function rbSync() {
   const operation = beginRbOperation();
   if (!operation) return;
-  const body = rbRequestBody(operation.selection);
+  const rememberedTarget = rememberedRbTarget(operation.selection);
+  const body = rbRequestBody(operation.selection, rememberedTarget ? {playlist_id: rememberedTarget} : {});
   try {
     const loaded = await loadRbPreview('/api/rb/sync', body, operation);
     if (loaded.stop || !rbOperationIsCurrent(operation)) return;
@@ -1658,7 +1772,10 @@ async function rbSync() {
       return;
     }
     if (!rbSyncHasChanges(preview)) return;
-    if (!confirm(`${previewText}\n\nПрименить именно этот план? Rekordbox должен быть закрыт.`)) {
+    const confirmed = await confirmRbAction(operation, 'Подтверждение синхронизации Rekordbox',
+      `${previewText}\n\nПрименить именно этот план? Rekordbox должен быть закрыт.`, 'Применить план');
+    if (!rbOperationIsCurrent(operation)) return;
+    if (!confirmed) {
       showStatus(`${previewText}\nПрименение отменено. Изменения не вносились.`);
       return;
     }
@@ -1675,9 +1792,21 @@ async function flipWav() {
   if (!operation) return;
   const selection = operation.selection;
   try {
-    const state = await refreshRbMediaState(selection, {operation});
+    let playlistId = rememberedRbTarget(selection);
+    let state = await refreshRbMediaState(selection, {operation, playlistId, quiet: true});
     if (!state || !rbOperationIsCurrent(operation)) return;
-    if (state.error || state.unresolved?.length || state.media_state?.mode === 'blocked') return;
+    if (state?.error?.code === 'ambiguous_playlist_target') {
+      playlistId = await chooseRbTarget(operation, selection.title);
+      if (!playlistId || !rbOperationIsCurrent(operation)) return;
+      rememberRbTarget(selection, playlistId);
+      clearError();
+      state = await refreshRbMediaState(selection, {operation, playlistId, quiet: true});
+      if (!state || !rbOperationIsCurrent(operation)) return;
+    }
+    if (state.error || state.unresolved?.length || state.media_state?.mode === 'blocked') {
+      showRbResultError(state, 'Текущее состояние Rekordbox нельзя определить безопасно.');
+      return;
+    }
     const mode = state.media_state?.mode;
     let toWav;
     if (mode === 'wav') toWav = false;
@@ -1697,7 +1826,10 @@ async function flipWav() {
     }
 
     if (toWav) {
-      if (!confirm(`Подготовить отдельные проверенные WAV-файлы для «${selection.title}»?\nИсходники сохранятся. База Rekordbox на этом шаге не изменяется.`)) {
+      const prepareConfirmed = await confirmRbAction(operation, 'Подготовка WAV',
+        `Подготовить отдельные проверенные WAV-файлы для «${selection.title}»?\nИсходники сохранятся. База Rekordbox на этом шаге не изменяется.`, 'Подготовить WAV');
+      if (!rbOperationIsCurrent(operation)) return;
+      if (!prepareConfirmed) {
         showStatus('Подготовка WAV отменена. Файлы и Rekordbox не изменялись.');
         return;
       }
@@ -1708,11 +1840,14 @@ async function flipWav() {
         showRbResultError(prepared, 'Подготовка WAV не завершена. База Rekordbox не изменялась.');
         return;
       }
-      const freshState = await refreshRbMediaState(selection, {operation});
-      if (!freshState || freshState.error || freshState.unresolved?.length || freshState.media_state?.mode === 'blocked') return;
+      const freshState = await refreshRbMediaState(selection, {operation, playlistId, quiet: true});
+      if (!freshState || freshState.error || freshState.unresolved?.length || freshState.media_state?.mode === 'blocked') {
+        if (freshState) showRbResultError(freshState, 'Состояние после подготовки WAV нельзя определить безопасно.');
+        return;
+      }
     }
 
-    const body = rbRequestBody(selection, {to_wav: toWav});
+    const body = rbRequestBody(selection, {to_wav: toWav, ...(playlistId ? {playlist_id: playlistId} : {})});
     const loaded = await loadRbPreview('/api/flip', body, operation);
     if (loaded.stop || !rbOperationIsCurrent(operation)) return;
     const preview = loaded.preview;
@@ -1724,7 +1859,10 @@ async function flipWav() {
       return;
     }
     if (!rbSyncHasChanges(preview)) return;
-    if (!confirm(`${previewText}\n\nПрименить именно это переключение путей? Rekordbox должен быть закрыт.`)) {
+    const confirmed = await confirmRbAction(operation, toWav ? 'Переключение на WAV' : 'Возврат к исходникам',
+      `${previewText}\n\nПрименить именно это переключение путей? Rekordbox должен быть закрыт.`, 'Применить пути');
+    if (!rbOperationIsCurrent(operation)) return;
+    if (!confirmed) {
       showStatus(`${previewText}\nПрименение отменено. Пути Rekordbox не изменялись.`);
       return;
     }
@@ -1820,6 +1958,8 @@ const clickActions = Object.freeze({
   'set-search-filter': el => setSearchFilter(el.dataset.filter),
   'overlay-close': (el, event) => { if (event.target === el) closeLogin(); },
   'close-login': () => closeLogin(),
+  'confirm-rb-dialog': () => confirmRbDialog(),
+  'cancel-rb-dialog': () => cancelRbDialog(),
   'do-login': () => tauriLogin(loginService),
   'retry-login': () => retryAuthLogin(),
   'logout-provider': () => logoutProvider(),

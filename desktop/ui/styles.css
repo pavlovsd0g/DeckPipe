@@ -488,6 +488,17 @@ th {
   margin: 10px 0;
 }
 
+.rb-dialog-copy {
+  max-height: 48vh;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+.rb-target-select {
+  margin-top: 10px;
+  width: 100%;
+}
+
 .login-input {
   width: 100%;
 }
