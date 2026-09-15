@@ -6,6 +6,7 @@ import threading
 import uuid
 import struct
 import logging
+import re
 from pathlib import Path
 from datetime import datetime
 from .rekordbox_recovery import digest, file_hash
@@ -206,6 +207,73 @@ class PyrekordboxAdapter:
         result = self.db.session.connection().exec_driver_sql('PRAGMA integrity_check').fetchall()
         if result != [('ok',)]:
             raise AdapterError('database_integrity_failed')
+
+    def validate_recovery_schema(self):
+        """Reject schema features that cannot be replayed without side effects."""
+        connection = self.db.session.connection()
+        schema = [tuple(r) for r in connection.exec_driver_sql(
+            'SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name')]
+        if any(r[0] == 'trigger' or (r[0] == 'table' and re.match(r'\s*CREATE\s+VIRTUAL\s+TABLE\b', r[3] or '', re.I)) for r in schema):
+            raise AdapterError('unsupported_recovery_schema')
+        tables = []
+        for kind, name, _, sql in schema:
+            if kind != 'table':
+                continue
+            quoted = '"' + name.replace('"', '""') + '"'
+            columns = list(connection.exec_driver_sql('PRAGMA table_xinfo(' + quoted + ')'))
+            if not columns or any(c[6] != 0 for c in columns):
+                raise AdapterError('unsupported_recovery_schema')
+            names = [c[1] for c in columns]
+            rowid = None
+            if not re.search(r'\bWITHOUT\s+ROWID\b', sql or '', re.I):
+                rowid = next((candidate for candidate in ('rowid', '_rowid_', 'oid') if candidate not in {name.lower() for name in names}), None)
+                if rowid is None:
+                    raise AdapterError('unsupported_recovery_schema')
+            tables.append((name, ([rowid] if rowid else []) + names))
+        return schema, sorted(tables, key=lambda item: (item[0] == 'sqlite_sequence', item[0]))
+
+    def restore_database_rows(self, backup_path):
+        """Replay a verified same-schema backup inside the caller's write transaction.
+
+        No database file replacement or sidecar deletion. BEGIN IMMEDIATE remains
+        held through recognition, replay, external restoration and commit.
+        """
+        from sqlalchemy import create_engine
+        schema, tables = self.validate_recovery_schema()
+        destination = self.db.session.connection()
+        if not destination.connection.driver_connection.in_transaction:
+            raise AdapterError('recovery_transaction_required')
+        url = self.db.engine.url.set(database='file:' + Path(backup_path).as_posix(),
+            query={'uri': 'true', 'mode': 'ro'})
+        engine = create_engine(url, module=self.db.engine.dialect.dbapi)
+        quote = lambda name: '"' + name.replace('"', '""') + '"'
+        try:
+            with engine.connect() as source:
+                backup_schema = [tuple(r) for r in source.exec_driver_sql(
+                    'SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name')]
+                if backup_schema != schema:
+                    raise AdapterError('recovery_schema_changed')
+                if source.exec_driver_sql('PRAGMA integrity_check').fetchall() != [('ok',)]:
+                    raise AdapterError('recovery_backup_damaged')
+                destination.exec_driver_sql('PRAGMA defer_foreign_keys=ON')
+                for name, _ in tables:
+                    destination.exec_driver_sql('DELETE FROM ' + quote(name))
+                for name, columns in tables:
+                    if name == 'sqlite_sequence':
+                        # AUTOINCREMENT inserts above may repopulate this table.
+                        destination.exec_driver_sql('DELETE FROM sqlite_sequence')
+                    fields = ','.join(quote(c) for c in columns)
+                    cursor = source.exec_driver_sql('SELECT ' + fields + ' FROM ' + quote(name))
+                    insert = 'INSERT INTO ' + quote(name) + '(' + fields + ') VALUES (' + ','.join('?' for _ in columns) + ')'
+                    while rows := cursor.fetchmany(500):
+                        destination.exec_driver_sql(insert, [tuple(r) for r in rows])
+        finally:
+            engine.dispose()
+        self.db.session.expire_all()
+
+    def finish_restore(self):
+        self.db.session.commit()
+        self.db.registry.clear_buffer()
 
     def external_files_for_plan(self, plan):
         files = {self.db_path.parent / 'masterPlaylists6.xml'}

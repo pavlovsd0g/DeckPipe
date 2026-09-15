@@ -9,7 +9,8 @@ import json
 import os
 import shutil
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
+from .rekordbox_file_ownership import OwnedFile, OwnershipError
 from pathlib import Path
 
 
@@ -82,24 +83,74 @@ class RecoveryError(RuntimeError):
 
 class Journal:
     def __init__(self, db_path):
-        self.path = Path(db_path).with_name('deckpipe-rekordbox-operation.json')
+        self.db_path = Path(db_path).absolute()
+        self.path = self.db_path.with_name('deckpipe-rekordbox-operation.json')
         self.data = None
         if self.path.exists():
             try:
                 self.data = json.loads(self.path.read_text(encoding='utf-8'))
-                if self.data['version'] != 1:
-                    raise ValueError()
-                required = {'id', 'phase', 'database_path', 'database_before', 'database_after',
-                    'backup', 'backup_hash', 'plan_hash', 'external'}
-                if not required.issubset(self.data) or self.data['phase'] not in {
-                        'prepared', 'commit_pending', 'database_committed', 'external_published', 'complete', 'restored'}:
-                    raise ValueError()
-                if len(self.data['id']) != 32 or any(c not in '0123456789abcdef' for c in self.data['id']):
-                    raise ValueError()
-                if not isinstance(self.data['external'], list):
-                    raise ValueError()
+                self._validate()
             except Exception:
                 raise RecoveryError('recovery_journal_invalid') from None
+
+    def _validate(self):
+        def require(condition):
+            if not condition:
+                raise ValueError('Invalid journal record')
+        def hex_value(value, length):
+            return isinstance(value, str) and len(value) == length and all(c in '0123456789abcdef' for c in value)
+        def path_value(value):
+            require(isinstance(value, str) and bool(value) and '\0' not in value and Path(value).is_absolute())
+            return os.path.normcase(os.path.normpath(value))
+        data = self.data
+        fields = {'version', 'id', 'phase', 'database_path', 'database_before', 'database_after',
+            'backup', 'backup_hash', 'plan_hash', 'external'}
+        require(isinstance(data, dict) and set(data) == fields)
+        require(type(data['version']) is int and data['version'] == 1 and hex_value(data['id'], 32))
+        phase = data['phase']
+        require(isinstance(phase, str) and phase in {'prepared', 'commit_pending', 'database_committed',
+            'external_published', 'complete', 'restoring', 'restored'})
+        require(path_value(data['database_path']) == path_value(str(self.db_path)))
+        root = self.db_path.parent / 'deckpipe-rekordbox-backups' / data['id']
+        require(path_value(data['backup']) == path_value(str(root / 'master.db')))
+        require(hex_value(data['database_before'], 64) and hex_value(data['backup_hash'], 64) and hex_value(data['plan_hash'], 64))
+        if phase == 'prepared':
+            require(data['database_after'] is None)
+        elif phase in ('restoring', 'restored'):
+            require(data['database_after'] is None or hex_value(data['database_after'], 64))
+        else:
+            require(hex_value(data['database_after'], 64))
+        require(isinstance(data['external'], list))
+        seen = set()
+        for index, item in enumerate(data['external']):
+            require(isinstance(item, dict) and {'path', 'backup', 'before', 'after'}.issubset(item)
+                and set(item).issubset({'path', 'backup', 'before', 'after', 'staged', 'moves'}))
+            original = path_value(item['path'])
+            xml = path_value(str(self.db_path.parent / 'masterPlaylists6.xml'))
+            share = path_value(str(self.db_path.parent / 'share')) + os.sep
+            require(original == xml or original.startswith(share))
+            require(original not in seen)
+            seen.add(original)
+            backup = root / ('external-' + str(index))
+            require(path_value(item['backup']) == path_value(str(backup)))
+            require(item['before'] is None or hex_value(item['before'], 64))
+            require(item['after'] is None or hex_value(item['after'], 64))
+            if 'staged' in item:
+                require(path_value(item['staged']) == path_value(str(backup.with_suffix('.after'))))
+                require(hex_value(item['after'], 64))
+            else:
+                require(item['after'] == item['before'])
+            moves = item.get('moves', [])
+            require(isinstance(moves, list))
+            moved_paths = set()
+            for move in moves:
+                require(isinstance(move, dict) and set(move) == {'path', 'hash'})
+                moved = path_value(move['path'])
+                prefix = path_value(str(backup)) + '.moved-'
+                require(moved.startswith(prefix) and hex_value(moved[len(prefix):], 32))
+                require(moved not in moved_paths and hex_value(move['hash'], 64))
+                require(move['hash'] in (item['before'], item['after']))
+                moved_paths.add(moved)
 
     @property
     def pending(self):
@@ -107,10 +158,15 @@ class Journal:
 
     def save(self, **updates):
         self.data.update(updates)
+        try:
+            self._validate()
+        except Exception:
+            raise RecoveryError('recovery_journal_invalid') from None
         atomic_bytes(self.path, json.dumps(self.data, ensure_ascii=False,
             sort_keys=True).encode('utf-8'))
 
     def prepare(self, adapter, plan):
+        adapter.validate_recovery_schema()
         operation_id = uuid.uuid4().hex
         root = adapter.db_path.parent / 'deckpipe-rekordbox-backups' / operation_id
         root.mkdir(parents=True)
@@ -145,65 +201,139 @@ class Journal:
             item['after'] = file_hash(staged)
         self.save()
 
-    def publish(self):
+    def _own_external(self, stack):
+        owners = {}
         for item in self.data['external']:
-            if 'staged' not in item:
+            try:
+                owner = stack.enter_context(OwnedFile(item['path']))
+            except FileNotFoundError:
+                owner = None
+            owners[item['path']] = owner
+        return owners
+
+    def _recognized_missing(self, item, stack):
+        # An interrupted owned rename can leave a path absent. Accept that
+        # transition only with the durably named, still verified displaced file.
+        for move in reversed(item.get('moves', [])):
+            try:
+                owner = stack.enter_context(OwnedFile(move['path'], read_only=True))
+            except FileNotFoundError:
                 continue
-            if file_hash(item['path']) != item['before']:
+            if owner.digest() == move['hash']:
+                return True
+        return False
+
+    def _replace_owned(self, item, owner, payload, stack):
+        replacement = None
+        if payload is not None:
+            temporary = Path(item['backup'] + '.publish-' + uuid.uuid4().hex)
+            replacement = stack.enter_context(OwnedFile(temporary, create=True))
+            replacement.write(payload)
+        if owner is not None:
+            displaced = item['backup'] + '.moved-' + uuid.uuid4().hex
+            item.setdefault('moves', []).append({'path': displaced, 'hash': owner.digest()})
+            self.save()  # Persist the transition before changing either name.
+            owner.rename(displaced)
+        if replacement is not None:
+            # ReplaceIfExists=False is essential, including originally absent
+            # paths and foreign creations after the old object was displaced.
+            replacement.rename(item['path'])
+        return replacement
+
+    def _verify_external(self, owners, field):
+        for item in self.data['external']:
+            owner = owners[item['path']]
+            if owner is None:
+                if Path(item['path']).exists():
+                    raise RecoveryError('recovery_external_changed')
+                actual = None
+            else:
+                actual = owner.digest()
+            if actual != item[field]:
                 raise RecoveryError('recovery_external_changed')
-            payload = Path(item['staged']).read_bytes()
-            if hashlib.sha256(payload).hexdigest() != item['after']:
-                raise RecoveryError('recovery_staged_file_damaged')
-            atomic_bytes(item['path'], payload)
-        self.save(phase='external_published')
+
+    def publish(self):
+        try:
+            with ExitStack() as stack:
+                owners = self._own_external(stack)
+                self._verify_external(owners, 'before')
+                for item in self.data['external']:
+                    if 'staged' not in item or item['after'] == item['before']:
+                        continue
+                    payload = Path(item['staged']).read_bytes()
+                    if hashlib.sha256(payload).hexdigest() != item['after']:
+                        raise RecoveryError('recovery_staged_file_damaged')
+                    owners[item['path']] = self._replace_owned(item, owners[item['path']], payload, stack)
+                self._verify_external(owners, 'after')
+                self.save(phase='external_published')
+        except OwnershipError:
+            raise RecoveryError('recovery_external_busy') from None
 
     def restore(self, adapter):
-        """Restore only a recognized pre/post DB and recognized external files."""
+        """Restore under SQLite writer ownership and mandatory external handles."""
         data = self.data
         if str(adapter.db_path.resolve()) != data['database_path']:
             raise RecoveryError('recovery_database_unrecognized')
-        backup_root = adapter.db_path.parent / 'deckpipe-rekordbox-backups' / data['id']
-        if not backup_root.resolve().is_relative_to((adapter.db_path.parent / 'deckpipe-rekordbox-backups').resolve()):
-            raise RecoveryError('recovery_journal_invalid')
-        if Path(data['backup']).resolve() != (backup_root / 'master.db').resolve():
-            raise RecoveryError('recovery_journal_invalid')
-        for item in data['external']:
-            original = Path(item['path']).resolve()
-            if original != (adapter.db_path.parent / 'masterPlaylists6.xml').resolve() and not original.is_relative_to((adapter.db_path.parent / 'share').resolve()):
-                raise RecoveryError('recovery_journal_invalid')
-            if not Path(item['backup']).resolve().is_relative_to(backup_root.resolve()):
-                raise RecoveryError('recovery_journal_invalid')
         if adapter.is_rekordbox_running():
             raise RecoveryError('rekordbox_running')
-        state = adapter.fingerprint()
-        if state not in (data['database_before'], data['database_after']):
-            raise RecoveryError('recovery_database_changed')
-        if file_hash(data['backup']) != data['backup_hash']:
-            raise RecoveryError('recovery_backup_damaged')
-        for item in data['external']:
-            if item['before'] is not None and file_hash(item['backup']) != item['before']:
-                raise RecoveryError('recovery_backup_damaged')
-            if file_hash(item['path']) not in (item['before'], item['after']):
-                raise RecoveryError('recovery_external_changed')
-        # All handles must be disposed before replacement; WAL is included by the
-        # consistent online backup and removed only after recognizing this DB.
+        try:
+            with ExitStack() as stack:
+                backup = stack.enter_context(OwnedFile(data['backup'], read_only=True))
+                if backup.digest() != data['backup_hash']:
+                    raise RecoveryError('recovery_backup_damaged')
+                owners = self._own_external(stack)
+                for item in data['external']:
+                    if item['before'] is not None:
+                        saved = stack.enter_context(OwnedFile(item['backup'], read_only=True))
+                        if saved.digest() != item['before']:
+                            raise RecoveryError('recovery_backup_damaged')
+                    owner = owners[item['path']]
+                    actual = owner.digest() if owner is not None else None
+                    if actual not in (item['before'], item['after']):
+                        if actual is not None or not self._recognized_missing(item, stack):
+                            raise RecoveryError('recovery_external_changed')
+                # The authoritative recognition is INSIDE the same SQLite write
+                # transaction as restoration. No close/replace interval exists.
+                adapter.begin()
+                state = adapter.fingerprint()
+                if state not in (data['database_before'], data['database_after']):
+                    raise RecoveryError('recovery_database_changed')
+                adapter.validate_recovery_schema()
+                self.save(phase='restoring')
+                if state != data['database_before']:
+                    adapter.restore_database_rows(data['backup'])
+                for item in data['external']:
+                    owner = owners[item['path']]
+                    actual = owner.digest() if owner is not None else None
+                    if actual == item['before']:
+                        continue
+                    payload = None if item['before'] is None else Path(item['backup']).read_bytes()
+                    if payload is not None and hashlib.sha256(payload).hexdigest() != item['before']:
+                        raise RecoveryError('recovery_backup_damaged')
+                    owners[item['path']] = self._replace_owned(item, owner, payload, stack)
+                self._verify_external(owners, 'before')
+                adapter.integrity_check()
+                if adapter.fingerprint() != data['database_before']:
+                    raise RecoveryError('rollback_verify_failed')
+                adapter.finish_restore()
+        except FileNotFoundError:
+            adapter.rollback()
+            raise RecoveryError('recovery_backup_damaged') from None
+        except OwnershipError:
+            adapter.rollback()
+            raise RecoveryError('recovery_external_busy') from None
+        except Exception:
+            adapter.rollback()
+            raise
+        # Ownership is now released after the completed restore transaction;
+        # a subsequent legitimate writer is preserved and causes refusal below.
         adapter.close()
-        if state != data['database_before']:
-            for suffix in ('-wal', '-shm'):
-                Path(str(adapter.db_path) + suffix).unlink(missing_ok=True)
-            atomic_bytes(adapter.db_path, Path(data['backup']).read_bytes())
-        for item in data['external']:
-            if file_hash(item['path']) == item['before']:
-                continue
-            if item['before'] is None:
-                Path(item['path']).unlink(missing_ok=True)
-            else:
-                atomic_bytes(item['path'], Path(item['backup']).read_bytes())
         verifier = adapter.reopen()
         try:
+            verifier.read_only()
             verifier.integrity_check()
             if verifier.fingerprint() != data['database_before']:
-                raise RecoveryError('rollback_verify_failed')
+                raise RecoveryError('recovery_database_changed')
         finally:
             verifier.close()
         self.save(phase='restored')

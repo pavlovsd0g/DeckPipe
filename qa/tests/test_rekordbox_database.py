@@ -442,11 +442,12 @@ target=str(f.root/'variant.wav')
 desired[0].update(path=target,source_path=source,
 verified_path_sha256=recovery.file_hash(target),verified_source_sha256=recovery.file_hash(source))
 preview=rb.sync_playlist('Likes',desired,adapter_factory=f.factory,operation_kind='relocate')
-publish=recovery.atomic_bytes
-def crash(path, data):
-    publish(path,data)
+from app.rekordbox_file_ownership import OwnedFile
+publish=OwnedFile.rename
+def crash(self, path):
+    publish(self,path)
     if Path(path).name == 'ANLZ0000.DAT': os._exit(73)
-recovery.atomic_bytes=crash
+OwnedFile.rename=crash
 rb.sync_playlist('Likes',desired,adapter_factory=f.factory,dry_run=False,operation_kind='relocate',
 confirmation_token=rb.APPLY_CONFIRMATION_TOKEN,expected_plan_hash=preview['plan']['hash'])
 '''
