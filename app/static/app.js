@@ -97,6 +97,11 @@ var activeAuthRequest = null;
 var authPollTimer = null;
 var authAttemptEpoch = 0;
 var nativeAccounts = {};
+var playlistLoadGeneration = 0;
+var providerAuth = {
+  deezer: { generation: 0, required: false },
+  sc: { generation: 0, required: false }
+};
 var rbSelectionEpoch = 0;
 var rbOperationGeneration = 0;
 var rbOperationBusy = false;
@@ -154,6 +159,7 @@ var FORMAT_CLASS_BY_VALUE = Object.freeze({
 var ERROR_KIND_LABELS = Object.freeze({
   local: "Локальная служба",
   security: "Защита API",
+  provider: "Подключение к сервису",
   state: "Состояние библиотеки",
   rekordbox: "Rekordbox",
   dryRun: "Dry-run",
@@ -192,6 +198,7 @@ async function getConnection() {
   throw new Error("backend connection unavailable");
 }
 async function api(path, opts = {}) {
+  const authGenerations = Object.fromEntries(Object.entries(providerAuth).map(([provider, state]) => [provider, state.generation]));
   const connection = await getConnection();
   const url = new URL(path, connection.baseUrl);
   const method = opts.method || (opts.body !== void 0 ? "POST" : "GET");
@@ -212,11 +219,24 @@ async function api(path, opts = {}) {
   if (!response.ok) {
     const payload = await response.json().catch(() => ({ detail: response.statusText }));
     const rawDetail = payload.detail;
-    const detail = typeof rawDetail === "object" && rawDetail !== null ? rawDetail.message || rawDetail.code || `HTTP ${response.status}` : rawDetail || response.statusText || `HTTP ${response.status}`;
+    let detail = typeof rawDetail === "object" && rawDetail !== null ? rawDetail.message || rawDetail.code || `HTTP ${response.status}` : rawDetail || response.statusText || `HTTP ${response.status}`;
+    const service = String(rawDetail?.service || "").toLowerCase();
+    const provider = service === "soundcloud" || service === "sc" ? "sc" : service === "deezer" ? "deezer" : null;
+    const providerError = provider && String(rawDetail?.code || "").startsWith("provider_");
+    const authRequired = providerError && rawDetail.code === "provider_auth_required";
+    if (authRequired) {
+      detail = `Войдите в ${provLabel(provider)} снова через кнопку подключения вверху. Сохранённая музыка доступна в библиотеке.`;
+      if (authGenerations[provider] === providerAuth[provider].generation) {
+        providerAuth[provider].required = true;
+        renderProviderAccount(provider);
+      }
+    }
     throw Object.assign(new Error(detail), {
-      kind: classifyApiFailure(path, response.status, detail),
+      kind: providerError ? "provider" : classifyApiFailure(path, response.status, detail),
       status: response.status,
-      payload
+      payload,
+      authProvider: authRequired ? provider : null,
+      authGeneration: authRequired ? authGenerations[provider] : null
     });
   }
   return response.json();
@@ -246,9 +266,20 @@ function showStatus(message) {
   region.classList.toggle("hidden", !message);
 }
 function showError(error, fallbackKind) {
+  if (isSupersededAuthError(error)) return;
   const region = $("#errorRegion");
   region.textContent = describeError(error, fallbackKind);
   region.classList.remove("hidden");
+}
+function isSupersededAuthError(error) {
+  return !!error?.authProvider && error.authGeneration !== providerAuth[error.authProvider]?.generation;
+}
+function renderProviderAccount(provider) {
+  const control = $(provider === "sc" ? "#btnLoginSc" : "#btnLoginDeezer");
+  const account = nativeAccounts[provider];
+  const required = providerAuth[provider].required;
+  control.textContent = `${provLabel(provider)}: ${required ? "войти снова" : account?.connected ? account.account?.name || "подключён" : "вход"}`;
+  setAuthActive(control, !!account?.connected && !required);
 }
 function clearError() {
   const region = $("#errorRegion");
@@ -542,6 +573,7 @@ function closeLogin({ cancel = true } = {}) {
   releaseDialogFocus();
 }
 async function loadConfig(expectedAuthEpoch = null) {
+  const authGenerations = Object.fromEntries(Object.entries(providerAuth).map(([provider, state]) => [provider, state.generation]));
   const config = await api("/api/config");
   if (expectedAuthEpoch !== null && expectedAuthEpoch !== authAttemptEpoch) return null;
   libraryConfigured = config.music_root_configured === true;
@@ -555,12 +587,11 @@ async function loadConfig(expectedAuthEpoch = null) {
   if (isPackagedAppOrigin()) {
     const state = await invoke("auth_status", { requestId: null });
     if (expectedAuthEpoch !== null && expectedAuthEpoch !== authAttemptEpoch) return null;
-    nativeAccounts = state.accounts || {};
-    for (const [provider, selector] of [["deezer", "#btnLoginDeezer"], ["sc", "#btnLoginSc"]]) {
-      const account = nativeAccounts[provider];
-      if (!account) continue;
-      $(selector).textContent = account.connected ? `${provLabel(provider)}: ${account.account?.name || "подключён"}` : `${provLabel(provider)}: вход`;
-      setAuthActive($(selector), !!account.connected);
+    for (const provider of ["deezer", "sc"]) {
+      if (authGenerations[provider] === providerAuth[provider].generation) {
+        nativeAccounts[provider] = state.accounts?.[provider];
+      }
+      renderProviderAccount(provider);
     }
   }
   if (expectedAuthEpoch !== null && expectedAuthEpoch !== authAttemptEpoch) return null;
@@ -602,7 +633,7 @@ async function openLogin(service) {
   if (epoch !== authAttemptEpoch) return;
   nativeAccounts = state.accounts || {};
   const account = nativeAccounts[service];
-  if (!account?.connected) return tauriLogin(service);
+  if (!account?.connected || providerAuth[service].required) return tauriLogin(service);
   renderLoginDialog(service);
   setResultState("ok");
   $("#loginResult").textContent = `Подключён: ${account.account?.name || provLabel(service)}`;
@@ -677,6 +708,12 @@ function canRetryAuth(state) {
 async function renderAuthState(state, epoch = authAttemptEpoch) {
   if (epoch !== authAttemptEpoch || state.requestId && state.requestId !== activeAuthRequest) return;
   if (state.status === "connected") {
+    const provider = state.provider || loginService;
+    providerAuth[provider].generation += 1;
+    providerAuth[provider].required = false;
+    const generation = providerAuth[provider].generation;
+    nativeAccounts[provider] = { connected: true, account: state.account };
+    renderProviderAccount(provider);
     activeAuthRequest = null;
     clearAuthPoll();
     setResultState("ok");
@@ -686,7 +723,7 @@ async function renderAuthState(state, epoch = authAttemptEpoch) {
     setHidden($("#btnAuthRetry"), true);
     showStatus($("#loginResult").textContent);
     await loadConfig();
-    if (libraryConfigured) await loadPlaylists();
+    if (generation === providerAuth[provider].generation && libraryConfigured) await loadPlaylists();
     return;
   }
   if (!["waiting_browser", "validating"].includes(state.status)) {
@@ -746,6 +783,8 @@ async function forgetAuthSession(service, operationEpoch) {
   }
   if (operationEpoch !== authAttemptEpoch) return false;
   nativeAccounts[service] = { connected: false };
+  providerAuth[service].generation += 1;
+  providerAuth[service].required = false;
   return true;
 }
 async function logoutProvider() {
@@ -816,6 +855,7 @@ async function saveRoot() {
   await loadPlaylists();
 }
 function renderRootSetup() {
+  playlistLoadGeneration += 1;
   setFlexVisible($("#toolbar"), false);
   replaceChildren($("#playlists"), create("div", { className: "list-pad dim", text: "Сначала подключите музыкальную библиотеку." }));
   replaceChildren($("#tracks"), create("section", { className: "root-setup" }, [
@@ -871,18 +911,26 @@ function playlistControl(title, cover, bodyChildren, action, dataset, active) {
     attrs: { "aria-pressed": active ? "true" : "false", "aria-label": title }
   }, [cover, create("span", { className: "pl-body" }, bodyChildren)]);
 }
+function beginPlaylistLoad() {
+  const generation = ++playlistLoadGeneration;
+  const sourceTab = tab;
+  if (libraryConfigured) replaceChildren($("#playlists"), create("div", { id: "empty", text: "Загружаем список…" }));
+  return () => generation === playlistLoadGeneration && sourceTab === tab;
+}
 async function loadPlaylists() {
+  const isCurrent = beginPlaylistLoad();
   if (!libraryConfigured) {
     renderRootSetup();
     return;
   }
   try {
     clearError();
-    if (tab === "sc") return await loadScSources();
-    if (tab === "local") return await loadLocalPlaylists();
-    if (tab === "errors") return await loadErrors();
-    if (tab === "search") return await loadSearchTargets();
+    if (tab === "sc") return await loadScSources(isCurrent);
+    if (tab === "local") return await loadLocalPlaylists(isCurrent);
+    if (tab === "errors") return await loadErrors(isCurrent);
+    if (tab === "search") return await loadSearchTargets(isCurrent);
     const playlists = await api("/api/playlists");
+    if (!isCurrent()) return;
     replaceChildren($("#playlists"), playlists.map((playlist) => {
       const cover = create("img", { attrs: { alt: "" } });
       const coverUrl = safeCoverUrl(playlist.cover);
@@ -897,12 +945,14 @@ async function loadPlaylists() {
       ], "select-playlist", { id: playlist.id, title: playlist.title }, active);
     }));
   } catch (error) {
+    if (!isCurrent() || isSupersededAuthError(error)) return;
     showError(error, tab === "errors" ? "state" : "local");
     replaceChildren($("#playlists"), create("div", { id: "empty", text: describeError(error) }));
   }
 }
-async function loadLocalPlaylists() {
+async function loadLocalPlaylists(isCurrent = beginPlaylistLoad()) {
   const playlists = await api("/api/local/playlists");
+  if (!isCurrent()) return;
   if (!playlists.length) {
     replaceChildren($("#playlists"), create("div", { id: "empty", text: "Локальных плейлистов пока нет. Их можно создать во вкладке «Поиск»." }));
     return;
@@ -916,8 +966,9 @@ async function loadLocalPlaylists() {
     ], "select-local-playlist", { id: key, title: playlist.title }, active);
   }));
 }
-async function loadErrors() {
+async function loadErrors(isCurrent = beginPlaylistLoad()) {
   const [localResult, remoteResult] = await Promise.allSettled([api("/api/errors?include_status=true"), api("/api/remote-actions")]);
+  if (!isCurrent()) return;
   const localValue = localResult.status === "fulfilled" ? localResult.value : [];
   const errors = Array.isArray(localValue) ? localValue : localValue.items || [];
   const warnings = Array.isArray(localValue) ? [] : localValue.errors || [];
@@ -961,7 +1012,7 @@ async function retryRemote(id) {
     const result = await api(`/api/remote-actions/${encodeURIComponent(id)}/retry`, { body: {} });
     if (result.state === "succeeded") showStatus("Плейлист Deezer обновлён. Повторная загрузка файлов не требовалась.");
   } finally {
-    await loadErrors();
+    if (tab === "errors") await loadErrors();
   }
 }
 async function retryOne(index) {
@@ -1003,7 +1054,7 @@ function switchTab(nextTab) {
   setEmpty(nextTab === "errors" ? "Треки с ошибками загрузки/верификации — слева. Кнопка ↻ перезапускает сломавшийся этап." : `Выберите ${nextTab === "sc" ? "источник" : nextTab === "local" ? "локальный плейлист" : "плейлист"} слева`);
   loadPlaylists();
 }
-async function loadSearchTargets() {
+async function loadSearchTargets(isCurrent = beginPlaylistLoad()) {
   if (!libraryConfigured) {
     renderRootSetup();
     return;
@@ -1013,8 +1064,9 @@ async function loadSearchTargets() {
     api("/api/sc/sources"),
     api("/api/local/playlists")
   ]);
+  if (!isCurrent()) return;
   const [deezerRows, scRows, localRows] = results.map((result) => result.status === "fulfilled" ? result.value : []);
-  const failures = results.filter((result) => result.status === "rejected");
+  const failures = results.filter((result) => result.status === "rejected" && !isSupersededAuthError(result.reason));
   if (failures.length) showError(new Error(failures.map((result) => result.reason.message).join("; ")));
   const rows = [
     ...deezerRows.map((item) => ({ key: item.id, title: item.title, provider: "deezer", count: item.count })),
@@ -1051,7 +1103,7 @@ async function chooseCustomDir() {
   const result = await api("/api/browse");
   if (!result.path) return;
   searchTarget = { key: "", title: result.path, provider: "dir", dir: result.path };
-  await loadSearchTargets();
+  if (tab === "search") await loadSearchTargets();
 }
 async function createTargetPlaylist(kind) {
   if (kind === "deezer") {
@@ -1065,7 +1117,7 @@ async function createTargetPlaylist(kind) {
     const result = await api("/api/local/playlists", { body: { title } });
     searchTarget = { key: result.key, title: result.title, provider: "local" };
   }
-  await loadSearchTargets();
+  if (tab === "search") await loadSearchTargets();
 }
 function setSearchFilter(filter) {
   searchFilter = filter;
@@ -1299,13 +1351,16 @@ async function addDzTrack(index) {
   await api("/api/deezer/playlist/add", { body: { playlist_id: searchTarget.key, track_ids: [track.id] } });
   showStatus(`«${track.title}» добавлен в «${searchTarget.title}»`);
 }
-async function loadScSources() {
+async function loadScSources(isCurrent = beginPlaylistLoad()) {
   try {
     await api("/api/sc/sync-account", { body: {} });
   } catch (error) {
-    showError(error, "security");
+    if (!isCurrent()) return;
+    showError(error, "provider");
   }
+  if (!isCurrent()) return;
   const sources = await api("/api/sc/sources");
+  if (!isCurrent()) return;
   if (!sources.length) {
     replaceChildren($("#playlists"), create("div", { id: "empty", text: "Войдите через «SC: вход» — плейлисты аккаунта появятся сами. Или добавьте URL выше." }));
     return;
@@ -1371,6 +1426,7 @@ async function loadTracks(playlist) {
     }
   } catch (error) {
     if (selectionEpoch !== rbSelectionEpoch || current !== playlist) return;
+    if (isSupersededAuthError(error)) return;
     showError(error, "state");
     setEmpty(`Не удалось загрузить: ${describeError(error, "state")}`, "Повторить", "rescan");
   }

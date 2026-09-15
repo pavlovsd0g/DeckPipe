@@ -12,7 +12,7 @@ pub fn random_id() -> String {
 pub fn provider_url(provider: &str) -> Result<&'static str, &'static str> {
     match provider {
         "deezer" => Ok("https://www.deezer.com/login"),
-        "sc" => Ok("https://soundcloud.com/sign-in"),
+        "sc" => Ok("https://soundcloud.com/signin"),
         _ => Err("AUTH_INVALID_PROVIDER"),
     }
 }

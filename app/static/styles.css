@@ -510,12 +510,21 @@ th {
 .login-actions {
   align-items: center;
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin-top: 12px;
 }
 
 #loginResult {
+  flex-basis: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
   font-size: 13px;
+}
+
+.login-actions button {
+  max-width: 100%;
+  white-space: normal;
 }
 
 .login-ok {
