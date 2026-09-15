@@ -59,7 +59,7 @@ assert again["unchanged"] and fixture.inventory() == before
 
 **Produces:** `/api/rb/sync` previews/applies resolved authoritative order with body expected_plan_hash/optional playlist_id. `/api/rb/prepare-wav` returns safe preparation counts/state without writing Rekordbox. `/api/flip` defaults read-only preview, uses same viewed hash/confirmation for path-only application. A read-only playlist media-state response must let the frontend choose WAV vs original reliably after restart. Report exact response fields/routes before Task 3.
 
-- [ ] Write RED API tests using real temporary audio in two nested folders plus explicit external binding: Likes resolves all paths, gaps/errors/ambiguous/offline roots block, local SC identities are not double-prefixed, source order and library changes invalidate apply.
+- [x] Write RED API tests using real temporary audio in two nested folders plus explicit external binding: Likes resolves all paths, gaps/errors/ambiguous/offline roots block, local SC identities are not double-prefixed, source order and library changes invalidate apply.
 
 ```python
 preview = client.post("/api/rb/sync?dry_run=true", json=likes_request).json()
@@ -71,11 +71,11 @@ result = apply_with_hash(preview["plan"]["hash"])
 assert result["error"]["code"] == "stale_preview"
 ```
 
-- [ ] Replace sidecar-only sourcing with authoritative service order and catalog paths; keep all unreadable/unavailable items explicit. Preserve normal sync as an idempotent operation without arbitrary path input.
-- [ ] Close the existing local-source producer gap: explicit local additions must retain requested membership/order even when all files are reused and no download job runs. Provide a validated local tracks projection through the catalog without calling Deezer for a local key. Keep unresolved requested members explicit and preserve existing local metadata.
-- [ ] Write real-audio RED tests for WAV preparation/reuse/revert and timeline mismatch: truncated/shifted variant or changed original cannot rebind; preserved cues/grid keep their timestamps. Use source/target decoded PCM equivalence and native rates/channels/frame counts, not stream-reported duration alone.
-- [ ] Implement durable original/variant mapping, staged no-clobber publication, explicit preparation action, fresh verification at application, source preservation and post-reconcile state/recovery. Ordinary preview writes no media or database. Expose shared-content effects in preview.
-- [ ] Run targeted API/audio suites; demonstrate real converter and ANLZ preservation; report exact contracts and no live-provider claims. Controller commits/reviews before Task 3.
+- [x] Replace sidecar-only sourcing with authoritative service order and catalog paths; keep all unreadable/unavailable items explicit. Preserve normal sync as an idempotent operation without arbitrary path input.
+- [x] Close the existing local-source producer gap: explicit local additions must retain requested membership/order even when all files are reused and no download job runs. Provide a validated local tracks projection through the catalog without calling Deezer for a local key. Keep unresolved requested members explicit and preserve existing local metadata.
+- [x] Write real-audio RED tests for WAV preparation/reuse/revert and timeline mismatch: truncated/shifted variant or changed original cannot rebind; preserved cues/grid keep their timestamps. Use source/target decoded PCM equivalence and native rates/channels/frame counts, not stream-reported duration alone.
+- [x] Implement durable original/variant mapping, staged no-clobber publication, explicit preparation action, fresh verification at application, source preservation and post-reconcile state/recovery. Ordinary preview writes no media or database. Expose shared-content effects in preview.
+- [x] Run targeted API/audio suites; demonstrate real converter and ANLZ preservation; report exact contracts and no live-provider claims. Controller commits/reviews before Task 3.
 
 ### Task 3: Usable preview, confirmation, and truthful results
 
@@ -109,4 +109,3 @@ if (calls.some(call => call.isApply && call.hash !== displayedHash)) throw Error
 - [ ] Run one final whole-change review, one coherent fix wave if needed, and scoped re-review. Tie evidence to final source revision.
 - [ ] Build fresh unsigned engineering Windows candidate, validate MSI payload/artifact provenance (Tauri bundle marker exception must be exact), exercise extracted backend on isolated synthetic fixtures. Preserve public-release signing gate.
 - [ ] Update visible release plan and Stage C report with code, actual test/build outcomes, remaining real Rekordbox/live-provider/installer acceptance. No merge/push/install/pin promotion. Retain worktree/evidence for further release work.
-
