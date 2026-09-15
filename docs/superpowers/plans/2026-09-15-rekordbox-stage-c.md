@@ -103,9 +103,19 @@ if (calls.some(call => call.isApply && call.hash !== displayedHash)) throw Error
 
 **Ownership:** controller; current release plan/audit, task ledger/review packages, lab harnesses, source gate and exact-revision build/readback. Fresh final reviewer mandatory. Do not reuse completed embedded-auth ledger as this plan's ledger.
 
-- [ ] Review each completed task and fix material findings through its owner. Record task status and source commits immediately.
-- [ ] Execute isolated real DB crash/recovery, catalog/WAV and frontend boundary proof; ensure actual fixture DB/file inventories and precise integrity outcomes are recorded.
-- [ ] Commit complete source; run full Python/PowerShell suites, frontend build and offline Rust checks. Preserve main user's Orchestrator file hash and A/B/authentication boundary.
-- [ ] Run one final whole-change review, one coherent fix wave if needed, and scoped re-review. Tie evidence to final source revision.
-- [ ] Build fresh unsigned engineering Windows candidate, validate MSI payload/artifact provenance (Tauri bundle marker exception must be exact), exercise extracted backend on isolated synthetic fixtures. Preserve public-release signing gate.
-- [ ] Update visible release plan and Stage C report with code, actual test/build outcomes, remaining real Rekordbox/live-provider/installer acceptance. No merge/push/install/pin promotion. Retain worktree/evidence for further release work.
+- [x] Review each completed task and fix material findings through its owner. Record task status and source commits immediately.
+- [x] Execute isolated real DB crash/recovery, catalog/WAV and frontend boundary proof; ensure actual fixture DB/file inventories and precise integrity outcomes are recorded.
+- [x] Commit complete source; run full Python/PowerShell suites, frontend build and offline Rust checks. Preserve main user's Orchestrator file hash and A/B/authentication boundary.
+- [x] Run one final whole-change review, one coherent fix wave if needed, and scoped re-review. Tie evidence to final source revision.
+- [x] Build fresh unsigned engineering Windows candidate, validate MSI payload/artifact provenance (Tauri bundle marker exception must be exact), exercise extracted backend on isolated synthetic fixtures. Preserve public-release signing gate.
+- [x] Update visible release plan and Stage C report with code, actual test/build outcomes, remaining real Rekordbox/live-provider/installer acceptance. No merge/push/install/pin promotion. Retain worktree/evidence for further release work.
+
+## Engineering acceptance — 15 September 2026
+
+Implemented/tested/built source: `6b3d8ab26a1b48edb6b22a07db4f8c8f5b3ba1a5`. Full source gate PASS: 369 Python cases (368 pass, one Windows symlink privilege skip), 62 PowerShell cases, 19 Rust tests, cargo fmt, frontend build and committed-HEAD archive equality. Task reviews and the single final review/fix/scoped-review cycle are complete; all four Important and three Minor findings are closed.
+
+Real launcher on new isolated SQLCipher/FLAC/ANLZ data: 82/82. Actual browser/API seed: 9/9, seven fresh DB/media readbacks:80/80, console errors:none. The global explicit recovery control worked after page reload with no selected source and the owned music directory physically unavailable. UI test server and tab were closed.
+
+New candidate: `D:/DeckPipe-RC-Lab/staging/rekordbox-stage-c-20260915-6b3d8ab-engineering`. Candidate provenance/MSI content:23/23. Extracted unmodified backend:32/32 library/API/WAV/restart checks and82/82 actual SQLCipher/ANLZ/sync/noop/WAV/restart/revert/source-independent recovery checks. Public signing/timestamp remains BLOCKED. No install, live provider/user DB application, merge, push or promotion.
+
+The later closure commit changes documentation only; it is not presented as a newly compiled revision. Worktree and evidence are retained. [Result](../../release-stage-c-2026-09-15.md); laboratory evidence under `D:/DeckPipe-RC-Lab/qa-evidence/rekordbox-stage-c-20260915`. Main user's Orchestrator file remains SHA256 `15ca74f28c1c808798208d2452f2f7d9373a839f5080ee613e3cf44464cead6c`.
