@@ -13,4 +13,8 @@ The owner reproduced a failed Google login from SoundCloud and explicitly reques
 
 The original native probe failed with `PROBE_POPUP_HANDOFF_FAILED`. The expanded corrected probe passed at `D:/DeckPipe-RC-Lab/qa-evidence/windows-stage-d-20260915/popup-regression/result.json`. Independent review found no remaining substantial implementation issue. A precisely forced parent-close-during-construction interleaving has not been separately demonstrated; the implementation checks the closed attempt both before reservation and after window creation.
 
+## Live acceptance, 16 September
+
+The owner completed Google/SoundCloud authentication in the installed `9f7f20b` candidate's linked child window. DeckPipe received the account and closed the login windows. The subsequent `34a75a5` candidate also fixes a separately exposed SoundCloud collection API failure. Its installed backend read 16 account playlists without errors, downloaded one verified audio file and reused it on repeat; both provider sessions remained valid after a complete NSIS uninstall/reinstall. See [current Stage D evidence](../../release-stage-d-2026-09-15.md). Popup and live login acceptance is complete; Stage D private-beta acceptance in the owner's current environment is also complete. Public-release conditions remain separate.
+
 References: [Tauri popup API](https://docs.rs/tauri/2.11.5/tauri/webview/struct.WebviewWindowBuilder.html#method.on_new_window), [WebView2 shared environment requirement](https://learn.microsoft.com/en-us/dotnet/api/microsoft.web.webview2.core.corewebview2newwindowrequestedeventargs.newwindow). The pinned Wry0.55.1 implementation defers its callback to avoid WebView2 reentrancy.
