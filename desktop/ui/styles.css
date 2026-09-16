@@ -467,7 +467,9 @@ th {
   box-shadow: 0 28px 80px rgba(0, 0, 0, .38);
   max-height: calc(100vh - 36px);
   max-width: 92vw;
+  min-width: 0;
   overflow: auto;
+  overflow-wrap: anywhere;
   padding: 18px;
   width: 520px;
 }
@@ -475,7 +477,23 @@ th {
 .modal-head {
   align-items: center;
   display: flex;
+  gap: 12px;
   justify-content: space-between;
+}
+
+.modal-head > :first-child {
+  min-width: 0;
+}
+
+.modal-head > button {
+  flex-shrink: 0;
+}
+
+#modal input,
+#modal select,
+#modal textarea {
+  max-width: 100%;
+  min-width: 0;
 }
 
 #loginTitle {
@@ -552,6 +570,10 @@ th {
   font-size: 13px;
   gap: 8px;
   padding: 4px 0;
+}
+
+.scacc > span {
+  min-width: 0;
 }
 
 #searchbar {
