@@ -14,6 +14,8 @@ from .rekordbox_recovery import digest, file_hash
 # The pinned registry buffer is class-global. Serialize handles in this process,
 # including preview handles, to prevent one close() clearing another transaction.
 _registry_lock = threading.RLock()
+_RELOCATION_FIELDS = frozenset({'FolderPath', 'FileNameL', 'FileSize', 'FileType',
+                                'SampleRate', 'BitDepth', 'rb_local_usn', 'updated_at'})
 
 
 class _NoKeyLog(logging.Filter):
@@ -186,7 +188,7 @@ class PyrekordboxAdapter:
                 'title': content.Title or '', 'artist': '', 'album': '',
                 'duration': content.Length or 0, 'position': int(song.TrackNo),
                 'path': content.FolderPath or '', 'content_id': str(content.ID),
-                'membership_id': str(song.ID)})
+                'membership_id': str(song.ID), 'membership_fingerprint': digest(song.to_dict())})
         if len({r['content_id'] for r in result}) != len(result):
             raise AdapterError('ambiguous_current_membership')
         return result
@@ -277,6 +279,8 @@ class PyrekordboxAdapter:
 
     def external_files_for_plan(self, plan):
         files = {self.db_path.parent / 'masterPlaylists6.xml'}
+        if plan['operation_kind'] != 'relocate':
+            return sorted(files, key=str)
         contents = {str(c.ID): c for c in self.db.get_content()}
         for item in plan['desired_resolved']:
             content = contents.get(item.get('content_id'))
@@ -298,18 +302,23 @@ class PyrekordboxAdapter:
         target = self.target(name, playlist_id)
         resolved = self.resolve(desired)
         current = self.snapshot_playlist(name, playlist_id, resolved)
-        preliminary = {'desired_resolved': resolved}
+        preliminary = {'desired_resolved': resolved, 'operation_kind': operation_kind}
         files = self.external_files_for_plan(preliminary)
         media = set()
         for item in resolved:
             media.add(item['path'])
             if item.get('source_path'):
                 media.add(item['source_path'])
+        content_rows = {str(c.ID): c.to_dict() for c in self.db.get_content()}
         context = {'target': {'id': str(target.ID) if target else None,
                 'name': str(target.Name) if target else name}, 'operation_kind': operation_kind,
             'database_fingerprint': self.fingerprint(),
             'media_fingerprints': {p: file_hash(p) for p in sorted(media)},
             'external_fingerprints': {str(p): file_hash(p) for p in files},
+            'content_fingerprints': {content_id: digest(row) for content_id, row in content_rows.items()},
+            'content_metadata_fingerprints': {content_id: digest({key: value for key, value in row.items()
+                if key not in _RELOCATION_FIELDS}) for content_id, row in content_rows.items()}
+                if operation_kind == 'relocate' else {},
             'current_memberships': current}
         return resolved, current, context
 
@@ -355,15 +364,16 @@ class PyrekordboxAdapter:
             target = self.db.create_playlist(plan['target']['name'])
         contents = {str(c.ID): c for c in self.db.get_content()}
         songs = {str(s.ContentID): s for s in self.db.get_playlist_songs(PlaylistID=target.ID)}
-        desired_ids = set()
-        for item in plan['desired_resolved']:
+        operations = plan['add'] if plan['operation_kind'] == 'sync' else plan['path']
+        for item in operations:
             content = contents.get(item.get('content_id'))
             if content is None:
                 if plan['operation_kind'] == 'relocate':
                     raise AdapterError('relocate_membership_change')
                 content = self._new_content(item)
-            desired_ids.add(str(content.ID))
-            if canonical_path(content.FolderPath) != canonical_path(item['path']):
+            if plan['operation_kind'] == 'relocate' and canonical_path(content.FolderPath) != canonical_path(item['path']):
+                if str(content.ID) not in songs:
+                    raise AdapterError('relocate_membership_change')
                 if not item.get('source_path'):
                     raise AdapterError('unverified_path_alias')
                 if content.AnalysisDataPath:
@@ -387,15 +397,7 @@ class PyrekordboxAdapter:
                         PlaylistID=str(target.ID), ContentID=str(content.ID), TrackNo=item['position'],
                         created_at=datetime.now(), updated_at=datetime.now())
                     self.db.add(song)
-                elif song.TrackNo != item['position']:
-                    with self.db.registry.disabled():
-                        song.TrackNo = item['position']
-                        song.updated_at = datetime.now()
-                    self.db.registry.on_move([song])
         if plan['operation_kind'] == 'sync':
-            for content_id, song in songs.items():
-                if content_id not in desired_ids:
-                    self.db.delete(song)
             target.updated_at = datetime.now()
         self.db.flush()
 

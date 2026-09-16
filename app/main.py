@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import jobs, library, catalog_service
+from . import jobs, library, catalog_service, activity_log
 from .library_catalog import MusicRootRequired, configured_music_roots
 from .auth_broker import auth_router, register_invalidation_hook, recover_pending_transaction
 from .deezer_client import (
@@ -47,14 +47,19 @@ async def run_startup_migrations() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    activity_log.initialize(ROOT)
+    activity_log.record('info', 'application', 'startup', 'Запуск DeckPipe.')
     await run_startup_migrations()
     jobs.initialize(ROOT)
     yield
+    activity_log.record('info', 'application', 'shutdown', 'Завершение работы DeckPipe.')
 
 
 app = FastAPI(title="DeckPipe", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+app.add_middleware(activity_log.ActivityLogMiddleware)
 app.add_middleware(LoopbackSecurityMiddleware, settings=SecuritySettings.from_env())
 app.include_router(auth_router)
+app.include_router(activity_log.router)
 STATIC = Path(__file__).parent / "static"
 
 
@@ -473,6 +478,21 @@ def api_browse():
 @app.get("/api/jobs")
 def api_jobs():
     return jobs.list_jobs()
+
+
+@app.post("/api/jobs/clear-completed")
+def api_clear_completed_jobs():
+    return jobs.clear_completed()
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def api_cancel_job(job_id: str):
+    try:
+        return jobs.cancel_job(job_id)
+    except KeyError:
+        raise HTTPException(404, "job не найден") from None
+    except ValueError:
+        raise HTTPException(409, {"code": "job_not_cancellable", "message": "Можно отменить только загрузку."}) from None
 
 
 @app.get("/api/jobs/{job_id}")

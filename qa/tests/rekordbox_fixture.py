@@ -1,5 +1,6 @@
 """Generated fixture only. Never invokes Rekordbox discovery or credential lookup."""
 from pathlib import Path
+import os
 import uuid
 import wave
 import struct
@@ -9,7 +10,9 @@ from sqlcipher3 import dbapi2 as sqlcipher
 from pyrekordbox.db6 import tables
 from app.rekordbox_adapter import PyrekordboxAdapter
 
-LAB = Path('D:/DeckPipe-RC-Lab/qa-evidence/rekordbox-stage-c-20260915')
+LAB = Path(os.environ.get('DECKPIPE_RB_TEST_LAB', 'D:/DeckPipe-RC-Lab/qa-evidence/rekordbox-stage-c-20260915'))
+if not LAB.resolve().is_relative_to(Path('D:/DeckPipe-RC-Lab/qa-evidence').resolve()):
+    raise ValueError('Fixture lab must stay in owned QA evidence')
 SYNTHETIC_KEY = '402fd-deckpipe-synthetic-fixture-not-a-real-key'
 
 

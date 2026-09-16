@@ -19,3 +19,4 @@ config.local.json
 desktop/src-tauri/binaries/
 release/
 .worktrees/
+rtk/

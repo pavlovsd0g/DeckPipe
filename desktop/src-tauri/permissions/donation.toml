@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-open-donation"
+description = "Allows the main window to open the fixed Donation URL in the default browser"
+commands = { allow = ["open_donation"] }

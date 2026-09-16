@@ -108,7 +108,8 @@ function fixture(selector) {
 ].forEach(fixture);
 globalThis.__invokeCalls = [];
 globalThis.__invokeResult = {baseUrl: 'http://127.0.0.1:24680', token: 'packaged-token'};
-globalThis.window = {location: {protocol: 'tauri:', origin: 'http://tauri.localhost'}};
+globalThis.window = {location: {protocol: 'tauri:', origin: 'http://tauri.localhost'},
+  setTimeout: () => 1, clearTimeout: () => {}, setInterval: () => 1, clearInterval: () => {}};
 globalThis.document = {
   activeElement: null,
   querySelector(selector) { return elements.get(selector) || fixture(selector); },
@@ -340,11 +341,8 @@ console.log(JSON.stringify({
         self.assertRegex(payload["fetchCalls"][0]["url"], r"/api/rb/sync\?dry_run=true$")
         self.assertEqual(payload["fetchCalls"][0]["body"], {"playlist_key": "playlist-1", "playlist_title": "Set One"})
         self.assertIn("не разрешены", payload["error"].lower())
-        self.assertIn("Синхронизация", payload["status"])
-        self.assertTrue(payload["dryRunSaysNoMutation"], payload["status"])
-        self.assertTrue(payload["dryRunSaysNoBackup"], payload["status"])
-        for text in ["добавить: 2", "убрать: 1", "изменить порядок: 3", "метаданные: 4", "пути: 5", "не разрешено: 6"]:
-            self.assertIn(text, payload["status"])
+        self.assertEqual(payload["status"], "")
+        self.assertIn("Изменения не применялись", payload["error"])
         self.assertNotIn("undefined", payload["status"])
         self.assertNotRegex(payload["status"], r"added_content|added_to_playlist|result\.playlist|note")
 
@@ -399,7 +397,7 @@ console.log(JSON.stringify({fetchCalls, prompts, status: elements.get('#statusRe
         })
         self.assertEqual(payload["prompts"], [])
         self.assertIn("изменения применены", payload["status"].lower())
-        self.assertIn("результат проверен", payload["status"].lower())
+        self.assertIn("применены и проверены", payload["status"].lower())
         self.assertIn("Резервная копия создана и проверена", payload["status"])
         self.assertNotIn("backup-123", payload["status"])
 

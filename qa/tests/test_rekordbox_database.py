@@ -53,8 +53,8 @@ class DatabaseTests(unittest.TestCase):
         adapter = self.fixture.factory()
         try:
             rows = adapter.snapshot_playlist('Likes')
-            self.assertEqual([r['content_id'] for r in rows], ['2', '1', '3'])
-            self.assertEqual([r['membership_id'] for r in rows[:2]], ['member-2', 'member-1'])
+            self.assertEqual([r['content_id'] for r in rows], ['1', '2', '3'])
+            self.assertEqual([r['membership_id'] for r in rows[:2]], ['member-1', 'member-2'])
         finally:
             adapter.close()
         inventory = self.fixture.inventory()
@@ -104,11 +104,12 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(before, self.fixture.inventory())
         self.assertEqual(Journal(self.fixture.path).data['phase'], 'restored')
 
-    def test_remove_only_target_membership(self):
+    def test_source_subset_keeps_all_target_memberships(self):
         before = self.fixture.protected()
         desired = self.fixture.desired(('1',))
         result = self.apply(self.preview(desired), desired)
         self.assertIsNone(result['error'], result)
+        self.assertTrue(result['unchanged'], result)
         self.assertEqual(before, self.fixture.protected())
 
     def test_canonical_path_preserves_unicode_and_folds_windows_aliases(self):

@@ -208,7 +208,7 @@ class RekordboxSyncPlannerTests(unittest.TestCase):
         path.write_bytes(content)
         return path
 
-    def test_dry_run_is_deterministic_and_reports_all_diff_surfaces(self) -> None:
+    def test_dry_run_is_deterministic_additive_and_reports_unresolved_sources(self) -> None:
         alpha = self.touch("Alpha.flac")
         beta_new = self.touch("Beta-new.flac")
         dup = self.touch("Dup.flac")
@@ -238,17 +238,19 @@ class RekordboxSyncPlannerTests(unittest.TestCase):
             "current": 5,
             "resolved": 3,
             "add": 1,
-            "remove": 1,
-            "reorder": 2,
-            "metadata": 2,
-            "path": 1,
+            "already_present": 2,
+            "reuse": 0,
+            "import": 1,
+            "preserved": 1,
+            "remove": 0,
+            "reorder": 0,
+            "metadata": 0,
+            "path": 0,
             "unresolved": 4,
         })
         self.assertEqual(["deezer:3"], [item["provider_id"] for item in first["add"]])
-        self.assertEqual(["deezer:old"], [item["provider_id"] for item in first["remove"]])
-        self.assertEqual(["deezer:2", "deezer:1"], [item["provider_id"] for item in first["reorder"]])
-        self.assertEqual(["deezer:2", "deezer:1"], [item["provider_id"] for item in first["metadata"]])
-        self.assertEqual(["deezer:2"], [item["provider_id"] for item in first["path"]])
+        for operation in ('remove', 'reorder', 'metadata', 'path'):
+            self.assertEqual(first[operation], [])
         self.assertEqual(
             ["ambiguous_current_identity", "duplicate_desired_identity", "missing_desired_path", "relative_desired_path"],
             [item["code"] for item in first["unresolved"]],

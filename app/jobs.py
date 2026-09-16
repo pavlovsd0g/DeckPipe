@@ -12,15 +12,23 @@ import uuid
 from pathlib import Path
 
 from . import rekordbox as rb
+from .activity_log import record
 from .atomic_io import (
     atomic_load_json,
     atomic_write_json,
-    cleanup_owned_stages,
     final_path_from_stage,
     is_partial_path,
     publish_staged_file,
 )
 from .deezer_client import get_session, load_config, verify_file
+from .download_control import (
+    DownloadCancelled,
+    DownloadCleanupFailed,
+    cancellation_scope,
+    check_cancelled,
+    cleanup_download_stages as cleanup_owned_stages,
+    publication_guard,
+)
 from .library import is_ready_entry, load_sidecar, max_position, numbered_name, playlist_dir, save_sidecar, track_key, update_track_status
 
 AUTO_RETRIES = 2
@@ -43,9 +51,11 @@ _worker_generation = 0
 _worker_stop = threading.Event()
 _active_worker_item: tuple[int, str] | None = None
 
-_VALID_STATES = {"queued", "running", "done"}
-_VALID_OUTCOMES = {"pending", "succeeded", "partial_failure", "failed", "interrupted"}
-_TERMINAL_OUTCOMES = {"succeeded", "partial_failure", "failed", "interrupted"}
+_VALID_STATES = {"queued", "running", "cancelling", "cancelled", "done"}
+_VALID_OUTCOMES = {"pending", "succeeded", "partial_failure", "failed", "interrupted", "cancelled"}
+_TERMINAL_OUTCOMES = {"succeeded", "partial_failure", "failed", "interrupted", "cancelled"}
+_TERMINAL_STATES = {"done", "cancelled"}
+_OWNED_STAGE_NAME = re.compile(r"^.+\.deckpipe-stage-[0-9a-f]{32}\.part\.[^\\/]*$")
 _VALID_MODES = {"append", "playlist_order", "flip_to_wav", "flip_to_source"}
 _SAFE_PROVIDER_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _DIRTY_ERROR_RE = re.compile(
@@ -56,6 +66,39 @@ _DIRTY_ERROR_RE = re.compile(
 
 class _StaleWorker(RuntimeError):
     pass
+
+
+def _validate_owned_stages(stages) -> list[dict]:
+    if not isinstance(stages, list):
+        raise ValueError("invalid stage ownership")
+    clean = []
+    for entry in stages:
+        if not isinstance(entry, dict) or set(entry) != {"path", "prefix"}:
+            raise ValueError("invalid stage ownership")
+        raw = entry["path"]
+        if not isinstance(raw, str) or type(entry["prefix"]) is not bool:
+            raise ValueError("invalid stage ownership")
+        path = Path(raw)
+        if not path.is_absolute() or ".." in path.parts or not _OWNED_STAGE_NAME.fullmatch(path.name):
+            raise ValueError("invalid stage ownership")
+        if entry["prefix"] and not path.name.endswith(".part."):
+            raise ValueError("invalid stage ownership")
+        clean.append(dict(entry))
+    return clean
+
+
+def _cleanup_registered_stages(job: dict) -> None:
+    for entry in _validate_owned_stages(job.get("owned_stages", [])):
+        path = Path(entry["path"])
+        # Do not follow a replaced directory junction or declare an offline
+        # music drive clean merely because its files cannot currently be seen.
+        if not path.parent.is_dir() or path.parent.resolve() != path.parent:
+            raise OSError("temporary file directory unavailable")
+        candidates = [candidate for candidate in path.parent.iterdir()
+                      if candidate.name.startswith(path.name) and is_partial_path(candidate)] if entry["prefix"] else [path]
+        cleanup_owned_stages(*candidates)
+    if "owned_stages" in job:
+        job["owned_stages"] = []
 
 
 def _now():
@@ -83,8 +126,11 @@ def _validate_journal(payload: object) -> dict:
             raise ValueError("invalid journal")
         if clean_job.get("state") not in _VALID_STATES or clean_job.get("outcome") not in _VALID_OUTCOMES:
             raise ValueError("invalid journal")
-        if clean_job["state"] == "done":
-            if clean_job["outcome"] not in _TERMINAL_OUTCOMES:
+        if clean_job["state"] == "cancelled":
+            if clean_job["outcome"] != "cancelled" or clean_job.get("terminal_error") is not None:
+                raise ValueError("invalid journal")
+        elif clean_job["state"] == "done":
+            if clean_job["outcome"] not in _TERMINAL_OUTCOMES - {"cancelled"}:
                 raise ValueError("invalid journal")
         elif clean_job["outcome"] != "pending":
             raise ValueError("invalid journal")
@@ -103,6 +149,8 @@ def _validate_journal(payload: object) -> dict:
             raise ValueError("invalid journal")
         clean_job["tracks"] = [_validate_track_item(item) for item in tracks]
         clean_job["results"] = [_validate_result_item(item) for item in results]
+        if "owned_stages" in clean_job:
+            clean_job["owned_stages"] = _validate_owned_stages(clean_job["owned_stages"])
         _validate_job_coherence(clean_job)
         if clean_job["state"] == "done" and clean_job["outcome"] != "succeeded":
             clean_job["terminal_error"] = _validate_terminal_error(clean_job.get("terminal_error"))
@@ -132,7 +180,7 @@ def initialize(data_root: Path | None = None, *, start_worker: bool = True, writ
             and _journal_path == journal_path
             and _worker_thread is not None
             and _worker_thread.is_alive()
-            and (_queue or current_worker_active or any(job.get("state") == "running" for job in _jobs.values()))
+            and (_queue or current_worker_active or any(job.get("state") in {"running", "cancelling"} for job in _jobs.values()))
         ):
             raise RuntimeError("DeckPipe jobs for this data root are busy")
         _worker_stop.set()
@@ -163,6 +211,28 @@ def initialize(data_root: Path | None = None, *, start_worker: bool = True, writ
         loaded_queue = []
         changed = False
         for job_id, job in loaded_jobs.items():
+            cleanup_retry = (job.get("terminal_error") or {}).get("code") == "cancel_cleanup_failed"
+            if job.get("owned_stages"):
+                try:
+                    _cleanup_registered_stages(job)
+                except (OSError, DownloadCleanupFailed):
+                    job.update(state="done", outcome="failed", current=None, terminal_error={
+                        "code": "cancel_cleanup_failed",
+                        "message": "Temporary file cleanup failed; reconnect the music folder and close applications using it, then restart DeckPipe",
+                    })
+                    record("error", operation="download", stage="cleanup_failed",
+                           message="Temporary files could not be cleaned after restart", job_id=job_id,
+                           error_code="cancel_cleanup_failed")
+                    changed = True
+                    continue
+                changed = True
+                if cleanup_retry:
+                    job.update(state="cancelled", outcome="cancelled", current=None, terminal_error=None)
+            if job.get("state") == "cancelling":
+                # A durable user cancellation must never turn back into a download after restart.
+                job.update(state="cancelled", outcome="cancelled", current=None, terminal_error=None)
+                changed = True
+                continue
             if job.get("state") in ("queued", "running"):
                 if job.get("mode") in IDEMPOTENT_DOWNLOAD_MODES:
                     if _reconcile_ready_items_in_jobs(loaded_jobs, job_id):
@@ -386,7 +456,7 @@ def _require_initialized() -> None:
 
 
 def _snapshot(job: dict | None):
-    return copy.deepcopy(job) if job is not None else None
+    return copy.deepcopy({key: value for key, value in job.items() if key != "owned_stages"}) if job is not None else None
 
 
 def _persist_locked(*, backup: bool = True) -> None:
@@ -464,6 +534,8 @@ def enqueue(
         should_start = _start_worker_default if start_worker is None else start_worker
         _write_jobs_candidate_locked(candidate_jobs)
         _publish_jobs_locked(candidate_jobs, candidate_queue)
+        record("info", operation="download", stage="queued", message="Download queued",
+               job_id=job_id, playlist_id=playlist_id)
         if should_start:
             _ensure_worker_locked()
     return job_id
@@ -476,7 +548,66 @@ def get_job(job_id: str):
 
 def list_jobs():
     with _lock:
-        return copy.deepcopy(sorted(_jobs.values(), key=lambda j: j["created_at"], reverse=True)[:20])
+        return [_snapshot(job) for job in sorted(_jobs.values(), key=lambda j: j["created_at"], reverse=True)[:20]]
+
+
+def register_owned_stage(job_id: str, path: Path, *, prefix=False, _generation=None) -> None:
+    path = Path(path).resolve()
+    descriptor = _validate_owned_stages([{"path": str(path), "prefix": prefix}])[0]
+    with _lock:
+        _check_generation_locked(_generation)
+        job = _jobs[job_id]
+        if job["state"] != "running":
+            raise DownloadCancelled()
+        if path.parent != playlist_dir(job["playlist_id"], job["title"]).resolve():
+            raise ValueError("stage is outside the download directory")
+        if descriptor in job.get("owned_stages", []):
+            return
+        candidate_jobs = copy.deepcopy(_jobs)
+        candidate_jobs[job_id].setdefault("owned_stages", []).append(descriptor)
+        _write_jobs_candidate_locked(candidate_jobs)
+        _publish_jobs_locked(candidate_jobs)
+
+
+def cancel_job(job_id: str) -> dict:
+    with _lock:
+        _require_initialized()
+        job = _jobs[job_id]
+        if job["mode"] not in IDEMPOTENT_DOWNLOAD_MODES:
+            raise ValueError("Only download jobs can be cancelled")
+        if job["state"] in _TERMINAL_STATES or job["state"] == "cancelling":
+            return _snapshot(job)
+        candidate_jobs = copy.deepcopy(_jobs)
+        candidate = candidate_jobs[job_id]
+        if job["state"] == "queued":
+            candidate.update(state="cancelled", outcome="cancelled", current=None, terminal_error=None)
+        else:
+            candidate["state"] = "cancelling"
+        candidate_queue = [item for item in _queue if item != job_id]
+        _write_jobs_candidate_locked(candidate_jobs)
+        _publish_jobs_locked(candidate_jobs, candidate_queue)
+        record("info", operation="download", stage="cancelled" if candidate["state"] == "cancelled" else "cancel_requested",
+               message="Download cancelled" if candidate["state"] == "cancelled" else "Download cancellation requested",
+               job_id=job_id, playlist_id=job["playlist_id"])
+        return _snapshot(candidate)
+
+
+def clear_completed() -> dict:
+    with _lock:
+        _require_initialized()
+        removed = [job_id for job_id, job in _jobs.items()
+                   if job["state"] in _TERMINAL_STATES and not job.get("owned_stages")]
+        if removed:
+            candidate_jobs = {job_id: copy.deepcopy(job) for job_id, job in _jobs.items() if job_id not in removed}
+            _write_jobs_candidate_locked(candidate_jobs)
+            _publish_jobs_locked(candidate_jobs, [job_id for job_id in _queue if job_id not in removed])
+            record("info", operation="download", stage="history_cleared", message="Completed queue records cleared")
+        return {"cleared": len(removed), "job_ids": removed}
+
+
+def _job_cancellation_requested(job_id: str, generation: int) -> bool:
+    with _lock:
+        return generation != _worker_generation or job_id not in _jobs or _jobs[job_id]["state"] in {"cancelling", "cancelled"}
 
 
 def pending_track_ids(job_id: str) -> list[dict]:
@@ -532,7 +663,9 @@ def _reconcile_ready_items_in_jobs(jobs_map: dict[str, dict], job_id: str) -> bo
 def mark_running(job_id: str, *, _generation: int | None = None) -> None:
     with _lock:
         _check_generation_locked(_generation)
-        job = _jobs[job_id]
+        job = _jobs.get(job_id)
+        if job is None or job["state"] in {"cancelled", "cancelling"}:
+            raise DownloadCancelled()
         if job["state"] == "done":
             raise RuntimeError("terminal job cannot run again")
         if job["state"] == "queued":
@@ -541,13 +674,16 @@ def mark_running(job_id: str, *, _generation: int | None = None) -> None:
             candidate_jobs[job_id]["outcome"] = "pending"
             _write_jobs_candidate_locked(candidate_jobs)
             _publish_jobs_locked(candidate_jobs)
+            if job["mode"] in IDEMPOTENT_DOWNLOAD_MODES:
+                record("info", operation="download", stage="started", message="Download started",
+                       job_id=job_id, playlist_id=job["playlist_id"])
 
 
 def mark_item_complete(job_id: str, track: dict, *, ok: bool, error: str, quality: str, _generation: int | None = None) -> None:
     with _lock:
         _check_generation_locked(_generation)
         job = _jobs[job_id]
-        if job["state"] != "running":
+        if job["state"] not in {"running", "cancelling"}:
             raise RuntimeError("terminal job cannot accept progress")
         track_id = str(track["id"])
         provider = track.get("provider", "deezer")
@@ -556,6 +692,7 @@ def mark_item_complete(job_id: str, track: dict, *, ok: bool, error: str, qualit
             return
         candidate_jobs = copy.deepcopy(_jobs)
         candidate = candidate_jobs[job_id]
+        _cleanup_registered_stages(candidate)
         candidate["results"].append(
             {
                 "id": track_id,
@@ -573,6 +710,13 @@ def mark_item_complete(job_id: str, track: dict, *, ok: bool, error: str, qualit
         candidate["current"] = None
         _write_jobs_candidate_locked(candidate_jobs)
         _publish_jobs_locked(candidate_jobs)
+        if job["mode"] in IDEMPOTENT_DOWNLOAD_MODES:
+            failed_step = next((kind for kind in ("download", "validation", "metadata", "conversion", "publication")
+                                if error == _public_error(kind)), "track")
+            failure_code = failed_step + "_failed"
+            record("info" if ok else "error", operation="download", stage="track_completed" if ok else failure_code,
+                   message="Трек сохранён." if ok else "Ошибка этапа обработки: " + failed_step, job_id=job_id,
+                   track_id=key, playlist_id=job["playlist_id"], error_code=None if ok else failure_code)
 
 
 def mark_terminal(job_id: str, *, outcome: str, error: dict | None = None, _generation: int | None = None) -> None:
@@ -581,16 +725,28 @@ def mark_terminal(job_id: str, *, outcome: str, error: dict | None = None, _gene
     with _lock:
         _check_generation_locked(_generation)
         job = _jobs[job_id]
-        if job["state"] == "done":
+        if job["state"] in _TERMINAL_STATES:
             raise RuntimeError("terminal job cannot transition again")
         candidate_jobs = copy.deepcopy(_jobs)
         candidate = candidate_jobs[job_id]
-        candidate["state"] = "done"
+        try:
+            _cleanup_registered_stages(candidate)
+        except (OSError, DownloadCleanupFailed):
+            outcome = "failed"
+            error = {"code": "cancel_cleanup_failed", "message": "Download stopped but temporary file cleanup failed"}
+        if candidate["state"] == "cancelling" and (error or {}).get("code") != "cancel_cleanup_failed":
+            outcome = "cancelled"
+        candidate["state"] = "cancelled" if outcome == "cancelled" else "done"
         candidate["outcome"] = outcome
         candidate["current"] = None
-        candidate["terminal_error"] = _sanitize_terminal_error(copy.deepcopy(error), outcome=outcome)
+        candidate["terminal_error"] = None if outcome == "cancelled" else _sanitize_terminal_error(copy.deepcopy(error), outcome=outcome)
         _write_jobs_candidate_locked(candidate_jobs)
         _publish_jobs_locked(candidate_jobs)
+        if job["mode"] in IDEMPOTENT_DOWNLOAD_MODES:
+            record("info" if outcome in {"succeeded", "cancelled"} else "error", operation="download",
+                   stage="cancelled" if outcome == "cancelled" else "completed" if outcome == "succeeded" else "failed",
+                   message="Download cancelled" if outcome == "cancelled" else "Download completed" if outcome == "succeeded" else "Download job failed",
+                   job_id=job_id, playlist_id=job["playlist_id"], error_code=(candidate["terminal_error"] or {}).get("code"))
 
 
 def mark_current(job_id: str, title: object, *, _generation: int | None = None) -> None:
@@ -657,15 +813,25 @@ def _wav_step(fpath: Path, reference_duration: float, identity: dict | None = No
 
     stage = None
     try:
+        check_cancelled()
         stage = convert_to_wav(fpath)
+        check_cancelled()
         v_ok, v_err, _ = verify_file(stage, reference_duration, tolerance=0.5)
         if not v_ok:
             cleanup_owned_stages(stage)
+            check_cancelled()
             return None, _public_error("conversion")
-        final = publish_staged_file(stage, _allocate_publication_path(final_path_from_stage(stage), identity))
+        with publication_guard():
+            final = publish_staged_file(stage, _allocate_publication_path(final_path_from_stage(stage), identity))
         return final, ""
+    except DownloadCancelled:
+        cleanup_owned_stages(stage)
+        raise
+    except DownloadCleanupFailed:
+        raise
     except Exception:
         cleanup_owned_stages(stage)
+        check_cancelled()
         return None, _public_error("conversion")
 
 
@@ -689,15 +855,17 @@ def _publish_wav_delete_state(pl_dir: Path, tid: str, source: Path, provider: st
     next_entry["provider"] = provider
     _set_track(pl_dir, tid, **next_entry, source_deleted=False)
     try:
-        source.unlink(missing_ok=True)
+        with publication_guard():
+            source.unlink(missing_ok=True)
+            _set_track(pl_dir, tid, source_deleted=True, provider=provider)
     except Exception:
         return
-    _set_track(pl_dir, tid, source_deleted=True, provider=provider)
 
 
 def _process_track(job, pl_dir, t, ds_holder, counter):
     from .tagger import write_tags, _meta_from_deezer, _meta_from_sc
 
+    check_cancelled()
     tid = str(t["id"])
     provider = t.get("provider", "deezer")
     expected = int(t.get("duration") or 0)
@@ -710,14 +878,15 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
         src = Path(pl_dir) / source_name if isinstance(source_name, str) else Path(pl_dir)
         if not is_ready_entry(pl_dir, source_entry) or src.suffix.lower() == ".wav":
             werr = _public_error("conversion")
-            _set_track(
-                pl_dir,
-                tid,
-                source_file=source_name if isinstance(source_name, str) else "",
-                status="verify_failed_convert",
-                error=werr,
-                provider=provider,
-            )
+            with publication_guard():
+                _set_track(
+                    pl_dir,
+                    tid,
+                    source_file=source_name if isinstance(source_name, str) else "",
+                    status="verify_failed_convert",
+                    error=werr,
+                    provider=provider,
+                )
             return False, werr, "wav"
         src_actual = prev.get("duration_actual") or expected
         wav, werr = _wav_step(src, src_actual, t)
@@ -735,7 +904,8 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
                            status="ok", error="", converted_at=_now(),
                            source_deleted=False, provider=provider)
             return True, "", "wav"
-        _set_track(pl_dir, tid, status="verify_failed_convert", error=werr, provider=provider)
+        with publication_guard():
+            _set_track(pl_dir, tid, status="verify_failed_convert", error=werr, provider=provider)
         return False, werr, "wav"
 
     from .catalog_service import existing_download, reconcile_reused_download, LibraryUnavailable
@@ -743,7 +913,9 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
     try:
         existing = existing_download(t)
     except LibraryUnavailable as exc:
+        check_cancelled()
         return False, str(exc), ""
+    check_cancelled()
     if existing:
         # Cross-folder references belong to the catalog, never the local sidecar.
         reconcile_reused_download(pl_dir, t)
@@ -754,6 +926,7 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
     meta = None
     for attempt in range(1 + AUTO_RETRIES):
         try:
+            check_cancelled()
             if stage_path:
                 cleanup_owned_stages(stage_path)
                 stage_path = None
@@ -761,12 +934,15 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
                 from .soundcloud import download_track as sc_download
 
                 stage_path, quality, sc_dur, sc_info = sc_download(t, pl_dir)
+                check_cancelled()
                 infos_duration = int(sc_dur or expected)
                 meta = _meta_from_sc(sc_info, None)
             else:
                 if ds_holder["ds"] is None:
                     ds_holder["ds"] = get_session()
+                check_cancelled()
                 stage_path, quality, infos = ds_holder["ds"].download_track(tid, pl_dir, prefer="FLAC")
+                check_cancelled()
                 infos_duration = int(infos["DURATION"])
                 meta = _meta_from_deezer(infos)
             v_ok, v_err, actual = _verify_after_tags(stage_path, expected, infos_duration, provider)
@@ -776,19 +952,28 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
             if meta:
                 try:
                     write_tags(stage_path, meta)
+                except DownloadCancelled:
+                    raise
                 except Exception:
                     err = _public_error("metadata")
                     cleanup_owned_stages(stage_path)
-                    _set_track(pl_dir, tid, title=t["title"], artist=t["artist"],
-                               file="", format=str(quality).lower(),
-                               status="verify_failed_metadata", error=err,
-                               downloaded_at=_now(), provider=provider, url=t.get("url", ""))
+                    with publication_guard():
+                        _set_track(pl_dir, tid, title=t["title"], artist=t["artist"],
+                                   file="", format=str(quality).lower(),
+                                   status="verify_failed_metadata", error=err,
+                                   downloaded_at=_now(), provider=provider, url=t.get("url", ""))
                     return False, err, quality
+            check_cancelled()
             v_ok, v_err, actual = _verify_after_tags(stage_path, expected, infos_duration, provider)
             if v_ok:
                 ok, err = True, ""
                 break
             err = _public_error("validation")
+        except DownloadCancelled:
+            cleanup_owned_stages(stage_path)
+            raise
+        except DownloadCleanupFailed:
+            raise
         except Exception:
             err = _public_error("download")
 
@@ -796,20 +981,28 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
         cleanup_owned_stages(stage_path)
         if "DRM" in str(err):
             err = "SoundCloud DRM-protected track is not downloadable"
-        _set_track(pl_dir, tid, title=t["title"], artist=t["artist"],
-                   file="", format=str(quality).lower(),
-                   status="verify_failed_download", error=err,
-                   downloaded_at=_now(), provider=provider, url=t.get("url", ""))
+        with publication_guard():
+            _set_track(pl_dir, tid, title=t["title"], artist=t["artist"],
+                       file="", format=str(quality).lower(),
+                       status="verify_failed_download", error=err,
+                       downloaded_at=_now(), provider=provider, url=t.get("url", ""))
         return False, err, quality
 
     try:
-        final_path, num = _final_download_path(pl_dir, t, stage_path, job, counter)
-        published = publish_staged_file(stage_path, final_path)
+        with publication_guard():
+            final_path, num = _final_download_path(pl_dir, t, stage_path, job, counter)
+            published = publish_staged_file(stage_path, final_path)
+            record("info", operation="download", stage="published", message="Verified audio file published",
+                   job_id=job.get("id"), track_id=_result_key(t), playlist_id=job.get("playlist_id"))
+    except DownloadCancelled:
+        cleanup_owned_stages(stage_path)
+        raise
     except Exception:
         cleanup_owned_stages(stage_path)
-        _set_track(pl_dir, tid, title=t["title"], artist=t["artist"], file="",
-                   format=str(quality).lower(), status="verify_failed_download",
-                   error=_public_error("publication"), downloaded_at=_now(), provider=provider, url=t.get("url", ""))
+        with publication_guard():
+            _set_track(pl_dir, tid, title=t["title"], artist=t["artist"], file="",
+                       format=str(quality).lower(), status="verify_failed_download",
+                       error=_public_error("publication"), downloaded_at=_now(), provider=provider, url=t.get("url", ""))
         return False, _public_error("publication"), quality
 
     src_format = published.suffix.lstrip(".").lower()
@@ -823,10 +1016,15 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
     if num:
         base_entry["position"] = num
     if _wav_mode() != "source" and src_format != "wav":
+        # The verified source is already committed. Cancellation of the optional
+        # conversion must retain a truthful ready entry for this complete music.
+        _set_track(pl_dir, tid, **base_entry, file=published.name, format=src_format,
+                   source_file=source_file_name, status="ok", error="")
         wav, werr = _wav_step(published, actual, t)
         if wav is None:
-            _set_track(pl_dir, tid, **base_entry, file=published.name, format=src_format,
-                       source_file=source_file_name, status="verify_failed_convert", error=werr)
+            with publication_guard():
+                _set_track(pl_dir, tid, **base_entry, file=published.name, format=src_format,
+                           source_file=source_file_name, status="verify_failed_convert", error=werr)
             return False, werr, quality
         if _wav_mode() == "wav_delete":
             _publish_wav_delete_state(
@@ -856,9 +1054,53 @@ def _process_track(job, pl_dir, t, ds_holder, counter):
     return True, "", quality
 
 
+def _run_download_job(job_id: str, generation: int):
+    from .catalog_service import validate_destination
+
+    check_cancelled()
+    mark_running(job_id, _generation=generation)
+    with _lock:
+        _check_generation_locked(generation)
+        tracks = pending_track_ids(job_id)
+        job_snapshot = copy.deepcopy(_jobs[job_id])
+    check_cancelled()
+    pl_dir = playlist_dir(job_snapshot["playlist_id"], job_snapshot["title"])
+    validate_destination(pl_dir, require_online=True)
+    check_cancelled()
+    pl_dir.mkdir(parents=True, exist_ok=True)
+    ds_holder = {"ds": None}
+    pl_total = int(tracks[0].get("total") or len(tracks)) if tracks else len(tracks)
+    counter = {"base": max_position(load_sidecar(pl_dir).get("tracks", {})),
+               "n": 0, "digits": 3 if pl_total >= 100 else 2}
+    for t in tracks:
+        check_cancelled()
+        mark_current(job_id, t.get("title"), _generation=generation)
+        record("info", operation="download", stage="track_started", message="Track download started",
+               job_id=job_id, track_id=_result_key(t), playlist_id=job_snapshot["playlist_id"])
+        try:
+            ok, err, quality = _process_track(job_snapshot, pl_dir, t, ds_holder, counter)
+        except (DownloadCancelled, DownloadCleanupFailed):
+            raise
+        except Exception:
+            check_cancelled()
+            ok, err, quality = False, _public_error("download"), ""
+        # A completed publication wins a simultaneous cancellation; retain its
+        # result before the next cancellation checkpoint stops remaining tracks.
+        mark_item_complete(job_id, t, ok=ok, error=err, quality=quality, _generation=generation)
+    with _lock:
+        _check_generation_locked(generation)
+        failed = _jobs[job_id]["failed"]
+        total = _jobs[job_id]["total"]
+    outcome = "succeeded" if failed == 0 else "failed" if failed == total else "partial_failure"
+    mark_terminal(job_id, outcome=outcome, error=None if outcome == "succeeded" else {
+        "code": outcome,
+        "message": "One or more tracks failed",
+    }, _generation=generation)
+
+
 def _worker(generation: int, stop_event: threading.Event):
     global _active_worker_item
-    from .catalog_service import validate_destination, LibraryUnavailable
+    from .catalog_service import LibraryUnavailable
     from .library_catalog import MusicRootRequired
     while not stop_event.is_set():
         with _lock:
@@ -872,37 +1114,26 @@ def _worker(generation: int, stop_event: threading.Event):
             continue
         job_id = item
         try:
-            mark_running(job_id, _generation=generation)
-            with _lock:
-                _check_generation_locked(generation)
-                job = _jobs[job_id]
-                tracks = pending_track_ids(job_id)
-                job_snapshot = copy.deepcopy(job)
-            pl_dir = playlist_dir(job_snapshot["playlist_id"], job_snapshot["title"])
-            validate_destination(pl_dir, require_online=True)
-            pl_dir.mkdir(parents=True, exist_ok=True)
-            ds_holder = {"ds": None}
-            pl_total = int(tracks[0].get("total") or len(tracks)) if tracks else len(tracks)
-            counter = {"base": max_position(load_sidecar(pl_dir).get("tracks", {})),
-                       "n": 0, "digits": 3 if pl_total >= 100 else 2}
-            for t in tracks:
-                mark_current(job_id, t.get("title"), _generation=generation)
-                try:
-                    ok, err, quality = _process_track(job_snapshot, pl_dir, t, ds_holder, counter)
-                except Exception:
-                    ok, err, quality = False, _public_error("download"), ""
-                mark_item_complete(job_id, t, ok=ok, error=err, quality=quality, _generation=generation)
-            with _lock:
-                _check_generation_locked(generation)
-                failed = _jobs[job_id]["failed"]
-                total = _jobs[job_id]["total"]
-            outcome = "succeeded" if failed == 0 else "failed" if failed == total else "partial_failure"
-            mark_terminal(job_id, outcome=outcome, error=None if outcome == "succeeded" else {
-                "code": outcome,
-                "message": "One or more tracks failed",
-            }, _generation=generation)
+            with cancellation_scope(
+                    lambda: _job_cancellation_requested(job_id, generation), _lock,
+                    lambda path, **kwargs: register_owned_stage(job_id, path, _generation=generation, **kwargs)):
+                _run_download_job(job_id, generation)
         except _StaleWorker:
             return
+        except DownloadCancelled:
+            with _lock:
+                if generation != _worker_generation:
+                    return
+                if job_id in _jobs and _jobs[job_id]["state"] not in _TERMINAL_STATES:
+                    mark_terminal(job_id, outcome="cancelled", _generation=generation)
+        except DownloadCleanupFailed:
+            try:
+                mark_terminal(job_id, outcome="failed", error={
+                    "code": "cancel_cleanup_failed",
+                    "message": "Download stopped but temporary file cleanup failed",
+                }, _generation=generation)
+            except _StaleWorker:
+                return
         except Exception as exc:
             try:
                 mark_terminal(

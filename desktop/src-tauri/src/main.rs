@@ -13,6 +13,7 @@ use tauri_plugin_shell::ShellExt;
 use tokio::time::timeout;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const DONATION_URL: &str = "https://pay.cloudtips.ru/p/f04f2f82";
 const CHILD_ENV_ALLOWLIST: &[&str] = &[
     "APPDATA",
     "LOCALAPPDATA",
@@ -39,6 +40,15 @@ struct BackendConnectionState {
 #[derive(Default)]
 struct ManagedSidecar {
     child: Mutex<Option<CommandChild>>,
+}
+
+#[tauri::command]
+#[allow(deprecated)] // Reuse the pinned shell plugin for this single fixed URL.
+async fn open_donation(app: tauri::AppHandle, window: WebviewWindow) -> Result<(), String> {
+    require_main(&window)?;
+    app.shell()
+        .open(DONATION_URL, None)
+        .map_err(|_| "Не удалось открыть страницу Donation в браузере.".to_owned())
 }
 
 #[tauri::command]
@@ -291,6 +301,7 @@ fn main() {
             auth_status,
             auth_cancel,
             auth_logout,
+            open_donation,
             backend_connection
         ])
         .setup(|app| {

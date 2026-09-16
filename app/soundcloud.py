@@ -10,7 +10,8 @@ import requests
 import yt_dlp
 import imageio_ffmpeg
 
-from .atomic_io import cleanup_owned_stages, is_partial_path, make_staged_path
+from .atomic_io import is_partial_path, make_staged_path
+from .download_control import cancellable_ytdlp_processes, check_cancelled, cleanup_download_stages as cleanup_owned_stages, register_stage
 from .deezer_client import sanitize_filename, get_soundcloud_oauth
 from .provider_errors import (
     detail_from_exception,
@@ -417,11 +418,13 @@ def _resolve_likes(url: str) -> dict:
 
 def download_track(track: dict, out_dir: Path):
     """Скачивает трек по url. Возвращает (path, format, actual_duration)."""
+    check_cancelled()
     out_dir.mkdir(parents=True, exist_ok=True)
     base = sanitize_filename(f"{track['artist']} - {track['title']}" if track.get("artist")
                              else track["title"])
     staged_template = make_staged_path(out_dir / (base + ".download")).with_suffix(".%(ext)s")
     stage_prefix = staged_template.name.split("%(ext)s", 1)[0]
+    register_stage(out_dir / stage_prefix, prefix=True)
     opts = {
         "quiet": True, "no_warnings": True, "noplaylist": True,
         # предпочитаем progressive MP3 (точная длительность, чистый контейнер),
@@ -430,15 +433,21 @@ def download_track(track: dict, out_dir: Path):
         "outtmpl": str(staged_template),
         "ffmpeg_location": FFMPEG,
         "postprocessor_args": ["-movflags", "+faststart"],
+        "progress_hooks": [lambda _progress: check_cancelled()],
+        "postprocessor_hooks": [lambda _progress: check_cancelled()],
+        "socket_timeout": 10,
     }
     opts = _youtube_dl_opts_with_oauth(opts, sc_oauth_token())
     try:
-        with yt_dlp.YoutubeDL(opts) as y:
+        check_cancelled()
+        with cancellable_ytdlp_processes(), yt_dlp.YoutubeDL(opts) as y:
             _bind_cookiejar(y, opts)
             info = y.extract_info(track["url"], download=True)
+            check_cancelled()
             fpath = Path(y.prepare_filename(info))
     except Exception:
         cleanup_owned_stages(*_current_stage_candidates(out_dir, stage_prefix))
+        check_cancelled()
         raise RuntimeError("SoundCloud download failed") from None
     # yt-dlp может поменять расширение после пост-обработки
     if not fpath.exists() or not _is_current_stage_path(fpath, out_dir, stage_prefix):

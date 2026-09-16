@@ -199,6 +199,10 @@ fn actual_capability_excludes_every_remote_auth_window() {
     assert!(capability.get("webviews").is_none());
     assert_eq!(
         capability["permissions"],
-        serde_json::json!(["allow-auth-broker", "allow-backend-connection"])
+        serde_json::json!([
+            "allow-auth-broker",
+            "allow-backend-connection",
+            "allow-open-donation"
+        ])
     );
 }

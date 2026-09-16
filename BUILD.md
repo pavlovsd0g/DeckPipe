@@ -23,6 +23,9 @@ New-Item -ItemType Directory -Path $env:TEMP | Out-Null
 $env:DECKPIPE_API_TOKEN = 'synthetic-test-only'
 $env:DECKPIPE_BOUND_PORT = '7100'
 $env:PYTHONDONTWRITEBYTECODE = '1'
+$env:PYTHONUTF8 = '1'
+$env:DECKPIPE_RB_TEST_LAB = Join-Path $deckpipeTestProfile 'RekordboxFixtures'
+New-Item -ItemType Directory -Path $env:DECKPIPE_RB_TEST_LAB | Out-Null
 node frontend/build.mjs
 & 'D:\DeckPipe-RC-Lab\tool-cache\offline-proof\Scripts\python.exe' -m unittest discover -s qa/tests -p 'test_*.py'
 ```
@@ -54,10 +57,10 @@ Backend EXE остаётся единственным внешним sidecar; н
   -StagingDirectory 'D:\DeckPipe-RC-Lab\staging\NEW-UNIQUE-CANDIDATE' `
   -PythonExe 'D:\DeckPipe-RC-Lab\tool-cache\offline-proof\Scripts\python.exe' `
   -WheelhouseDirectory 'D:\DeckPipe-RC-Lab\wheelhouse' `
-  -UnsignedEngineeringCandidate
+  -PrivateBetaCandidate
 ```
 
-Инженерный кандидат без подписи не является разрешением на распространение. Проверка должна показывать незакрытые условия подписи. Старый кандидат и его pin/evidence нельзя заменять результатом другой сборки. Для авторизованного private-beta применяется отдельный `-PrivateBetaCandidate` и существующая политика; публичный выпуск требует подписи и timestamp.
+Текущий канал — согласованный **unsigned private beta**. Политика фиксирует подпись Windows и timestamp как `WAIVED_BY_OWNER`, а не как пройденную проверку. Старый ключ `-UnsignedEngineeringCandidate` заблокирован. Старый кандидат и его pin/evidence нельзя заменять результатом другой сборки; используйте новую папку для каждого кандидата. Репозиторий и доступ к сборкам сохраняют текущую видимость.
 
 ## Приёмка настоящей установки
 

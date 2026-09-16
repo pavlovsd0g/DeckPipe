@@ -5,6 +5,7 @@
   "windows": ["main"],
   "permissions": [
     "allow-auth-broker",
-    "allow-backend-connection"
+    "allow-backend-connection",
+    "allow-open-donation"
   ]
 }

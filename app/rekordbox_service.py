@@ -7,6 +7,7 @@ from pathlib import Path
 
 from . import catalog_service, library, rekordbox as rb
 from .atomic_io import file_lock
+from .activity_log import record
 from .library_catalog import MusicRootRequired
 from .rekordbox_media import MediaError, MediaStore, path_key
 
@@ -158,6 +159,8 @@ def resolve(key, title):
 def blocked(exc, dry_run=True):
     code = getattr(exc, 'code', 'source_unavailable')
     unresolved = getattr(exc, 'unresolved', [{'code': code}])
+    record('warning', operation='rekordbox', stage='source_blocked',
+           message='Rekordbox source or verified media is unavailable', error_code=code)
     return dict(dry_run=dry_run, applied=False, reconciled=False, unchanged=False, plan=None,
                 unresolved=unresolved, backup_id=None, backup=None, recovery=False, error={'code': code, 'message': code})
 
@@ -202,14 +205,13 @@ def media_state_from_plan(desired, plan, store):
     target_exists = (plan or {}).get('target', {}).get('id') is not None
     missing = sum(row['mode'] == 'not_in_rekordbox' for row in rows)
     membership = 'absent_target' if not target_exists else ('partial' if missing else 'complete')
-    if membership == 'complete' and (plan or {}).get('reorder'):
-        membership = 'order_mismatch'
     mode = next(iter(modes)) if len(modes) == 1 else ('empty' if not modes else 'mixed')
-    if unmatched or 'blocked' in modes:
+    if 'blocked' in modes:
         mode = 'blocked'
         membership = 'mismatch'
     return dict(mode=mode, tracks=rows, unmatched_memberships=unmatched,
                 membership=membership, target_exists=target_exists, missing=missing,
+                preserved=len(unmatched),
                 prepared=sum(row['prepared'] for row in rows), total=len(rows),
                 shared_content=(plan or {}).get('shared_content', []))
 
@@ -221,7 +223,7 @@ def inspect_state(key, title, playlist_id=None):
     try:
         desired, store = resolve(key, title), MediaStore()
         media_desired = _media_desired(desired, store)
-        result = rb.sync_playlist(title, media_desired, dry_run=True, playlist_id=playlist_id)
+        result = rb.sync_playlist(title, media_desired, dry_run=True, playlist_id=playlist_id, log_activity=False)
         if result.get('error') or result.get('unresolved'):
             return {**result, 'media_state': {'mode': 'blocked'}}
         return {**result, 'media_state': media_state_from_plan(desired, result['plan'], store)}
@@ -242,7 +244,7 @@ def sync(key, title, *, dry_run=True, expected_plan_hash=None, confirmation_toke
         media_desired = _media_desired(desired, store, to_wav=bool(to_wav), require_prepared=to_wav is True)
         if to_wav is None and any(store.entry(item['path']) for item in desired):
             # Ordinary sync retains each existing content's actual mode.
-            observed = rb.sync_playlist(title, media_desired, dry_run=True, playlist_id=playlist_id)
+            observed = rb.sync_playlist(title, media_desired, dry_run=True, playlist_id=playlist_id, log_activity=False)
             if observed.get('error'):
                 return {**observed, 'dry_run': dry_run}
             # existing_path is resolved against the whole collection ContentID,
@@ -279,7 +281,7 @@ def _result_media_state(result, desired, store, title, media_desired, playlist_i
     if not dry_run and result.get('reconciled'):
         # The map precedes DB commit; actual state is read back, never guessed
         # from a callback or from the pre-operation plan returned by the core.
-        fresh = rb.sync_playlist(title, media_desired, dry_run=True, playlist_id=playlist_id)
+        fresh = rb.sync_playlist(title, media_desired, dry_run=True, playlist_id=playlist_id, log_activity=False)
         if fresh.get('error') or fresh.get('unresolved'):
             return {'mode': 'blocked', 'error': fresh.get('error')}
         return media_state_from_plan(desired, fresh['plan'], store)
@@ -292,6 +294,8 @@ def _result_media_state(result, desired, store, title, media_desired, playlist_i
 
 def prepare_wav(key, title, bit_depth=16):
     result = dict(prepared=0, reused=0, total=0, tracks=[], error=None, unresolved=[])
+    record('info', operation='rekordbox', stage='wav_preparation_started',
+           message='Verified WAV preparation started')
     try:
         desired, store = resolve(key, title), MediaStore()
         result['total'] = len(desired)
@@ -300,9 +304,14 @@ def prepare_wav(key, title, bit_depth=16):
             result['prepared' if created else 'reused'] += 1
             result['tracks'].append(dict(provider_id=item['provider_id'], original_path=entry['source'], wav_path=entry['variant'], state='prepared'))
         result['state'] = 'prepared'
+        record('info', operation='rekordbox', stage='wav_prepared',
+               message='Verified WAV files are ready')
     except (SourceError, MediaError, MusicRootRequired, catalog_service.LibraryUnavailable) as exc:
         result.update(state='blocked', error={'code': exc.code, 'message': str(exc)},
                       unresolved=getattr(exc, 'unresolved', [{'code': exc.code}]))
     except Exception:
         result.update(state='blocked', error={'code': 'wav_preparation_failed', 'message': 'WAV preparation failed'})
+    if result['error']:
+        record('warning', operation='rekordbox', stage='wav_preparation_failed',
+               message='Verified WAV preparation could not finish', error_code=result['error']['code'])
     return result

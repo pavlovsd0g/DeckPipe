@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -19,7 +18,8 @@ from mutagen.mp4 import MP4 as MutagenMP4
 from mutagen.wave import WAVE as MutagenWAVE
 from mutagen.oggopus import OggOpus as MutagenOpus
 
-from .atomic_io import atomic_write_json, cleanup_owned_stages, make_staged_path
+from .atomic_io import atomic_write_json, make_staged_path
+from .download_control import DownloadCancelled, DownloadCleanupFailed, check_cancelled, cleanup_download_stages as cleanup_owned_stages, register_stage, run_media_process
 
 _MUTAGEN_BY_EXT = {".flac": MutagenFLAC, ".mp3": MutagenMP3, ".m4a": MutagenMP4,
                    ".aac": MutagenMP4, ".mp4": MutagenMP4, ".wav": MutagenWAVE,
@@ -174,24 +174,31 @@ class DeezerSession:
 
     def download_track(self, track_id: str, out_dir: Path, prefer: str = "FLAC"):
         """Скачивает трек с fallback по качеству. Возвращает (path, quality, infos)."""
+        check_cancelled()
         infos = self.gw("song.getData", SNG_ID=track_id)
+        check_cancelled()
         title, artist = infos["SNG_TITLE"], infos["ART_NAME"]
         order = [prefer] + [q for q in QUALITIES if q != prefer]
         for q in order:
+            check_cancelled()
             if int(infos.get(FILESIZE_KEY[q], "0") or 0) == 0:
                 continue
             try:
                 url = self.media_url(infos["TRACK_TOKEN"], q)
+                check_cancelled()
                 ext = "flac" if q == "FLAC" else "mp3"
                 final_path = out_dir / f"{sanitize_filename(artist + ' - ' + title)}.{ext}"
                 fpath = make_staged_path(final_path)
+                register_stage(fpath)
                 key = _blowfish_key(track_id)
                 try:
-                    with self.s.get(url, stream=True, timeout=180) as r:
+                    with self.s.get(url, stream=True, timeout=(15, 5)) as r:
                         r.raise_for_status()
+                        check_cancelled()
                         i = 0
                         with open(fpath, "wb") as f:
                             for chunk in r.iter_content(chunk_size=2048):
+                                check_cancelled()
                                 if not chunk:
                                     continue
                                 if i % 3 == 0 and len(chunk) == 2048:
@@ -202,12 +209,15 @@ class DeezerSession:
                                 i += 1
                             f.flush()
                             os.fsync(f.fileno())
+                    check_cancelled()
                 except Exception:
                     cleanup_owned_stages(fpath)
                     raise
                 return fpath, q, infos
+            except (DownloadCancelled, DownloadCleanupFailed):
+                raise
             except Exception:
-                pass
+                check_cancelled()
         raise RuntimeError("download failed")
 
 
@@ -222,6 +232,7 @@ def _blowfish_key(track_id: str) -> bytes:
 def verify_file(fpath: Path, expected_duration: int, tolerance: float = 2.0):
     """Проверка целостности: читаемость + полное декодирование + длительность.
     Возвращает (ok, error_message, actual_duration)."""
+    check_cancelled()
     try:
         if not fpath.exists() or fpath.stat().st_size < 30_000:
             return False, "файл отсутствует или подозрительно мал", 0.0
@@ -232,8 +243,7 @@ def verify_file(fpath: Path, expected_duration: int, tolerance: float = 2.0):
         actual = float(mf.info.length)
     except Exception:
         return False, "media validation failed", 0.0
-    r = subprocess.run([FFMPEG, "-v", "error", "-i", str(fpath), "-f", "null", "-"],
-                       capture_output=True, text=True)
+    r = run_media_process([FFMPEG, "-v", "error", "-i", str(fpath), "-f", "null", "-"])
     if r.returncode != 0 or r.stderr.strip():
         return False, "media validation failed", actual
     if abs(actual - expected_duration) > tolerance:

@@ -6,7 +6,9 @@ import json
 import os
 import subprocess
 import uuid
+from functools import partial
 from pathlib import Path
+from .activity_log import record
 
 APPLY_CONFIRMATION_TOKEN = "APPLY_REKORDBOX_CHANGES"
 RECOVERY_CONFIRMATION_TOKEN = "RESTORE_REKORDBOX_OPERATION"
@@ -124,6 +126,7 @@ def _duplicate_desired_positions(items: list[dict]) -> tuple[set[int], list[dict
 
 
 def plan_playlist_sync(desired: list[dict], current: list[dict] | None = None) -> dict:
+    """Plan only missing memberships; existing Rekordbox state is authoritative."""
     desired_clean: list[dict] = []
     current_clean: list[dict] = []
     unresolved: list[dict] = []
@@ -169,23 +172,20 @@ def plan_playlist_sync(desired: list[dict], current: list[dict] | None = None) -
     ], key=lambda item: (item["position"], item["provider_id"]))
     desired_by_id = {item["provider_id"]: item for item in desired_resolved}
     current_by_id = {item["provider_id"]: item for item in current_resolved}
-    common = sorted(desired_by_id.keys() & current_by_id.keys(), key=lambda key: (desired_by_id[key]["position"], key))
-    add = sorted([item for item in desired_resolved if item["provider_id"] not in current_by_id], key=lambda item: (item["position"], item["provider_id"]))
-    remove = sorted([item for item in current_resolved if item["provider_id"] not in desired_by_id], key=lambda item: (item["position"], item["provider_id"]))
-    reorder = [desired_by_id[key] for key in common if desired_by_id[key]["position"] != current_by_id[key]["position"]]
-    metadata = [
-        desired_by_id[key]
-        for key in common
-        if any(desired_by_id[key][field] != current_by_id[key][field] for field in ("title", "artist", "album", "duration"))
-    ]
-    path = [desired_by_id[key] for key in common if desired_by_id[key]["path"] != current_by_id[key]["path"]]
+    already_present = [item for item in desired_resolved if item['provider_id'] in current_by_id]
+    preserved = [item for item in current_resolved if item['provider_id'] not in desired_by_id]
+    missing = [item for item in desired_resolved if item['provider_id'] not in current_by_id]
+    last_position = max((item['position'] for item in current_clean), default=0)
+    add = [dict(item, source_position=item['position'], position=last_position + offset)
+           for offset, item in enumerate(missing, 1)]
+    reused = sum(bool(item.get('content_id')) for item in add)
     unresolved = sorted(unresolved, key=lambda item: (item.get("code", ""), item.get("position", 0), item.get("provider_id", ""), ",".join(item.get("provider_ids", []))))
     plan = {
         "add": add,
-        "remove": remove,
-        "reorder": reorder,
-        "metadata": metadata,
-        "path": path,
+        "remove": [],
+        "reorder": [],
+        "metadata": [],
+        "path": [],
         "unresolved": unresolved,
         "desired_resolved": desired_resolved,
         "counts": {
@@ -193,10 +193,14 @@ def plan_playlist_sync(desired: list[dict], current: list[dict] | None = None) -
             "current": len(current_clean),
             "resolved": len(desired_resolved),
             "add": len(add),
-            "remove": len(remove),
-            "reorder": len(reorder),
-            "metadata": len(metadata),
-            "path": len(path),
+            "already_present": len(already_present),
+            "reuse": reused,
+            "import": len(add) - reused,
+            "preserved": len(preserved),
+            "remove": 0,
+            "reorder": 0,
+            "metadata": 0,
+            "path": 0,
             "unresolved": len(unresolved),
         },
     }
@@ -210,7 +214,15 @@ from .rekordbox_recovery import Journal, RecoveryError, digest, mutation_lock
 _exclusive_create_lock = mutation_lock
 
 
-def _failure(code, *, plan, dry_run=False, backup=None):
+def _failure(code, *, plan, dry_run=False, backup=None, log_activity=True):
+    if log_activity:
+        level, stage, message = {
+            'recovery_restored_preview_required': ('info', 'recovered', 'Rekordbox restored; review a new preview'),
+            'recovery_needed': ('warning', 'recovery_required', 'Rekordbox recovery is required before new changes'),
+            'recovery_not_needed': ('info', 'recovery_not_needed', 'No pending Rekordbox recovery'),
+        }.get(code, ('warning', 'failed', 'Rekordbox operation could not be completed'))
+        record(level, operation='rekordbox', stage=stage, message=message,
+               playlist_id=plan.get('target', {}).get('id'), error_code=code)
     return {'dry_run': dry_run, 'applied': False, 'reconciled': False,
         'unchanged': False, 'unresolved': plan.get('unresolved', []), 'plan': plan,
         'backup_id': backup.get('id') if backup else None,
@@ -223,12 +235,10 @@ def _bound_plan(adapter, name, desired, playlist_id, operation_kind):
     resolved, current, context = adapter.context(name, canonical, playlist_id, operation_kind)
     plan = plan_playlist_sync(resolved, current)
     plan.update(context)
-    # Existing metadata is owned by Rekordbox; source metadata only initializes
-    # new content. It must never cause writes or make a no-op appear different.
-    plan['metadata'] = []
-    plan['counts']['metadata'] = 0
-    plan['path'] = [i for i in plan['desired_resolved'] if i.get('existing_path') and
-        canonical_path(i['existing_path']) != canonical_path(i['path'])]
+    # Only an explicit media switch may relocate existing content. Ordinary
+    # sync can reuse a verified alias without changing the collection's path.
+    plan['path'] = [i for i in plan['desired_resolved'] if operation_kind == 'relocate'
+        and i.get('existing_path') and canonical_path(i['existing_path']) != canonical_path(i['path'])]
     plan['counts']['path'] = len(plan['path'])
     seen_paths = set()
     for item in plan['desired_resolved']:
@@ -245,7 +255,7 @@ def _bound_plan(adapter, name, desired, playlist_id, operation_kind):
                 plan['unresolved'].append({'code': 'media_verification_required', 'provider_id': item['provider_id']})
             elif expected and context['media_fingerprints'].get(item.get(path_field)) != expected:
                 plan['unresolved'].append({'code': 'media_verification_changed', 'provider_id': item['provider_id']})
-    if operation_kind == 'relocate' and (plan['add'] or plan['remove'] or plan['reorder'] or not plan['target']['id']):
+    if operation_kind == 'relocate' and (plan['add'] or not plan['target']['id']):
         plan['unresolved'].append({'code': 'relocate_membership_change'})
     plan['counts']['unresolved'] = len(plan['unresolved'])
     plan['shared_content'] = []
@@ -253,7 +263,7 @@ def _bound_plan(adapter, name, desired, playlist_id, operation_kind):
         for item in plan['path']:
             playlists = sorted({str(s.PlaylistID) for s in adapter.db.get_playlist_songs(ContentID=item['content_id'])})
             plan['shared_content'].append({'content_id': item['content_id'], 'playlist_ids': playlists})
-    plan['version'] = 2
+    plan['version'] = 3
     plan.pop('hash', None)
     plan['hash'] = digest(plan)
     return plan
@@ -264,21 +274,55 @@ def _no_changes(plan):
         plan[k] for k in ('add', 'remove', 'reorder', 'path'))
 
 
+def _reconciled(plan, after):
+    if not _no_changes(after):
+        return False
+    before_rows, after_rows = plan['current_memberships'], after['current_memberships']
+    if len(after_rows) != len(before_rows) + len(plan['add']):
+        return False
+    # Completeness alone cannot prove additive sync: a lost extra membership
+    # would otherwise look successful. Retained IDs, order and row metadata
+    # must all survive, also during an explicit media switch.
+    for before, actual in zip(before_rows, after_rows):
+        if any(before[field] != actual[field] for field in
+               ('membership_id', 'content_id', 'position', 'membership_fingerprint')):
+            return False
+    for expected, actual in zip(plan['add'], after_rows[len(before_rows):]):
+        if expected['provider_id'] != actual['provider_id'] or expected['position'] != actual['position']:
+            return False
+    relocated_ids = {item['content_id'] for item in plan['path']} if plan['operation_kind'] == 'relocate' else set()
+    for content_id, fingerprint in plan['content_fingerprints'].items():
+        if content_id in relocated_ids:
+            # Media switches may update only path/format properties and their
+            # registry timestamps. DJ metadata must survive for every content.
+            fingerprint = plan['content_metadata_fingerprints'][content_id]
+            actual = after['content_metadata_fingerprints'].get(content_id)
+        else:
+            actual = after['content_fingerprints'].get(content_id)
+        if actual != fingerprint:
+            return False
+    return True
+
+
 def sync_playlist(pl_name, ordered_files, create_missing=True, *, dry_run=True,
         adapter_factory=None, confirmation_token=None, expected_plan_hash=None,
-        playlist_id=None, operation_kind='sync', on_reconciled=None):
-    """Preview or apply exactly the viewed ordered playlist using a durable journal.
+        playlist_id=None, operation_kind='sync', on_reconciled=None, log_activity=True):
+    """Append the viewed missing tracks, or explicitly relocate verified media.
 
     source_path is a verified alias supplied by the media service. Public callers
     must never forward unverified client file paths into this internal interface.
     """
     plan = plan_playlist_sync(ordered_files, [])
+    failure = partial(_failure, log_activity=log_activity)
     if operation_kind not in ('sync', 'relocate'):
-        return _failure('invalid_operation_kind', plan=plan, dry_run=dry_run)
+        return failure('invalid_operation_kind', plan=plan, dry_run=dry_run)
     if not dry_run and confirmation_token != APPLY_CONFIRMATION_TOKEN:
-        return _failure('apply_not_confirmed', plan=plan)
+        return failure('apply_not_confirmed', plan=plan)
     if not dry_run and not expected_plan_hash:
-        return _failure('preview_required', plan=plan)
+        return failure('preview_required', plan=plan)
+    if log_activity:
+        record('info', operation='rekordbox', stage='preview_started' if dry_run else 'apply_started',
+               message='Rekordbox preview started' if dry_run else 'Rekordbox apply started', playlist_id=playlist_id)
     factory = adapter_factory or _PyrekordboxAdapter
     adapter = None
     journal = None
@@ -287,9 +331,14 @@ def sync_playlist(pl_name, ordered_files, create_missing=True, *, dry_run=True,
         journal = Journal(adapter.db_path)
         if dry_run:
             if journal.pending:
-                return _failure('recovery_needed', plan=plan, dry_run=True, backup=journal.data)
+                return failure('recovery_needed', plan=plan, dry_run=True, backup=journal.data)
             adapter.read_only()
             plan = _bound_plan(adapter, pl_name, ordered_files, playlist_id, operation_kind)
+            if log_activity:
+                record('warning' if plan['unresolved'] else 'info', operation='rekordbox',
+                       stage='preview_blocked' if plan['unresolved'] else 'preview_ready',
+                       message='Rekordbox preview contains unresolved tracks' if plan['unresolved'] else 'Rekordbox preview ready',
+                       playlist_id=plan['target']['id'])
             return {'dry_run': True, 'applied': False, 'reconciled': False,
                 'unchanged': _no_changes(plan), 'plan': plan, 'unresolved': plan['unresolved'],
                 'backup_id': None, 'backup': None, 'error': None, 'recovery': False}
@@ -300,35 +349,39 @@ def sync_playlist(pl_name, ordered_files, create_missing=True, *, dry_run=True,
         adapter = None
         with mutation_lock(lock_path) as acquired:
             if not acquired:
-                return _failure('concurrent_apply', plan=plan)
+                return failure('concurrent_apply', plan=plan)
             adapter = factory()
             journal = Journal(adapter.db_path)
             if journal.pending:
-                return _failure('recovery_needed', plan=plan, backup=journal.data)
+                return failure('recovery_needed', plan=plan, backup=journal.data)
             if adapter.is_rekordbox_running():
-                return _failure('rekordbox_running', plan=plan)
+                return failure('rekordbox_running', plan=plan)
             adapter.read_only()
             adapter.integrity_check()
             plan = _bound_plan(adapter, pl_name, ordered_files, playlist_id, operation_kind)
             if plan['unresolved']:
-                return _failure('unresolved_items', plan=plan)
-            # Replay is safe only after proving the authoritative desired state is
-            # already exactly present. A stale hash cannot authorize new writes.
+                return failure('unresolved_items', plan=plan)
+            # Replay is safe when all source members already exist in the target.
+            # Retained extras/order are intentional. Stale hashes never allow writes.
             if _no_changes(plan):
+                if log_activity:
+                    record('info', operation='rekordbox', stage='unchanged',
+                           message='Rekordbox already contains the requested tracks; no changes needed',
+                           playlist_id=plan['target']['id'])
                 return {'dry_run': False, 'applied': False, 'reconciled': True,
                     'unchanged': True, 'plan': plan, 'plan_hash': plan['hash'],
                     'unresolved': [], 'backup_id': None, 'backup': None, 'error': None, 'recovery': False}
             if expected_plan_hash != plan['hash']:
-                return _failure('stale_preview', plan=plan)
+                return failure('stale_preview', plan=plan)
             if not create_missing and plan['target']['id'] is None:
-                return _failure('playlist_not_found', plan=plan)
+                return failure('playlist_not_found', plan=plan)
             adapter.close()
             adapter = factory()
             adapter.begin()
             locked_plan = _bound_plan(adapter, pl_name, ordered_files, playlist_id, operation_kind)
             if locked_plan['hash'] != expected_plan_hash:
                 adapter.rollback()
-                return _failure('stale_preview', plan=locked_plan)
+                return failure('stale_preview', plan=locked_plan)
             journal.prepare(adapter, plan)
             try:
                 if adapter.is_rekordbox_running():
@@ -337,7 +390,7 @@ def sync_playlist(pl_name, ordered_files, create_missing=True, *, dry_run=True,
                 if locked_plan['hash'] != expected_plan_hash:
                     adapter.rollback()
                     journal.save(phase='restored')
-                    return _failure('stale_preview', plan=locked_plan)
+                    return failure('stale_preview', plan=locked_plan)
                 adapter.apply_operations({**plan, '_create_missing': create_missing})
                 payloads = adapter.prepare_commit()
                 journal.stage_external(payloads)
@@ -352,9 +405,12 @@ def sync_playlist(pl_name, ordered_files, create_missing=True, *, dry_run=True,
                 if adapter.fingerprint() != journal.data['database_after']:
                     raise AdapterError('reconcile_failed')
                 after = _bound_plan(adapter, pl_name, ordered_files, playlist_id, operation_kind)
-                if not _no_changes(after):
+                if not _reconciled(plan, after):
                     raise AdapterError('reconcile_failed')
                 journal.save(phase='complete')
+                if log_activity:
+                    record('info', operation='rekordbox', stage='reconciled',
+                           message='Rekordbox changes applied and verified', playlist_id=after['target']['id'])
                 result = {'dry_run': False, 'applied': True, 'reconciled': True,
                     'unchanged': False, 'plan': plan, 'plan_hash': plan['hash'],
                     'unresolved': [], 'backup_id': journal.data['id'], 'backup': {'verified': True},
@@ -364,6 +420,10 @@ def sync_playlist(pl_name, ordered_files, create_missing=True, *, dry_run=True,
                         on_reconciled(result)
                     except Exception:
                         result['error'] = {'code': 'callback_failed', 'message': 'Media state reconciliation failed'}
+                        if log_activity:
+                            record('warning', operation='rekordbox', stage='failed',
+                                   message='Rekordbox changes were verified but media bookkeeping failed',
+                                   playlist_id=after['target']['id'], error_code='callback_failed')
                 return result
             except Exception as exc:
                 code = str(exc) if isinstance(exc, (AdapterError, RecoveryError)) else 'transaction_failed'
@@ -375,15 +435,21 @@ def sync_playlist(pl_name, ordered_files, create_missing=True, *, dry_run=True,
                     adapter.close()
                 adapter = factory()
                 try:
+                    if log_activity:
+                        record('warning', operation='rekordbox', stage='recovery_started',
+                               message='Restoring the Rekordbox operation after failure', error_code=code)
                     journal.restore(adapter)
                     adapter = None
+                    if log_activity:
+                        record('info', operation='rekordbox', stage='recovered',
+                               message='Rekordbox rollback restored and verified')
                 except Exception as recovery_exc:
                     code = str(recovery_exc) if isinstance(recovery_exc, RecoveryError) else 'rollback_verify_failed'
-                return _failure(code, plan=plan, backup=journal.data)
+                return failure(code, plan=plan, backup=journal.data)
     except (AdapterError, RecoveryError) as exc:
-        return _failure(str(exc), plan=plan, dry_run=dry_run, backup=journal.data if journal else None)
+        return failure(str(exc), plan=plan, dry_run=dry_run, backup=journal.data if journal else None)
     except Exception:
-        return _failure('adapter_open_failed' if adapter is None else 'snapshot_failed', plan=plan, dry_run=dry_run)
+        return failure('adapter_open_failed' if adapter is None else 'snapshot_failed', plan=plan, dry_run=dry_run)
     finally:
         if adapter is not None:
             adapter.close()
@@ -398,6 +464,8 @@ def recover_operation(*, dry_run=True, adapter_factory=None, expected_plan_hash=
         return _failure('recovery_not_confirmed', plan=plan)
     if not dry_run and not expected_plan_hash:
         return _failure('recovery_preview_required', plan=plan)
+    record('info', operation='rekordbox', stage='recovery_preview_started' if dry_run else 'recovery_started',
+           message='Rekordbox recovery preview started' if dry_run else 'Rekordbox recovery started')
     factory = adapter_factory or _PyrekordboxAdapter
     try:
         adapter = factory()

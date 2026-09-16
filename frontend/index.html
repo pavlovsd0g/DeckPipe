@@ -30,8 +30,10 @@
     <button class="ghost" type="button" data-action="send-report" aria-label="Отправить багрепорт">🐞 Багрепорт</button>
   </div>
 </header>
-<div id="statusRegion" class="live-region hidden" role="status" aria-live="polite"></div>
-<div id="errorRegion" class="live-region error-region hidden" role="alert" aria-live="assertive"></div>
+<div id="notifications">
+  <div id="statusRegion" class="live-region hidden" role="status" aria-live="polite"></div>
+  <div id="errorRegion" class="live-region error-region hidden" role="alert" aria-live="assertive"></div>
+</div>
 <div id="libraryState" class="library-state" role="status" aria-live="polite"></div>
 <main>
   <aside id="side" aria-label="Навигация по источникам">
@@ -41,6 +43,7 @@
       <button id="tab-local" type="button" data-action="switch-tab" data-tab="local">Локальные</button>
       <button id="tab-search" type="button" data-action="switch-tab" data-tab="search">Поиск</button>
       <button id="tab-errors" type="button" data-action="switch-tab" data-tab="errors">Ошибки</button>
+      <button id="tab-logs" type="button" data-action="switch-tab" data-tab="logs">Логи</button>
     </nav>
     <div id="sc-add">
       <label class="sr-only" for="scUrl">URL плейлиста/страницы SoundCloud</label>
@@ -51,21 +54,29 @@
   </aside>
   <section id="content" aria-label="Рабочая область">
     <div id="toolbar" class="hidden" role="toolbar" aria-label="Действия плейлиста">
-      <div class="playlist-heading">
-        <div id="pltitle"></div>
-        <div id="plpath"></div>
+      <div class="playlist-summary">
+        <div class="playlist-heading">
+          <div id="pltitle"></div>
+          <div id="plpath"></div>
+        </div>
+        <span id="plstats" class="dim" aria-live="polite"></span>
       </div>
-      <span id="plstats" class="dim" aria-live="polite"></span>
-      <label class="dim label-compact" title="Файлы с номерами: 01 - Artist - Title">
-        <input type="checkbox" id="numbering" data-action="save-numbering"> NN
-      </label>
-      <button class="ghost" type="button" data-action="rescan">Пересканировать</button>
-      <button class="ghost" type="button" data-action="bind-path">Папка плейлиста…</button>
-      <button type="button" data-action="download-selected" aria-label="Скачать выбранные треки">Скачать выбранные</button>
-      <button type="button" data-action="sync-playlist-order" title="Перенумеровать файлы по порядку в стриминге и докачать недостающие" aria-label="Синхронизировать по порядку стриминга">Синк: по порядку</button>
-      <button type="button" data-action="sync-append" title="Не трогать текущие номера, новые треки — вниз списка" aria-label="Синхронизировать только новые треки вниз списка">Синк: новые вниз</button>
-      <button class="ghost" id="rbSyncBtn" type="button" data-action="rb-sync" title="Просмотреть синхронизацию скачанных треков с Rekordbox" aria-label="Просмотреть синхронизацию Rekordbox">→ RB</button>
-      <button class="ghost" id="flipBtn" type="button" data-action="flip-wav" title="Проверить режим файлов Rekordbox" aria-label="Подготовить WAV или вернуть исходные файлы в Rekordbox">⇄ Проверить WAV</button>
+      <div class="toolbar-row toolbar-sync" role="group" aria-label="Синхронизация">
+        <span class="toolbar-label">Синхронизация</span>
+        <button class="ghost" type="button" data-action="rescan">Пересканировать</button>
+        <button class="ghost" type="button" data-action="bind-path">Папка плейлиста…</button>
+        <button class="ghost" id="rbSyncBtn" type="button" data-action="rb-sync" title="Добавить недостающие треки в Rekordbox, сохранив существующие" aria-label="Просмотреть синхронизацию Rekordbox">→ Rekordbox</button>
+        <button class="ghost" id="flipBtn" type="button" data-action="flip-wav" title="Проверить режим файлов Rekordbox" aria-label="Подготовить WAV или вернуть исходные файлы в Rekordbox">⇄ Проверить WAV</button>
+      </div>
+      <div class="toolbar-row toolbar-download" role="group" aria-label="Загрузка">
+        <span class="toolbar-label">Загрузка</span>
+        <button type="button" data-action="download-selected" aria-label="Скачать выбранные треки">Скачать выбранные</button>
+        <button type="button" data-action="sync-playlist-order" title="Перенумеровать файлы в папке по порядку в стриминге и докачать недостающие" aria-label="Синхронизировать по порядку стриминга">По порядку</button>
+        <button type="button" data-action="sync-append" title="Не трогать текущие номера, новые треки — вниз списка" aria-label="Синхронизировать только новые треки вниз списка">Новые вниз</button>
+        <label class="dim label-compact" title="Файлы с номерами: 01 - Artist - Title">
+          <input type="checkbox" id="numbering" data-action="save-numbering"> NN
+        </label>
+      </div>
     </div>
     <div id="searchbar" class="hidden" role="search">
       <label class="sr-only" for="searchInput">Трек, альбом или исполнитель</label>
@@ -88,7 +99,15 @@
     <div id="tracks" tabindex="-1"><div id="empty"><div class="empty-title">Выберите плейлист слева</div></div></div>
   </section>
 </main>
-<div id="jobs" role="status" aria-live="polite"></div>
+<footer id="appFooter">
+  <div class="footer-bar">
+    <button id="toggleJobs" class="ghost button-small" type="button" data-action="toggle-jobs" aria-controls="jobs" aria-expanded="true">Свернуть загрузки</button>
+    <span id="queueSummary" class="dim" role="status" aria-live="polite">Очередь пуста</span>
+    <button id="clearJobs" class="ghost button-small" type="button" data-action="clear-completed-jobs" disabled>Скрыть завершённые</button>
+    <span class="app-credit">powered by @doggylord <a href="https://pay.cloudtips.ru/p/f04f2f82" target="_blank" rel="noopener noreferrer" data-action="open-donation" title="Поддержать автора: открыть Donation в браузере">Donation</a></span>
+  </div>
+  <div id="jobs" role="status" aria-live="polite"></div>
+</footer>
 
 <div id="modalOverlay" class="hidden" data-action="overlay-close">
   <div id="modal" role="dialog" aria-modal="true" aria-labelledby="loginTitle" tabindex="-1">

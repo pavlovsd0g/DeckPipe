@@ -107,7 +107,7 @@ class DesktopContractTests(unittest.TestCase):
         self.assertEqual(["main"], capability["windows"])
         self.assertNotIn("remote", capability)
         self.assertEqual(
-            ["allow-auth-broker", "allow-backend-connection"],
+            ["allow-auth-broker", "allow-backend-connection", "allow-open-donation"],
             capability["permissions"],
         )
 

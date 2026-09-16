@@ -406,7 +406,7 @@ console.log(JSON.stringify(runs));
         self.assertEqual(len(restored["calls"]), 4)
         self.assertEqual(restored["calls"][2]["body"]["expected_plan_hash"], "t" * 64)
         self.assertRegex(restored["calls"][3]["url"], r"dry_run=true$")
-        self.assertIn("восстанов", restored["status"].lower())
+        self.assertIn("синхронизировано", restored["status"].lower())
         self.assertEqual(len(vanished["calls"]), 3)
         self.assertNotIn("восстановлена", vanished["status"].lower())
         self.assertTrue(vanished["error"])
@@ -414,7 +414,7 @@ console.log(JSON.stringify(runs));
         self.assertEqual(len(changed_cancel["confirms"]), 2)
         self.assertIn("Восстановление", changed_cancel["confirms"][0]["title"])
         self.assertIn("синхронизации", changed_cancel["confirms"][1]["title"].lower())
-        self.assertIn("отменено", changed_cancel["status"].lower())
+        self.assertIn("отменена", changed_cancel["status"].lower())
         self.assertEqual(len(changed_apply["calls"]), 5)
         self.assertEqual(len(changed_apply["confirms"]), 2)
         self.assertEqual(changed_apply["calls"][2]["body"]["expected_plan_hash"], "t" * 64)
@@ -512,7 +512,7 @@ console.log(JSON.stringify({dialogAvailable,choiceText,calls,status:elements.get
         self.assertRegex(payload["calls"][1]["url"], r"/api/rb/status$")
         self.assertIn("playlist_id=22", payload["calls"][2]["url"])
         self.assertEqual(payload["calls"][3]["body"]["playlist_id"], "22")
-        self.assertIn("ID 22", payload["status"])
+        self.assertIn("Изменений нет", payload["status"])
 
     def test_duplicate_name_original_target_keeps_id_through_prepare_and_flip_preview(self):
         payload = self.probe(
@@ -546,7 +546,7 @@ console.log(JSON.stringify({calls,status:elements.get('#statusRegion').textConte
         self.assertIn("playlist_id=22", payload["calls"][4]["url"])
         self.assertEqual(payload["calls"][5]["body"]["playlist_id"], "22")
         self.assertTrue(payload["calls"][5]["body"]["to_wav"])
-        self.assertIn("ID 22", payload["status"])
+        self.assertIn("Изменений нет", payload["status"])
 
     def test_delayed_preview_cannot_replace_new_auth_dialog_or_status(self):
         payload = self.probe(
@@ -607,7 +607,7 @@ console.log(JSON.stringify({dialogAvailable,calls,busy:rbOperationBusy,visible:!
         self.assertEqual(len(payload["calls"]), 1)
         self.assertFalse(payload["busy"])
         self.assertFalse(payload["visible"])
-        self.assertIn("отменено", payload["status"].lower())
+        self.assertIn("отменена", payload["status"].lower())
 
     def test_playlist_change_settles_and_closes_stale_rekordbox_dialog(self):
         payload = self.probe(

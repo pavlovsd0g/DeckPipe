@@ -399,6 +399,12 @@
           "markdownDescription": "Allows the main window to read the in-memory backend connection once per launch"
         },
         {
+          "description": "Allows the main window to open the fixed Donation URL in the default browser",
+          "type": "string",
+          "const": "allow-open-donation",
+          "markdownDescription": "Allows the main window to open the fixed Donation URL in the default browser"
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",

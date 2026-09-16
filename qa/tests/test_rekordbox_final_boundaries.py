@@ -190,7 +190,7 @@ class MembershipMediaBoundaries(unittest.TestCase):
             ('wav-partial', [wav], 'target', 'wav', 'partial'),
             ('existing-empty', [], 'target', 'empty', 'partial'),
             ('absent-target', [], None, 'empty', 'absent_target'),
-            ('disjoint', [{'path':str(f.root/'three.wav')}], 'target', 'blocked', 'mismatch'),
+            ('disjoint', [{'path':str(f.root/'three.wav')}], 'target', 'empty', 'partial'),
             ('mixed-formats', [wav,two], 'target', 'mixed', 'complete'),
         ]
         for name, current, target, mode, membership in cases:
@@ -202,4 +202,4 @@ class MembershipMediaBoundaries(unittest.TestCase):
         reordered = media_state_from_plan(desired,
             {'target':{'id':'target'}, 'current_memberships':[two,original], 'reorder':[desired[0]]}, store)
         self.assertEqual(reordered['mode'], 'original')
-        self.assertEqual(reordered['membership'], 'order_mismatch')
+        self.assertEqual(reordered['membership'], 'complete')

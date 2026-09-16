@@ -545,6 +545,13 @@ for (const selector of ['#btnAuthStart', '#btnAuthRetry']) {
 cancelRbDialog();
 await rbDialog;
 finishRbOperation(rbOperation);
+window.setTimeout=()=>1; window.clearTimeout=()=>{};
+renderJobs([{id:'job-1',title:'Download',mode:'append',state:'running',done:0,total:1}]);
+collectActions(elements.get('#jobs')).forEach(action => emitted.add(action));
+showStatus('Completed');
+collectActions(elements.get('#statusRegion')).forEach(action => emitted.add(action));
+logsBefore='10'; renderLogs();
+collectActions(elements.get('#tracks')).forEach(action => emitted.add(action));
 console.log(JSON.stringify({
   emitted: [...emitted].sort(),
   click: Object.keys(clickActions).sort(),
@@ -592,9 +599,6 @@ console.log(JSON.stringify({
             "d091d0b0d0b3d180d0b5d0bfd0bed180d182",
             "d09fd0b5d180d0b5d181d0bad0b0d0bdd0b8d180d0bed0b2d0b0d182d18c",
             "d0a1d0bad0b0d187d0b0d182d18c20d0b2d18bd0b1d180d0b0d0bdd0bdd18bd0b5",
-            "d0a1d0b8d0bdd0ba3a20d0bfd0be20d0bfd0bed180d18fd0b4d0bad183",
-            "d0a1d0b8d0bdd0ba3a20d0bdd0bed0b2d18bd0b520d0b2d0bdd0b8d0b7",
-            "e28692205242",
             "e2878420574156",
             "d09fd0bed0b2d182d0bed180d0b8d182d18c",
             "d098d0bcd0bfd0bed180d182d0b8d180d0bed0b2d0b0d182d18c20d0b2d18bd0b1d180d0b0d0bdd0bdd18bd0b5",
