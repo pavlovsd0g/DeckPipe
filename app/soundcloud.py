@@ -21,6 +21,11 @@ from .provider_errors import (
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 SC_API = "https://api-v2.soundcloud.com"
+_WEB_HEADERS = {
+    "Origin": "https://soundcloud.com",
+    "Referer": "https://soundcloud.com/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+}
 
 _cache = {}  # url -> (ts, data)
 TTL = 600  # 10 мин: рейт-лимит SC делает повторные резолвы дорогими
@@ -50,14 +55,13 @@ def sc_client_id() -> str:
     if _cid_cache["id"] and time.time() - _cid_cache["ts"] < 6 * 3600:
         return _cid_cache["id"]
     try:
-        UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        html = requests.get("https://soundcloud.com", headers=UA, timeout=20).text
+        html = requests.get("https://soundcloud.com", headers=_WEB_HEADERS, timeout=20).text
         scripts = re.findall(r'<script[^>]+src="([^"]+\.js)"', html)
         for s in scripts:
             if s.startswith("/"):
                 s = "https://soundcloud.com" + s
             try:
-                js = requests.get(s, headers=UA, timeout=20).text
+                js = requests.get(s, headers=_WEB_HEADERS, timeout=20).text
             except Exception:
                 continue
             m = re.search(r'client_id\s*:\s*"([0-9a-zA-Z]{32})"', js)
@@ -69,8 +73,8 @@ def sc_client_id() -> str:
     return _CID_FALLBACK
 
 
-def _headers(token: str) -> dict:
-    return {"Authorization": f"OAuth {token}"}
+def _headers(token: str | None) -> dict:
+    return {**_WEB_HEADERS, **({"Authorization": f"OAuth {token}"} if token else {})}
 
 
 def _params(**kw) -> dict:
@@ -98,18 +102,21 @@ def sc_account_playlists(token: str) -> list:
                             "url": p.get("permalink_url"), "count": p.get("track_count", 0)})
     except Exception as exc:
         errors.append(detail_from_exception("soundcloud", exc))
-    # лайкнутые плейлисты (библиотека)
+    # The user's likes feed contains both track and playlist wrappers. The old
+    # /me/library/all endpoint may deny access even with a valid signed-in user.
     try:
         seen = {p["id"] for p in out}
-        for d in _account_pages(f"{SC_API}/me/library/all", token):
+        for d in _account_pages(f"{SC_API}/users/{uid}/likes", token):
             for it in d.get("collection", []):
                 if not isinstance(it, dict):
                     raise provider_collection_incomplete("soundcloud")
-                if it.get("type") not in ("playlist-like", "playlist"):
+                if 'playlist' not in it and isinstance(it.get('track'), dict):
                     continue
-                p = it.get("playlist") or it
-                pid = str(p.get("id", ""))
-                if pid and pid not in seen and p.get("permalink_url"):
+                p = it.get("playlist")
+                if not isinstance(p, dict) or p.get("id") is None or not p.get("permalink_url"):
+                    raise provider_collection_incomplete("soundcloud")
+                pid = str(p["id"])
+                if pid not in seen:
                     seen.add(pid)
                     out.append({"id": pid, "title": "♥ " + (p.get("title") or "?"),
                                 "url": p["permalink_url"], "count": p.get("track_count", 0)})
@@ -139,7 +146,7 @@ def _account_pages(first_url: str, token: str):
             raise provider_pagination_invalid("soundcloud")
         seen.add(url)
         try:
-            r = requests.get(url, headers=_headers(token) if token else {}, params=params, timeout=20)
+            r = requests.get(url, headers=_headers(token), params=params, timeout=20)
             r.raise_for_status()
             data = r.json()
         except Exception as exc:
@@ -227,7 +234,7 @@ def _track_from_api(t: dict) -> dict:
 
 
 def _api_get(path: str, token: str | None, **params) -> dict:
-    h = _headers(token) if token else {}
+    h = _headers(token)
     last = None
     for attempt in range(4):
         try:

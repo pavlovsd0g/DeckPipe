@@ -227,6 +227,44 @@ class ProviderCollectionTests(unittest.TestCase):
         self.assertEqual([], result.errors)
         self.assertEqual(4, request.call_count)
 
+    def test_soundcloud_liked_playlists_use_user_likes_and_preserve_pagination(self):
+        own = {"id": 1, "title": "Mine", "permalink_url": "https://soundcloud.com/me/mine", "track_count": 1}
+        liked = {"id": 2, "title": "Liked", "permalink_url": "https://soundcloud.com/artist/set", "track_count": 3}
+        next_url = "https://api-v2.soundcloud.com/users/7/likes?cursor=next"
+        pages = [
+            FakeResponse({"collection": [own]}),
+            FakeResponse({"collection": [{"kind": "like", "track": {"id": 3}},
+                                         {"kind": "like", "playlist": own}], "next_href": next_url}),
+            FakeResponse({"collection": [{"kind": "like", "playlist": liked}]}),
+        ]
+        with (
+            patch.object(soundcloud, "sc_validate", return_value={"id": 7}),
+            patch.object(soundcloud, "sc_client_id", return_value="synthetic-client"),
+            patch.object(soundcloud.requests, "get", side_effect=pages) as request,
+        ):
+            result = soundcloud.sc_account_playlists("synthetic-token")
+        self.assertEqual(["1", "2"], [item["id"] for item in result])
+        self.assertEqual("♥ Liked", result[1]["title"])
+        self.assertEqual([], result.errors)
+        self.assertEqual("https://api-v2.soundcloud.com/users/7/likes", request.call_args_list[1].args[0])
+        self.assertEqual(next_url, request.call_args_list[2].args[0])
+        for call in request.call_args_list:
+            headers = call.kwargs['headers']
+            self.assertEqual('OAuth synthetic-token', headers['Authorization'])
+            self.assertEqual('https://soundcloud.com', headers.get('Origin'))
+            self.assertEqual('https://soundcloud.com/', headers.get('Referer'))
+            self.assertIn('Mozilla/', headers.get('User-Agent', ''))
+
+    def test_soundcloud_malformed_liked_playlist_is_reported_as_partial(self):
+        with (
+            patch.object(soundcloud, "sc_validate", return_value={"id": 7}),
+            patch.object(soundcloud, "_account_pages", side_effect=[
+                iter([{"collection": []}]), iter([{"collection": [{"kind": "like", "playlist": None}]}]),
+            ]),
+        ):
+            result = soundcloud.sc_account_playlists("synthetic-token")
+        self.assertEqual("provider_collection_incomplete", result.errors[0]["code"])
+
     def test_search_preserves_partial_results_and_adds_safe_service_errors(self):
         def sc_get(path, _token, **_params):
             if path == "/search/tracks":
