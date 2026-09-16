@@ -4,12 +4,16 @@
 
 DeckPipe находит уже сохранённые треки во всех ваших музыкальных папках, скачивает недостающие и добавляет их в Rekordbox. Поддерживается Windows x64; текущая версия — **0.6.0 beta**. Интерфейс на русском языке.
 
-[Скачать сборку](https://github.com/pavlovsd0g/DeckPipe/releases) · [Сообщить о проблеме](https://github.com/pavlovsd0g/DeckPipe/issues)
+**[Скачать для Windows — EXE, 78,8 МБ](https://github.com/pavlovsd0g/DeckPipe/releases/download/v0.6.0-beta.20260916/DeckPipe-0.6.0+20260827.050713.6456dba254a6-d98427f-unsigned-private-beta-x64-setup.exe)** · **[Скачать MSI, 79,3 МБ](https://github.com/pavlovsd0g/DeckPipe/releases/download/v0.6.0-beta.20260916/DeckPipe-0.6.0+20260827.050713.6456dba254a6-d98427f-unsigned-private-beta-x64.msi)**
+
+Для первой установки рекомендуем **EXE**. При обновлении выбирайте тот же тип установщика, которым пользовались раньше. Оба устанавливать не нужно.
+
+[Актуальный релиз: 0.6.0 beta от 16 сентября 2026](https://github.com/pavlovsd0g/DeckPipe/releases/tag/v0.6.0-beta.20260916) · [Все версии](https://github.com/pavlovsd0g/DeckPipe/releases) · [Сообщить о проблеме](https://github.com/pavlovsd0g/DeckPipe/issues)
 
 ## Установка
 
-1. Откройте **Releases** по ссылке выше и выберите последнюю сборку.
-2. В разделе **Assets** скачайте файл, заканчивающийся на **`-x64-setup.exe`**. Это обычный установщик. Альтернатива — **`-x64.msi`** для установки через Windows Installer; устанавливать оба варианта не нужно.
+1. Скачайте установщик по прямой ссылке выше. Описание изменений и контрольные суммы доступны на странице **актуального релиза** в разделе **Releases**.
+2. Файл **`-x64-setup.exe`** — обычный установщик. Альтернатива — **`-x64.msi`** для установки через Windows Installer; устанавливать оба варианта не нужно.
 3. Закройте ранее запущенный DeckPipe, запустите установщик и следуйте его шагам.
 4. Откройте DeckPipe из меню «Пуск» или ярлыка приложения.
 
